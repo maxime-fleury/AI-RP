@@ -3,6 +3,7 @@
  * Both expose the same streaming interface.
  */
 import { getSetting } from "../server/db";
+import { tracked } from "../server/health";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -213,7 +214,8 @@ async function* readSse(body: ReadableStream<Uint8Array>, signal?: AbortSignal):
 
 export function getProvider(id?: string): ChatProvider {
   const provider = (id ?? getSetting("provider", "lmstudio")) as string;
-  return provider === "openrouter" ? new OpenRouterProvider() : new LMStudioProvider();
+  const raw = provider === "openrouter" ? new OpenRouterProvider() : new LMStudioProvider();
+  return tracked(raw);
 }
 
 export function defaultModelFor(provider: string): string {

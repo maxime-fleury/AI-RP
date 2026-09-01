@@ -2,7 +2,7 @@ import { describe, test, expect } from "bun:test";
 import { loadApp, dataDir } from "./helpers";
 
 const { db, routes } = await loadApp();
-const { importFile, parsePngCard, normalizeCard } = await import("../src/server/importCards");
+const { importFile, parsePngCard, normalizeCard, fingerprintFor, sizeLimitFor, MAX_JSON_BYTES } = await import("../src/server/importCards");
 
 const enc = new TextEncoder();
 
@@ -36,8 +36,43 @@ describe("importCards", () => {
     expect(card.creator).toBe("Moi");
   });
 
-  test("importFile: unrecognized format returns null", () => {
-    expect(importFile("notes.txt", enc.encode("hi"))).toBeNull();
+  test("importFile: unrecognized format is reported invalid", () => {
+    const res = importFile("notes.txt", enc.encode("hi"));
+    expect(res.status).toBe("invalid");
+    expect(res.name).toBe("notes.txt");
+  });
+
+  test("importFile: JSON over the 5 Mo limit is rejected before parsing", () => {
+    const big = new Uint8Array(MAX_JSON_BYTES + 1); // filled with zeros → not valid JSON anyway
+    const res = importFile("huge.json", big);
+    expect(res.status).toBe("invalid");
+    expect(res.reason).toContain("trop volumineux");
+  });
+
+  test("sizeLimitFor applies per type (PNG 50 Mo / JSON 5 Mo)", () => {
+    expect(sizeLimitFor("a.png")).toBe(50 * 1024 * 1024);
+    expect(sizeLimitFor("a.JSON")).toBe(MAX_JSON_BYTES);
+    expect(sizeLimitFor("a.txt")).toBe(0);
+  });
+
+  test("fingerprintFor is stable across key order and whitespace", () => {
+    const a = fingerprintFor({ data: { name: "Alba", description: "Elfe" }, spec: "chara_card_v2" });
+    const b = fingerprintFor({ spec: "chara_card_v2", data: { description: "Elfe", name: "Alba" } });
+    expect(a).toBe(b);
+    expect(a.length).toBe(64); // sha256 hex
+  });
+
+  test("importFile: same character twice → second is a duplicate", () => {
+    const json = JSON.stringify({ data: { name: "Duplicata", description: "Même contenu" } });
+    const first = importFile("dup.json", enc.encode(json));
+    expect(first.status).toBe("imported");
+    const second = importFile("dup2.json", enc.encode(json));
+    expect(second.status).toBe("duplicate");
+    expect(second.reason).toContain("Duplicata");
+    // only one row was created
+    const matches = db.listCards().filter((c: any) => c.name === "Duplicata");
+    expect(matches).toHaveLength(1);
+    expect(matches[0].fingerprint).toBe(fingerprintFor(JSON.parse(json)));
   });
 
   test("parsePngCard extracts chara chunk without touching DB", () => {
@@ -49,11 +84,12 @@ describe("importCards", () => {
 
   test("importFile PNG creates a card + avatar", async () => {
     const png = pngWithChara(JSON.stringify({ data: { name: "Pixel", first_mes: "*Salut.*" } }));
-    const card = importFile("pixel.png", png);
-    expect(card).not.toBeNull();
-    expect(card!.name).toBe("Pixel");
-    expect(card!.avatar).toContain("/uploads/avatars/");
-    expect(db.getCard(card!.id).name).toBe("Pixel");
+    const res = importFile("pixel.png", png);
+    expect(res.status).toBe("imported");
+    const card = res.card!;
+    expect(card.name).toBe("Pixel");
+    expect(card.avatar).toContain("/uploads/avatars/");
+    expect(db.getCard(card.id).name).toBe("Pixel");
   });
 });
 
@@ -68,6 +104,28 @@ describe("export/import API", () => {
     const j = (await res.json()) as any;
     expect(j.imported).toHaveLength(1);
     expect(j.imported[0].name).toBe("Online");
+    expect(j.report).toHaveLength(1);
+    expect(j.report[0].status).toBe("imported");
+  });
+
+  test("POST /api/import reports duplicates + invalid files per file", async () => {
+    const body = JSON.stringify({ data: { name: "Double", description: "Même carte" } });
+    const payload = JSON.stringify({ files: [
+      { name: "a.json", base64: Buffer.from(body).toString("base64") },
+      { name: "a-copy.json", base64: Buffer.from(body).toString("base64") },
+      { name: "notes.txt", base64: Buffer.from("hi").toString("base64") },
+    ] });
+    const res = await routes.handleApi(
+      new Request("http://test.local/api/import", { method: "POST", headers: { "Content-Type": "application/json" }, body: payload }),
+      new URL("http://test.local/api/import"),
+    );
+    expect(res.status).toBe(200);
+    const j = (await res.json()) as any;
+    expect(j.imported).toHaveLength(1);
+    expect(j.duplicates).toEqual(["a-copy.json"]);
+    const statuses = j.report.map((r: any) => r.status);
+    expect(statuses).toContain("duplicate");
+    expect(statuses).toContain("invalid");
   });
 
   test("data dir is isolated", () => {

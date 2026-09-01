@@ -11,17 +11,25 @@ import {
   listPersonas, getPersona, createPersona, updatePersona, deletePersona,
   listConversations, getConversation, createConversation, updateConversation, deleteConversation,
   listMessages, getMessage, createMessage, updateMessage, deleteMessage, touchConversation,
+  listTrashedResources, restoreTrashed, permanentDeleteTrashed,
   lastMessageOf,
+  listLocations, createLocation, updateLocation, deleteLocation,
+  listLorebook, createLorebookEntry, updateLorebookEntry, deleteLorebookEntry, activeLorebook,
+  listRelations, createRelation, updateRelation, deleteRelation,
+  listTimeline, createTimelineEvent, updateTimelineEvent, deleteTimelineEvent,
+  createJob, listJobs, updateJob, pendingJobs,
+  listBranches,
 } from "./db";
-import { importFile, scanDirectory } from "./importCards";
+import { importFile, scanDirectory, sizeLimitFor, type ImportResult } from "./importCards";
 import { getProvider, defaultModelFor, type ChatMessage } from "../llm/providers";
-import { buildMessages, buildSystemPrompt, estimateTokens, parseSegments, fallbackSpeaker, summarizeSystem, type Segment, type CastContext } from "../llm/prompt";
-import type { MessageRow } from "./db";
+import { buildMessages, buildSystemPrompt, estimateTokens, parseSegments, fallbackSpeaker, summarizeSystem, presetFromKey, parseMemory, memoryToText, type Segment, type CastContext, type MemoryState } from "../llm/prompt";
+import type { ConversationRow, MessageRow } from "./db";
 import { synthSegments, buildTtsContext, listVoices, warmupTts, getVoiceSample } from "../tts/service";
 import { ensureTtsLoaded, synthesize, wavBytes } from "../tts/engine";
 import { generateAndSave, probeImageStatus, ensureImageServer } from "./image";
-import { storageInfo, runBackup } from "./backup";
+import { storageInfo, runBackup, analyzeOrphans, purgeOrphans, cacheInfo, purgeAudioCache } from "./backup";
 import { zipFiles } from "./zip";
+import { providerHealth } from "./health";
 import { AUDIO_DIR, IMAGES_DIR, UPLOADS_DIR } from "./paths";
 import { withCharaChunk, placeholderPng } from "./cardExport";
 
@@ -36,6 +44,21 @@ async function readJson(req: Request): Promise<any> {
   } catch {
     throw new Error("JSON invalide");
   }
+}
+
+const MAX_TOTAL_BYTES = 50 * 1024 * 1024; // total cap for one import batch
+const MAX_IMPORT_FILES = 100;
+const SECRET_KEYS = new Set(["openrouter_key", "auth_token"]);
+
+function publicSettings(): Record<string, unknown> {
+  const settings = allSettings();
+  for (const key of SECRET_KEYS) {
+    if (key in settings) {
+      settings[`${key}_set`] = Boolean(settings[key]);
+      delete settings[key];
+    }
+  }
+  return settings;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -187,7 +210,9 @@ function conversationView(id: number) {
   try {
     cards = (JSON.parse(conv.cast) as number[]).map((cid) => getCard(Number(cid))).filter(Boolean);
   } catch { /* ignore */ }
-  return { ...conv, world, persona, scenario, cards };
+  const memory = parseMemory(conv.memory_json);
+  const { memory_json, ...rest } = conv;
+  return { ...rest, memory, world, persona, scenario, cards };
 }
 
 function messageView(m: any) {
@@ -222,12 +247,33 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     }
 
     // health / meta
+    if (method === "GET" && p === "/api/health/providers") {
+      return json(providerHealth());
+    }
     if (method === "GET" && p === "/api/health") {
       return json({
         ok: true,
         tts: { fr: await ensureTtsLoaded("fr").catch(() => false), en: await ensureTtsLoaded("en").catch(() => false) },
         image: await probeImageStatus(),
       });
+    }
+    // test all services at once (LLM provider, TTS, image sidecar) with latencies
+    if (p === "/api/test" && method === "POST") {
+      const results: Record<string, any> = {};
+      const t0 = Date.now();
+      const provider = getProvider();
+      const models = await provider.models().catch(() => []);
+      results.provider = {
+        provider: provider.id,
+        ok: Array.isArray(models) && models.length > 0,
+        ms: Date.now() - t0,
+        models: Array.isArray(models) ? models.slice(0, 3) : [],
+      };
+      const t1 = Date.now();
+      const ttsOk = await ensureTtsLoaded("fr").catch(() => false);
+      results.tts = { ok: ttsOk, ms: Date.now() - t1 };
+      results.image = await probeImageStatus();
+      return json(results);
     }
 
     // LAN auth
@@ -247,6 +293,29 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     if (p === "/api/storage" && method === "GET") {
       return json(storageInfo());
     }
+    // cache: regenerable audio + orphan images, with one-click purge
+    if (p === "/api/cache" && method === "GET") {
+      return json(cacheInfo());
+    }
+    if (p === "/api/cache/purge" && method === "POST") {
+      const body = await readJson(req);
+      if (body.audio) {
+        const r = purgeAudioCache();
+        return json({ ok: true, removed: r.removed, bytes: r.bytes });
+      }
+      return json({ ok: true, removed: 0, bytes: 0 });
+    }
+    // orphan file analysis (simulation — nothing deleted) + purge
+    if (p === "/api/storage/analyze" && method === "POST") {
+      return json(analyzeOrphans());
+    }
+    if (p === "/api/storage/purge" && method === "POST") {
+      const body = await readJson(req);
+      const files = Array.isArray(body.files) ? body.files.map(String).filter(Boolean) : [];
+      if (!files.length) return json({ removed: 0, bytes: 0 });
+      const r = purgeOrphans(files);
+      return json(r);
+    }
     if (p === "/api/backup" && method === "POST") {
       const file = runBackup(true);
       return json({ ok: Boolean(file), file });
@@ -254,12 +323,15 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
 
     // settings
     if (p === "/api/settings" && method === "GET") {
-      return json(allSettings());
+      return json(publicSettings());
     }
     if (p === "/api/settings" && method === "PATCH") {
       const body = await readJson(req);
-      for (const [k, v] of Object.entries(body)) setSetting(k, v);
-      return json(allSettings());
+      for (const [k, v] of Object.entries(body)) {
+        if (SECRET_KEYS.has(k) && (v === undefined || v === null || String(v) === "")) continue;
+        setSetting(k, v);
+      }
+      return json(publicSettings());
     }
     if (p === "/api/voices" && method === "GET") {
       return json({ voices: listVoices() });
@@ -296,29 +368,54 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       return json({ url: `/audio/${path.basename(file)}`, durationMs: res.durationMs, voice: body.voice, lang });
     }
 
-    // import cards
+    // import cards — per-file report (importé / doublon / invalide) + limits
     if (p === "/api/import" && method === "POST") {
       const ct = req.headers.get("content-type") || "";
       const imported: any[] = [];
+      const report: ImportResult[] = [];
+      let totalBytes = 0;
+      // returns true when the whole batch must be rejected (total too big)
+      const account = (name: string, n: number): boolean => {
+        totalBytes += n;
+        return totalBytes > MAX_TOTAL_BYTES;
+      };
       if (ct.includes("multipart/form-data")) {
         const form = await req.formData();
         const files = form.getAll("files");
+        if (files.length > MAX_IMPORT_FILES) return json({ error: `Maximum ${MAX_IMPORT_FILES} fichiers par import` }, 413);
         for (const f of files) {
           if (typeof f === "string") continue;
           const bytes = new Uint8Array(await f.arrayBuffer());
-          const card = importFile(f.name, bytes);
-          if (card) imported.push(messageView(card));
+          if (!sizeLimitFor(f.name)) {
+            report.push({ status: "invalid", name: f.name, reason: "Format non reconnu (PNG ou JSON attendu)" });
+            continue;
+          }
+          if (account(f.name, bytes.byteLength)) return json({ error: "Import trop volumineux (maximum 50 Mo au total)" }, 413);
+          const res = importFile(f.name, bytes);
+          report.push(res);
+          if (res.status === "imported" && res.card) imported.push(messageView(res.card));
         }
       } else {
         const body = await readJson(req);
         const files: { name: string; base64: string }[] = body.files ?? [];
+        if (!Array.isArray(files) || files.length > MAX_IMPORT_FILES) {
+          return json({ error: `Maximum ${MAX_IMPORT_FILES} fichiers par import` }, 413);
+        }
         for (const f of files) {
-          const bytes = Uint8Array.from(atob(f.base64), (c) => c.charCodeAt(0));
-          const card = importFile(f.name, bytes);
-          if (card) imported.push(messageView(card));
+          if (!f || typeof f.base64 !== "string") continue;
+          const raw = atob(f.base64);
+          if (!sizeLimitFor(f.name)) {
+            report.push({ status: "invalid", name: String(f.name || "?"), reason: "Format non reconnu (PNG ou JSON attendu)" });
+            continue;
+          }
+          if (account(f.name, raw.length)) return json({ error: "Import trop volumineux (maximum 50 Mo au total)" }, 413);
+          const bytes = Uint8Array.from(raw, (c) => c.charCodeAt(0));
+          const res = importFile(f.name, bytes);
+          report.push(res);
+          if (res.status === "imported" && res.card) imported.push(messageView(res.card));
         }
       }
-      return json({ imported });
+      return json({ imported, duplicates: report.filter((r) => r.status === "duplicate").map((r) => r.name), report });
     }
     if (p === "/api/cards/scan" && method === "POST") {
       const body = await readJson(req);
@@ -350,8 +447,9 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       return w ? json(w) : json({ error: "not found" }, 404);
     }
     if (parts[1] === "worlds" && parts[2] && !parts[3] && method === "DELETE") {
+      // soft delete → trash; restore via /api/trash
       deleteWorld(Number(parts[2]));
-      return json({ ok: true });
+      return json({ ok: true, trashed: true });
     }
     if (parts[1] === "worlds" && parts[2] && parts[3] === "cover" && method === "POST") {
       const body = await readJson(req);
@@ -416,6 +514,99 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       }
       return json({ map: world.map || null, locations });
     }
+    // structured locations (managed by the user, pinned on the map)
+    if (parts[1] === "worlds" && parts[2] && parts[3] === "locations" && method === "GET") {
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
+      return json({ locations: listLocations(world.id) });
+    }
+    if (parts[1] === "worlds" && parts[2] && parts[3] === "locations" && method === "POST") {
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
+      const body = await readJson(req);
+      return json(createLocation({ world_id: world.id, ...body }), 201);
+    }
+    if (parts[1] === "locations" && parts[2] && !parts[3] && method === "PATCH") {
+      const body = await readJson(req);
+      return json(updateLocation(Number(parts[2]), body));
+    }
+    if (parts[1] === "locations" && parts[2] && !parts[3] && method === "DELETE") {
+      deleteLocation(Number(parts[2]));
+      return json({ ok: true });
+    }
+    // lorebook: conditional memory entries injected only when triggers match
+    if (parts[1] === "worlds" && parts[2] && parts[3] === "lorebook" && method === "GET") {
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
+      return json({ entries: listLorebook(world.id) });
+    }
+    if (parts[1] === "worlds" && parts[2] && parts[3] === "lorebook" && method === "POST") {
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
+      const body = await readJson(req);
+      return json(createLorebookEntry({ world_id: world.id, ...body }), 201);
+    }
+    if (parts[1] === "lorebook" && parts[2] && !parts[3] && method === "PATCH") {
+      const body = await readJson(req);
+      return json(updateLorebookEntry(Number(parts[2]), body));
+    }
+    if (parts[1] === "lorebook" && parts[2] && !parts[3] && method === "DELETE") {
+      deleteLorebookEntry(Number(parts[2]));
+      return json({ ok: true });
+    }
+    // relations: character relationship graph (from → kind → to)
+    if (parts[1] === "worlds" && parts[2] && parts[3] === "relations" && method === "GET") {
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
+      return json({ relations: listRelations(world.id) });
+    }
+    if (parts[1] === "worlds" && parts[2] && parts[3] === "relations" && method === "POST") {
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
+      const body = await readJson(req);
+      return json(createRelation({ world_id: world.id, ...body }), 201);
+    }
+    if (parts[1] === "relations" && parts[2] && !parts[3] && method === "PATCH") {
+      const body = await readJson(req);
+      return json(updateRelation(Number(parts[2]), body));
+    }
+    if (parts[1] === "relations" && parts[2] && !parts[3] && method === "DELETE") {
+      deleteRelation(Number(parts[2]));
+      return json({ ok: true });
+    }
+    // timeline: major world events (auto-suggested or added by hand)
+    if (parts[1] === "worlds" && parts[2] && parts[3] === "timeline" && method === "GET") {
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
+      return json({ events: listTimeline(world.id) });
+    }
+    if (parts[1] === "worlds" && parts[2] && parts[3] === "timeline" && !parts[4] && method === "POST") {
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
+      const body = await readJson(req);
+      return json(createTimelineEvent({ world_id: world.id, ...body }), 201);
+    }
+    if (parts[1] === "timeline" && parts[2] && !parts[3] && method === "DELETE") {
+      deleteTimelineEvent(Number(parts[2]));
+      return json({ ok: true });
+    }
+    // propose major events for the world timeline from the playthroughs — the
+    // LLM only SUGGESTS (label + justifying extract); nothing is written until
+    // the user accepts a proposal in the Chronologie tab
+    if (parts[1] === "worlds" && parts[2] && parts[3] === "timeline" && parts[4] === "propose" && method === "POST") {
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
+      const result = await proposeTimelineEvents(world.id);
+      if (!result) return json({ error: "Le modèle n'a pas pu analyser les parties" }, 502);
+      return json(result);
+    }
+
+    // async background tasks (TTS / images / summaries): status + history
+    if (p === "/api/jobs" && method === "GET") {
+      const status = url.searchParams.get("status") || undefined;
+      return json({ jobs: listJobs(status) });
+    }
+
     // export a whole world (scenarios + conversations) as a ZIP
     if (parts[1] === "worlds" && parts[2] && parts[3] === "export" && method === "GET") {
       const world = getWorld(Number(parts[2]));
@@ -456,8 +647,9 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       if (!world) return json({ error: "not found" }, 404);
       const { name, intro } = await generateScenarioIntro(world, body.genre, body.theme);
       const customName = typeof body.name === "string" && body.name.trim() ? body.name.trim() : null;
-      const s = createScenario({ world_id: world.id, name: customName ?? name, intro });
-      return json(s, 201);
+      // Generation is preview-only by default; persist only when explicitly requested.
+      if (body.persist === true) return json(createScenario({ world_id: world.id, name: customName ?? name, intro }), 201);
+      return json({ name: customName ?? name, intro, draft: true }, 200);
     }
     if (parts[1] === "worlds" && parts[2] && parts[3] === "scenarios" && method === "POST") {
       const body = await readJson(req);
@@ -474,7 +666,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     }
     if (parts[1] === "scenarios" && parts[2] && !parts[3] && method === "DELETE") {
       deleteScenario(Number(parts[2]));
-      return json({ ok: true });
+      return json({ ok: true, trashed: true });
     }
     // regenerate the intro of an existing scenario (genre-aware)
     if (parts[1] === "scenarios" && parts[2] && parts[3] === "generate" && method === "POST") {
@@ -494,15 +686,36 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     }
     if (p === "/api/cards" && method === "POST") {
       const body = await readJson(req);
+      if (body.avatar && typeof body.avatar === "string" && body.avatar.startsWith("data:image/")) {
+        const match = body.avatar.match(/^data:image\/(png|jpeg|webp);base64,(.+)$/);
+        if (!match) return json({ error: "Avatar invalide" }, 400);
+        const bytes = Buffer.from(match[2], "base64");
+        if (bytes.length > 5 * 1024 * 1024) return json({ error: "Avatar limité à 5 Mo" }, 413);
+        const card = createCard({ ...body, avatar: "" });
+        const file = `card-${card.id}.${match[1] === "jpeg" ? "jpg" : match[1]}`;
+        fs.mkdirSync(path.join(UPLOADS_DIR, "avatars"), { recursive: true });
+        fs.writeFileSync(path.join(UPLOADS_DIR, "avatars", file), bytes);
+        return json(updateCard(card.id, { avatar: `/uploads/avatars/${file}` }), 201);
+      }
       return json(createCard(body), 201);
     }
     if (parts[1] === "cards" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
+      if (body.avatar && typeof body.avatar === "string" && body.avatar.startsWith("data:image/")) {
+        const match = body.avatar.match(/^data:image\/(png|jpeg|webp);base64,(.+)$/);
+        if (!match) return json({ error: "Avatar invalide" }, 400);
+        const bytes = Buffer.from(match[2], "base64");
+        if (bytes.length > 5 * 1024 * 1024) return json({ error: "Avatar limité à 5 Mo" }, 413);
+        const file = `card-${Number(parts[2])}-${Date.now()}.${match[1] === "jpeg" ? "jpg" : match[1]}`;
+        fs.mkdirSync(path.join(UPLOADS_DIR, "avatars"), { recursive: true });
+        fs.writeFileSync(path.join(UPLOADS_DIR, "avatars", file), bytes);
+        body.avatar = `/uploads/avatars/${file}`;
+      }
       return json(updateCard(Number(parts[2]), body));
     }
     if (parts[1] === "cards" && parts[2] && !parts[3] && method === "DELETE") {
       deleteCard(Number(parts[2]));
-      return json({ ok: true });
+      return json({ ok: true, trashed: true });
     }
     // export a card as a SillyTavern-compatible PNG (chara chunk)
     if (parts[1] === "cards" && parts[2] && parts[3] === "export-st" && method === "GET") {
@@ -553,7 +766,22 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     }
     if (parts[1] === "personas" && parts[2] && !parts[3] && method === "DELETE") {
       deletePersona(Number(parts[2]));
-      return json({ ok: true });
+      return json({ ok: true, trashed: true });
+    }
+
+    // trash: soft-deleted resources (worlds, scenarios, cards, personas)
+    if (p === "/api/trash" && method === "GET") {
+      return json({ items: listTrashedResources() });
+    }
+    if (p === "/api/trash/restore" && method === "POST") {
+      const body = await readJson(req);
+      const ok = restoreTrashed(String(body.type), Number(body.id));
+      return ok ? json({ ok: true }) : json({ error: "type inconnu" }, 400);
+    }
+    if (p === "/api/trash/permanent" && method === "POST") {
+      const body = await readJson(req);
+      const ok = permanentDeleteTrashed(String(body.type), Number(body.id));
+      return ok ? json({ ok: true }) : json({ error: "type inconnu" }, 400);
     }
 
     // conversations
@@ -576,10 +804,15 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         settings: JSON.stringify(body.settings ?? {}),
       });
       // opening: scenario intro (or first card greeting)
+      let convSettings: Record<string, unknown> = {};
+      try { convSettings = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
       const scenario = conv.scenario_id ? getScenario(conv.scenario_id) : null;
+      const draftIntro = typeof convSettings.draft_intro === "string" ? convSettings.draft_intro : "";
       const cards = (JSON.parse(conv.cast) as number[]).map((id) => getCard(Number(id))).filter(Boolean) as any[];
       let opening: MessageRow | null = null;
-      if (scenario?.intro) {
+      if (draftIntro) {
+        opening = createMessage({ conversation_id: conv.id, role: "assistant", name: "Narrateur", content: draftIntro });
+      } else if (scenario?.intro) {
         opening = createMessage({ conversation_id: conv.id, role: "assistant", name: "Narrateur", content: scenario.intro });
       } else if (cards[0]?.first_mes) {
         opening = createMessage({ conversation_id: conv.id, role: "assistant", name: cards[0].name, content: cards[0].first_mes });
@@ -630,14 +863,26 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     }
     if (parts[1] === "conversations" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
-      updateConversation(Number(parts[2]), {
+      const patch: any = {
         title: body.title,
         group_mode: body.group_mode === undefined ? undefined : body.group_mode ? 1 : 0,
         pinned: body.pinned === undefined ? undefined : body.pinned ? 1 : 0,
         archived: body.archived === undefined ? undefined : body.archived ? 1 : 0,
         cast: body.cast ? JSON.stringify(body.cast) : undefined,
         settings: body.settings ? JSON.stringify(body.settings) : undefined,
-      });
+      };
+      if (typeof body.branch_kind === "string" && ["main", "canon", "alternative", "draft", "abandoned"].includes(body.branch_kind)) {
+        patch.branch_kind = body.branch_kind;
+      }
+      if (body.memory && typeof body.memory === "object" && !Array.isArray(body.memory)) {
+        const m = parseMemory(JSON.stringify(body.memory));
+        if (m) {
+          patch.memory_json = JSON.stringify(m);
+          // keep the readable summary in sync so list views show the memory
+          patch.summary = memoryToText(m);
+        }
+      }
+      updateConversation(Number(parts[2]), patch);
       return json(conversationView(Number(parts[2])));
     }
     if (parts[1] === "conversations" && parts[2] && !parts[3] && method === "DELETE") {
@@ -676,6 +921,8 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         cast: src.cast,
         group_mode: src.group_mode,
         settings: src.settings,
+        parent_id: src.id,
+        branch_kind: "alternative",
       });
       const audioSrcDir = path.join(AUDIO_DIR, String(src.id));
       const audioDstDir = path.join(AUDIO_DIR, String(fork.id));
@@ -726,6 +973,58 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       view.messages = listMessages(view.id).map(messageView);
       return json(view, 201);
     }
+    // scene state panel: stored structured summary of the current scene
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "scene" && method === "GET") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      let cs: Record<string, unknown> = {};
+      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+      const state = cs.scene_state && typeof cs.scene_state === "object" ? cs.scene_state : null;
+      return json({ state, updatedAt: typeof cs.scene_updated_at === "number" ? cs.scene_updated_at : 0 });
+    }
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "scene" && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      let cs: Record<string, unknown> = {};
+      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+      const lastUpdate = typeof cs.scene_updated_at === "number" ? cs.scene_updated_at : 0;
+      // throttle: never regenerate more than once every 2 minutes
+      if (Date.now() - lastUpdate < 120_000 && cs.scene_state) {
+        return json({ state: cs.scene_state, updatedAt: lastUpdate, throttled: true });
+      }
+      const state = await generateSceneState(conv.id);
+      if (!state) return json({ error: "Le modèle n'a pas pu produire l'état de scène" }, 502);
+      updateConversation(conv.id, { settings: JSON.stringify({ ...cs, scene_state: state, scene_updated_at: Date.now() }) });
+      return json({ state, updatedAt: Date.now() });
+    }
+
+    // branch family: parent + siblings + children of a conversation
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "branches" && method === "GET") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const family = new Map<number, ConversationRow>();
+      family.set(conv.id, conv);
+      if (conv.parent_id) {
+        const parent = getConversation(conv.parent_id);
+        if (parent) family.set(parent.id, parent);
+        for (const s of listBranches(conv.parent_id)) family.set(s.id, s);
+      }
+      for (const c of listBranches(conv.id)) family.set(c.id, c);
+      const list = [...family.values()].sort((a, b) => a.created_at - b.created_at);
+      return json({ branches: list.map((c) => conversationView(c.id)) });
+    }
+    // narrative consistency check (LLM, button-triggered — never blocks a turn)
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "validate" && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const result = await validateNarrative(conv.id);
+      if (!result) return json({ error: "Le modèle n'a pas pu vérifier la cohérence" }, 502);
+      let cs: Record<string, unknown> = {};
+      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+      updateConversation(conv.id, { settings: JSON.stringify({ ...cs, validation: result }) });
+      return json(result);
+    }
+
     // estimate the tokens the model would receive for this conversation
     if (parts[1] === "conversations" && parts[2] && parts[3] === "context" && method === "GET") {
       const conv = getConversation(Number(parts[2]));
@@ -733,7 +1032,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const view = conversationView(conv.id)!;
       const msgs = listMessages(conv.id);
       const { system, messages } = buildMessages(
-        { world: view.world, persona: view.persona, cards: view.cards, scenario: view.scenario, conversation: conv, summary: conv.summary || undefined },
+        { world: view.world, persona: view.persona, cards: view.cards, scenario: view.scenario, conversation: conv, summary: conv.summary || undefined, memory: parseMemory(conv.memory_json) || undefined },
         msgs,
       );
       const tokens = estimateTokens(system) + messages.reduce((acc, m) => acc + estimateTokens(m.content), 0);
@@ -808,6 +1107,87 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         },
       });
     }
+    // export the party as a Markdown book: chapters, scene breaks, memory header
+    // branch=current (default) | canon (main + canon branches of the family)
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "export-md" && method === "GET") {
+      const convId = Number(parts[2]);
+      const conv = getConversation(convId);
+      if (!conv) return json({ error: "not found" }, 404);
+      const branchMode = url.searchParams.get("branch") || "current";
+      // canon mode: gather the family (root + siblings/children) and keep only
+      // main / canon branches, in chronological order
+      let exports: { conv: ConversationRow; view: any; msgs: any[]; title: string }[] = [];
+      if (branchMode === "canon") {
+        const family = new Map<number, ConversationRow>();
+        family.set(conv.id, conv);
+        if (conv.parent_id) {
+          const parent = getConversation(conv.parent_id);
+          if (parent) { family.set(parent.id, parent); for (const s of listBranches(parent.id)) family.set(s.id, s); }
+        }
+        for (const c of listBranches(conv.id)) family.set(c.id, c);
+        const kept = [...family.values()]
+          .filter((c) => c.branch_kind === "main" || c.branch_kind === "canon")
+          .sort((a, b) => a.created_at - b.created_at);
+        for (const c of kept) exports.push({ conv: c, view: conversationView(c.id)!, msgs: listMessages(c.id).map(messageView), title: c.title || "Partie" });
+      } else {
+        exports = [{ conv, view: conversationView(convId)!, msgs: listMessages(convId).map(messageView), title: conv.title || "Partie" }];
+      }
+      const renderBook = (conv: ConversationRow, view: any, msgs: any[]): string[] => {
+        const lines: string[] = [];
+        const mem = parseMemory(conv.memory_json);
+        if (mem) lines.push(`## Mémoire\n${memoryToText(mem)}\n`);
+        if (!msgs.length) { lines.push("*(Aucun message.)*"); return lines; }
+        let chapter = 0;
+        let lastTs = 0;
+        let inChapter = false;
+        for (const m of msgs) {
+          const gap = lastTs && m.created_at - lastTs > 2 * 3600 * 1000;
+          const chapterBreak = gap || chapter === 0;
+          if (chapterBreak) {
+            chapter++;
+            const d = new Date(m.created_at);
+            lines.push(`\n## Chapitre ${chapter} — ${d.toLocaleDateString("fr-FR", { day: "numeric", month: "long", year: "numeric" })}`);
+            inChapter = false;
+          } else if (inChapter) {
+            lines.push("---\n"); // scene break between messages
+          }
+          inChapter = true;
+          const who = m.role === "user" ? (view.persona?.name ?? "Moi") : (m.name || "Narrateur");
+          const img = m.meta?.image ? `\n![illustration](${m.meta.image})\n` : "";
+          const body = (m.content || "").replace(/\*\*/g, "").trim();
+          lines.push(m.role === "user" ? `**${who}** : ${body}` : `> **${who}** : ${body}`);
+          if (img) lines.push(img);
+          lastTs = m.created_at;
+        }
+        return lines;
+      };
+      const title = conv.title || "Partie";
+      const lines: string[] = [`# ${title}\n`];
+      const firstView = exports[0].view;
+      const metaBits = [
+        firstView.world?.name ? `**Monde :** ${firstView.world.name}` : null,
+        conv.group_mode ? "**Mode :** groupe" : "**Mode :** solo",
+        branchMode === "canon" ? "**Export :** canon (branches principales)" : null,
+        `**Exporté le :** ${new Date().toLocaleDateString("fr-FR", { day: "numeric", month: "long", year: "numeric" })}`,
+      ].filter(Boolean);
+      lines.push(metaBits.join(" · ") + "\n");
+      if (exports.length > 1) {
+        for (const e of exports) {
+          lines.push(`\n---\n\n## Branch ${e.title} — ${e.conv.branch_kind === "canon" ? "⭐ canon" : "🌳 principale"}\n`);
+          lines.push(...renderBook(e.conv, e.view, e.msgs));
+        }
+      } else {
+        lines.push(...renderBook(exports[0].conv, exports[0].view, exports[0].msgs));
+      }
+      const text = lines.join("\n");
+      const safe = title.replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-") || "partie";
+      return new Response(text, {
+        headers: {
+          "Content-Type": "text/markdown; charset=utf-8",
+          "Content-Disposition": `attachment; filename="${safe}${branchMode === "canon" ? "-canon" : ""}.md"`,
+        },
+      });
+    }
     // gallery: all illustrations of a conversation + AI captions
     if (parts[1] === "conversations" && parts[2] && parts[3] === "gallery" && method === "GET") {
       const convId = Number(parts[2]);
@@ -815,14 +1195,35 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       if (!conv) return json({ error: "not found" }, 404);
       const msgs = listMessages(convId).map(messageView);
       const items = msgs.filter((m: any) => m.meta?.image).map((m: any) => ({
-        id: m.id, image: m.meta.image, seed: m.meta.seed ?? null,
-        character: m.meta.character ?? null, message: (m.content || "").slice(0, 200),
+        id: m.id, image: m.meta.image, seed: m.meta.image_seed ?? m.meta.seed ?? null,
+        kind: m.meta.image_kind ?? null, character: m.meta.image_char ?? m.meta.character ?? null,
+        fav: m.meta.image_fav ? 1 : 0, message: (m.content || "").slice(0, 200),
       }));
       let captions: Record<string, string> = {};
       try {
         captions = JSON.parse(fs.readFileSync(path.join(IMAGES_DIR, "conversations", String(convId), "captions.json"), "utf8"));
       } catch { /* none yet */ }
       return json({ items, captions });
+    }
+    // world gallery: every illustration across the world's parties (conversation
+    // images + world cover/map) with filters: kind, character, favorites
+    if (parts[1] === "worlds" && parts[2] && parts[3] === "gallery" && method === "GET") {
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
+      const items: any[] = [];
+      const push = (image: string, kind: string | null, character: string | null, seed: number | null, msg: string, convId: number | null, convTitle: string, createdAt: number, fav: number, mid?: number) => {
+        items.push({ image, kind, character, seed, message: msg.slice(0, 200), conversation_id: convId, conversation: convTitle, created_at: createdAt, fav, id: mid ?? `w${image}` });
+      };
+      for (const conv of listConversations().filter((c) => c.world_id === world.id)) {
+        for (const m of listMessages(conv.id).map(messageView)) {
+          const meta = m.meta as any;
+          if (meta?.image) push(meta.image, meta.image_kind ?? null, meta.image_char ?? null, meta.image_seed ?? meta.seed ?? null, m.content || "", conv.id, conv.title, m.created_at, meta.image_fav ? 1 : 0, m.id);
+        }
+      }
+      if (world.cover) push(world.cover, "landscape", null, null, "Couverture du monde", null, world.name, world.created_at ?? Date.now(), 0);
+      if (world.map) push(world.map, "landscape", null, null, "Carte du monde", null, world.name, world.created_at ?? Date.now(), 0);
+      items.sort((a, b) => b.created_at - a.created_at);
+      return json({ items });
     }
     // generate AI captions for the gallery in one pass (one LLM call)
     if (parts[1] === "conversations" && parts[2] && parts[3] === "gallery" && parts[4] === "captions" && method === "POST") {
@@ -835,37 +1236,45 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       let existing: Record<string, string> = {};
       const capFile = path.join(IMAGES_DIR, "conversations", String(convId), "captions.json");
       try { existing = JSON.parse(fs.readFileSync(capFile, "utf8")); } catch { /* none */ }
-      const provider = getProvider();
-      let model = defaultModelFor(provider.id);
-      if (!model) { const models = await provider.models(); model = models[0] ?? ""; }
-      const list = items.map((m: any, i: number) => `[${i + 1}] ${(m.content || "").slice(0, 300)}`).join("\n\n");
-      const sys = [
-        "Tu écris des légendes courtes pour la galerie d'illustrations d'une partie de roleplay.",
-        "Pour chaque extrait numéroté, écris une légende d'1-2 phrases qui résume ce qui se passe, comme la voix d'un documentaire.",
-        "Réponds strictement au format : 1: légende, 2: légende… Une ligne par numéro, rien d'autre.",
-      ].join(" ");
-      let text = "";
+      const job = createJob({ type: "captions", status: "running", progress: 0, conversation_id: convId, payload: JSON.stringify({ count: items.length }) });
       try {
-        for await (const delta of provider.stream({
-          messages: [{ role: "system", content: sys }, { role: "user", content: `Illustrations à légender :\n\n${list}` }],
-          model, temperature: 0.8, maxTokens: 800, noThinking: true,
-          signal: AbortSignal.timeout(120_000),
-        })) { text += delta; }
-      } catch (e) {
-        return json({ captions: existing, error: `Le modèle n'a pas pu écrire les légendes : ${e?.message ?? e}` });
-      }
-      const captions: Record<string, string> = {};
-      for (const line of text.split("\n")) {
-        const m = line.match(/^\s*(\d+)\s*[:.-]\s*(.+)$/);
-        if (m) {
-          const idx = Number(m[1]) - 1;
-          if (items[idx]) captions[String(items[idx].id)] = m[2].trim();
+        const provider = getProvider();
+        let model = defaultModelFor(provider.id);
+        if (!model) { const models = await provider.models(); model = models[0] ?? ""; }
+        const list = items.map((m: any, i: number) => `[${i + 1}] ${(m.content || "").slice(0, 300)}`).join("\n\n");
+        const sys = [
+          "Tu écris des légendes courtes pour la galerie d'illustrations d'une partie de roleplay.",
+          "Pour chaque extrait numéroté, écris une légende d'1-2 phrases qui résume ce qui se passe, comme la voix d'un documentaire.",
+          "Réponds strictement au format : 1: légende, 2: légende… Une ligne par numéro, rien d'autre.",
+        ].join(" ");
+        let text = "";
+        try {
+          for await (const delta of provider.stream({
+            messages: [{ role: "system", content: sys }, { role: "user", content: `Illustrations à légender :\n\n${list}` }],
+            model, temperature: 0.8, maxTokens: 800, noThinking: true,
+            signal: AbortSignal.timeout(120_000),
+          })) { text += delta; }
+        } catch (e) {
+          updateJob(job.id, { status: "failed", error: String((e as any)?.message ?? e).slice(0, 300), completed_at: Date.now() });
+          return json({ captions: existing, error: `Le modèle n'a pas pu écrire les légendes : ${(e as any)?.message ?? e}` });
         }
+        const captions: Record<string, string> = {};
+        for (const line of text.split("\n")) {
+          const m = line.match(/^\s*(\d+)\s*[:.-]\s*(.+)$/);
+          if (m) {
+            const idx = Number(m[1]) - 1;
+            if (items[idx]) captions[String(items[idx].id)] = m[2].trim();
+          }
+        }
+        Object.assign(existing, captions);
+        fs.mkdirSync(path.dirname(capFile), { recursive: true });
+        fs.writeFileSync(capFile, JSON.stringify(existing, null, 2));
+        updateJob(job.id, { status: "done", progress: 100, completed_at: Date.now() });
+        return json({ captions: existing });
+      } catch (e: any) {
+        updateJob(job.id, { status: "failed", error: String(e?.message ?? e).slice(0, 300), completed_at: Date.now() });
+        return json({ captions: existing, error: String(e?.message ?? e) }, 500);
       }
-      Object.assign(existing, captions);
-      fs.mkdirSync(path.dirname(capFile), { recursive: true });
-      fs.writeFileSync(capFile, JSON.stringify(existing, null, 2));
-      return json({ captions: existing });
     }
     // edit a message's content (double-click in the UI)
     if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] && !parts[5] && method === "PATCH") {
@@ -875,6 +1284,13 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const m = getMessage(mid);
       const conv = getConversation(convId);
       if (!conv || !m) return json({ error: "not found" }, 404);
+      const meta = JSON.parse(m.meta || "{}");
+      // meta-only updates (favoris, notes privées…) never touch content/audio
+      if (body.meta && typeof body.meta === "object" && !Array.isArray(body.meta)) {
+        Object.assign(meta, body.meta);
+        updateMessage(mid, { meta: JSON.stringify(meta) });
+        return json(messageView(getMessage(mid)!));
+      }
       if (typeof body.content !== "string" || !body.content.trim()) {
         return json({ error: "contenu vide" }, 400);
       }
@@ -885,7 +1301,6 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       }
       // content changed → the old audio + response suggestions no longer match
       updates.audio = "[]";
-      const meta = JSON.parse(m.meta || "{}");
       delete meta.suggestions;
       updates.meta = JSON.stringify(meta);
       updateMessage(mid, updates);
@@ -913,6 +1328,26 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       return json({ ok: true });
     }
     // emoji reactions on a message (kept in meta.reactions)
+    // bulk delete: remove EXACTLY the selected message ids (no cascade) — used
+    // by the chat's multi-select mode
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] === "bulk-delete" && method === "POST") {
+      const convId = Number(parts[2]);
+      const body = await readJson(req);
+      const ids = Array.isArray(body.ids) ? body.ids.map(Number).filter(Boolean) : [];
+      if (!ids.length) return json({ error: "aucun message sélectionné" }, 400);
+      const dir = path.join(AUDIO_DIR, String(convId));
+      for (const mid of ids) {
+        try {
+          for (const f of fs.readdirSync(dir)) {
+            if (f.startsWith(`${mid}-`) && f.endsWith(".wav")) fs.rmSync(path.join(dir, f), { force: true });
+          }
+        } catch { /* no audio dir */ }
+        deleteMessage(mid);
+      }
+      const last = lastMessageOf(convId);
+      updateConversation(convId, { last_message: last?.content ?? "" });
+      return json({ ok: true, removed: ids.length });
+    }
     if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] && parts[5] === "reactions" && (method === "POST" || method === "DELETE")) {
       const mid = Number(parts[4]);
       const m = getMessage(mid);
@@ -987,12 +1422,17 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         : body.kind === "landscape" || body.kind === "portrait" ? body.kind
         : detectSceneKind(m.content);
       const landscape = kind === "landscape";
-      const prompt = buildIllustrationPrompt(world?.name ?? "", world?.description ?? "", world?.tone ?? "épique", m.content, kind, char);
+      let prompt = buildIllustrationPrompt(world?.name ?? "", world?.description ?? "", world?.tone ?? "épique", m.content, kind, char);
       const seed =
         typeof body.seed === "number" ? body.seed
         : body.vary ? undefined
         : char ? charSeed(char.id)
         : undefined;
+      // optional seed-locked variation: same seed + a prompt tweak = same
+      // composition, different details (used by the gallery's 🔒 button)
+      if (typeof body.variation === "string" && body.variation.trim()) {
+        prompt = `${prompt}\n(${body.variation.trim().slice(0, 300)})`;
+      }
       // img2img: use the character's avatar as a visual reference so their
       // face stays consistent from one illustration to the next
       let init_image: string | undefined;
@@ -1004,9 +1444,17 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
           init_image = fs.readFileSync(avatarFile).toString("base64");
         }
       }
+      // per-world negative prompt overrides the global one (world.settings.negative)
+      let negative = NEGATIVE_PROMPT;
+      if (world) {
+        try {
+          const ws = JSON.parse(world.settings || "{}");
+          if (typeof ws.negative === "string" && ws.negative.trim()) negative = ws.negative.trim();
+        } catch { /* ignore */ }
+      }
       const res = await generateAndSave(`conversations/${convId}`, {
         prompt,
-        negative: NEGATIVE_PROMPT,
+        negative,
         steps: Number(getSetting("image_steps", 28)),
         cfg: Number(getSetting("image_cfg", 7)),
         width: Number(getSetting("image_width", landscape ? 1152 : 768)),
@@ -1026,6 +1474,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       if (!conv) return json({ error: "not found" }, 404);
       if (preparingAudio.has(conv.id)) return json({ busy: true, generated: 0, remaining: 0 });
       preparingAudio.add(conv.id);
+      const job = createJob({ type: "tts", status: "running", progress: 0, conversation_id: conv.id, payload: JSON.stringify({ kind: "prepare-audio" }) });
       try {
         const msgs = listMessages(conv.id).filter((m) => {
           if (m.role !== "assistant") return false;
@@ -1042,8 +1491,13 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
             updateMessage(m.id, { audio: JSON.stringify(audio) });
             generated++;
           }
+          updateJob(job.id, { progress: recent.length ? Math.round((generated / recent.length) * 100) : 100 });
         }
+        updateJob(job.id, { status: "done", progress: 100, completed_at: Date.now() });
         return json({ generated, remaining: Math.max(0, msgs.length - recent.length) });
+      } catch (e: any) {
+        updateJob(job.id, { status: "failed", error: String(e?.message ?? e).slice(0, 300), completed_at: Date.now() });
+        return json({ error: String(e?.message ?? e) }, 500);
       } finally {
         preparingAudio.delete(conv.id);
       }
@@ -1332,29 +1786,51 @@ function summarizeOverflow(convId: number, conv: ConversationRow, newMsgs: Messa
   try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
   const provider = getProvider((cs.provider as string) || undefined);
   const model = (cs.model as string) || defaultModelFor(provider.id);
-  const old = conv.summary && !conv.summary.startsWith(SUMMARY_PREFIX) ? conv.summary : "";
+  const oldMem = parseMemory(conv.memory_json);
+  const oldText = !oldMem && conv.summary && !conv.summary.startsWith(SUMMARY_PREFIX) ? conv.summary : "";
   const chat: ChatMessage[] = [
     { role: "system", content: summarizeSystem() },
-    ...(old ? [{ role: "user", content: `Résumé actuel à compléter :\n${old}` }] : []),
+    ...(oldMem
+      ? [{ role: "user", content: `Mémoire structurée actuelle à compléter (garde ce qui reste vrai) :\n${JSON.stringify(oldMem)}` }]
+      : oldText
+        ? [{ role: "user", content: `Résumé actuel à compléter :\n${oldText}` }]
+        : []),
     ...newMsgs.slice(-30).map((m) => ({ role: m.role === "user" ? "user" : "assistant", content: m.content.slice(0, 1500) })),
   ];
+  const job = createJob({ type: "summary", status: "running", progress: 0, conversation_id: convId, payload: JSON.stringify({ messages: newMsgs.length }) });
   provider
     .complete({ messages: chat, model, temperature: 0.4, maxTokens: 400, noThinking: true, signal: AbortSignal.timeout(90_000) })
     .then((text) => {
-      const summary = (text || "").trim();
-      if (!summary) return;
-      const merged = [SUMMARY_PREFIX, old ? `${old.trim()}\n` : "", summary].join("");
+      const raw = (text || "").trim();
+      if (!raw) return;
       const lastId = newMsgs[newMsgs.length - 1]?.id ?? 0;
-      updateConversation(convId, { summary: merged, summary_msg_id: lastId });
+      const mem = parseMemory(raw);
+      if (mem) {
+        // structured memory wins: store JSON + keep the readable rendering in sync
+        updateConversation(convId, {
+          memory_json: JSON.stringify(mem),
+          summary: memoryToText(mem),
+          summary_msg_id: lastId,
+        });
+      } else {
+        // fallback: plain-text rolling summary (previous behaviour)
+        const old = oldMem ? memoryToText(oldMem) : oldText;
+        const merged = [SUMMARY_PREFIX, old ? `${old.trim()}\n` : "", raw].join("");
+        updateConversation(convId, { summary: merged, summary_msg_id: lastId });
+      }
+      updateJob(job.id, { status: "done", progress: 100, completed_at: Date.now() });
     })
-    .catch((e) => console.error("[summary] failed:", String(e?.message ?? e).slice(0, 200)));
+    .catch((e) => {
+      updateJob(job.id, { status: "failed", error: String(e?.message ?? e).slice(0, 300), completed_at: Date.now() });
+      console.error("[summary] failed:", String(e?.message ?? e).slice(0, 200));
+    });
 }
 
 function applyContextWindow(
   convId: number,
   conv: ConversationRow,
   history: MessageRow[],
-): { kept: MessageRow[]; summary?: string } {
+): { kept: MessageRow[]; summary?: string; memory?: MemoryState } {
   let cs: Record<string, unknown> = {};
   try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
   // per-world cap acts as a hard ceiling over the conversation's own value,
@@ -1367,19 +1843,179 @@ function applyContextWindow(
     const worldCap = Number(ws.context_max_messages ?? getSetting("world_context_max_messages", 0));
     if (worldCap > 0) maxMsgs = Math.min(maxMsgs, worldCap);
   }
-  if (history.length <= maxMsgs) return { kept: history, summary: conv.summary || undefined };
+  const memory = parseMemory(conv.memory_json) || undefined;
+  if (history.length <= maxMsgs) return { kept: history, summary: conv.summary || undefined, memory };
   const kept = history.slice(-maxMsgs);
   const firstKeptId = kept[0]?.id ?? 0;
   const overflow = history.filter((m) => m.id < firstKeptId);
   const newMsgs = overflow.filter((m) => m.id > (conv.summary_msg_id ?? 0));
   if (newMsgs.length) summarizeOverflow(convId, conv, newMsgs); // background, non-blocking
-  return { kept, summary: conv.summary || undefined };
+  return { kept, summary: conv.summary || undefined, memory };
+}
+
+/**
+ * Narrative consistency check: ask the LLM for a list of incohérences
+ * (dead character back, item used before obtained, POV violation…).
+ * Button-triggered, never blocks a turn. Returns null when the model fails.
+ */
+async function validateNarrative(convId: number): Promise<{ findings: any[] } | null> {
+  const conv = getConversation(convId);
+  if (!conv) return null;
+  const view = conversationView(convId)!;
+  const msgs = listMessages(convId).slice(-16);
+  if (msgs.length < 2) return { findings: [] };
+  const { kept, summary, memory } = applyContextWindow(convId, conv, msgs);
+  const { system } = buildMessages(
+    { world: view.world, persona: view.persona, cards: view.cards, scenario: view.scenario, conversation: conv, summary, memory },
+    kept,
+  );
+  const transcript = msgs.map((m) => `${m.role === "user" ? "Joueur" : (m.name || "Narrateur")} : ${m.content.slice(0, 800)}`).join("\n");
+  const provider = getProvider();
+  let model = defaultModelFor(provider.id);
+  if (!model) { const models = await provider.models().catch(() => []); model = models[0] ?? ""; }
+  if (!model) return null;
+  const sys = [
+    "Tu es un correcteur de cohérence pour une partie de roleplay.",
+    "Relis le fil et détecte les incohérences : personnage mort qui réapparaît, objet utilisé avant d'être obtenu, lieu contradictoire, changement de nom, violation du point de vue, joueur contrôlé par l'IA.",
+    'Réponds avec un JSON strict : {"findings":[{"severity":"info|warning|critical","message":"l\'incohérence en une phrase","suggestion":"correction proposée"}]} — tableau vide si tout est cohérent.',
+    "Ne signale pas deux fois la même chose et ne sois pas tatillon : uniquement les vrais problèmes.",
+  ].join(" ");
+  const text = await provider
+    .complete({
+      messages: [{ role: "system", content: system + "\n\n" + sys }, { role: "user", content: transcript }],
+      model, temperature: 0.2, maxTokens: 500, noThinking: true, signal: AbortSignal.timeout(90_000),
+    })
+    .catch(() => "");
+  if (!text) return null;
+  const parse = (t: string) => {
+    try {
+      const p = JSON.parse(t);
+      return p && Array.isArray(p.findings) ? { findings: p.findings.slice(0, 6) } : null;
+    } catch { return null; }
+  };
+  return parse(text) ?? (() => { const m = text.match(/\{[\s\S]*\}/); return m ? parse(m[0]) : null; })();
+}
+
+/**
+ * Ask the LLM for a compact structured "scene state" (location, characters,
+ * goals, dangers, secrets) used by the collapsible chat panel. Never throws.
+ */
+async function generateSceneState(convId: number): Promise<Record<string, unknown> | null> {
+  const conv = getConversation(convId);
+  if (!conv) return null;
+  const view = conversationView(convId)!;
+  const msgs = listMessages(convId);
+  if (!msgs.length) return null;
+  const { kept, summary, memory } = applyContextWindow(convId, conv, msgs);
+  const { system } = buildMessages(
+    { world: view.world, persona: view.persona, cards: view.cards, scenario: view.scenario, conversation: conv, summary, memory },
+    kept,
+  );
+  const recent = msgs.slice(-8).map((m) => `${m.role === "user" ? "Joueur" : (m.name || "Narrateur")} : ${m.content.slice(0, 600)}`).join("\n");
+  const provider = getProvider();
+  let model = defaultModelFor(provider.id);
+  if (!model) { const models = await provider.models().catch(() => []); model = models[0] ?? ""; }
+  if (!model) return null;
+  const sys = [
+    "Tu es un outil d'analyse de partie de roleplay.",
+    "À partir du fil récent, produis un état de scène concis au format JSON strict, sans aucun texte autour :",
+    '{"location":"lieu actuel si identifiable, sinon vide","characters":["personnages présents"],"goals":["objectifs du joueur en cours"],"dangers":["menaces en cours"],"secrets":["secrets que le joueur a déjà découverts"],"notes":"une phrase de contexte"}',
+    "N'invente rien : ne mentionne que ce qui est visible dans le fil.",
+  ].join(" ");
+  const text = await provider
+    .complete({
+      messages: [{ role: "system", content: system + "\n\n" + sys }, { role: "user", content: recent }],
+      model, temperature: 0.3, maxTokens: 400, noThinking: true, signal: AbortSignal.timeout(90_000),
+    })
+    .catch(() => "");
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object") return parsed;
+  } catch {
+    const m = text.match(/\{[\s\S]*\}/);
+    if (m) { try { return JSON.parse(m[0]); } catch { /* ignore */ } }
+  }
+  return null;
+}
+
+/**
+ * Ask the LLM to spot MAJOR events across a world's playthroughs (arrivals,
+ * pacts, battles, item gains, revelations, big choices). Proposals only — the
+ * user accepts them one by one. Returns null when the model can't answer.
+ */
+async function proposeTimelineEvents(worldId: number): Promise<{ proposals: any[] } | null> {
+  const world = getWorld(worldId);
+  if (!world) return null;
+  const convs = listConversations().filter((c) => c.world_id === worldId);
+  const threads: { conv: ConversationRow; msgs: MessageRow[] }[] = [];
+  for (const conv of convs) {
+    const msgs = listMessages(conv.id).slice(-40);
+    if (msgs.length >= 2) threads.push({ conv, msgs });
+  }
+  if (!threads.length) return { proposals: [] };
+  const provider = getProvider();
+  let model = defaultModelFor(provider.id);
+  if (!model) { const models = await provider.models().catch(() => []); model = models[0] ?? ""; }
+  if (!model) return null;
+  const transcript = threads
+    .map(({ conv, msgs }) => `--- Partie : ${conv.title} ---\n` + msgs.map((m) => `${m.role === "user" ? "Joueur" : (m.name || "Narrateur")} : ${m.content.slice(0, 500)}`).join("\n"))
+    .join("\n\n");
+  const sys = [
+    "Tu es un outil d'analyse de partie de roleplay. À partir des échanges récents d'une campagne, repère les ÉVÉNEMENTS MAJEURS à retenir pour la chronologie du monde : arrivées, rencontres marquantes, pactes, batailles, objets obtenus, révélations, choix importants.",
+    "Ignore les échanges anodins. Maximum 6 événements, un seul par événement marquant.",
+    "Réponds UNIQUEMENT par un tableau JSON, sans aucun texte autour :",
+    `[{"label": "Jour 1 — Arrivée à Eldoria", "message": "extrait très court (moins de 120 caractères) tiré du fil justifiant l'événement"}]`,
+    "Le label commence par « Jour N — » en respectant l'ordre chronologique apparent.",
+  ].join(" ");
+  const text = await provider
+    .complete({
+      messages: [{ role: "system", content: sys }, { role: "user", content: transcript.slice(0, 16000) }],
+      model, temperature: 0.3, maxTokens: 700, noThinking: true, signal: AbortSignal.timeout(90_000),
+    })
+    .catch(() => "");
+  if (!text) return null;
+  const parse = (t: string): any[] | null => {
+    try {
+      const p = JSON.parse(t);
+      if (Array.isArray(p)) return p;
+      if (p && Array.isArray(p.proposals)) return p.proposals;
+      return null;
+    } catch { return null; }
+  };
+  let arr = parse(text) ?? (() => { const m = text.match(/\[[\s\S]*\]/); return m ? parse(m[0]) : null; })();
+  if (!arr) return null;
+  arr = arr.slice(0, 6).filter((p: any) => p && typeof p.label === "string" && p.label.trim());
+  // attach the source extract (nearest message mention) so the user can verify
+  const existing = new Set(listTimeline(worldId).map((e) => e.label.trim().toLowerCase()));
+  const proposals = arr.map((p: any) => {
+    const needle = String(p.message || "").trim().slice(0, 60).toLowerCase();
+    let found: { conversation_id: number; title: string; extract: string } | null = null;
+    for (const { conv, msgs } of threads) {
+      for (const m of msgs) {
+        if (needle && m.content.toLowerCase().includes(needle)) {
+          found = { conversation_id: conv.id, title: conv.title, extract: m.content.slice(0, 200) };
+          break;
+        }
+      }
+      if (found) break;
+    }
+    return {
+      label: p.label.trim(),
+      message: String(p.message || "").trim().slice(0, 120),
+      conversation_id: found?.conversation_id ?? null,
+      conversation: found?.title ?? null,
+      extract: found?.extract ?? null,
+      duplicate: existing.has(p.label.trim().toLowerCase()),
+    };
+  });
+  return { proposals };
 }
 
 async function generateSuggestions(ctx: CastContext, history: MessageRow[]): Promise<string[]> {
   // same context policy as the main stream
-  const { kept, summary } = applyContextWindow(ctx.conversation.id, ctx.conversation, history);
-  ctx = { ...ctx, summary };
+  const { kept, summary, memory } = applyContextWindow(ctx.conversation.id, ctx.conversation, history);
+  ctx = { ...ctx, summary, memory };
   let cs: Record<string, unknown> = {};
   try { cs = JSON.parse(ctx.conversation.settings || "{}"); } catch { /* ignore */ }
   const provider = getProvider((cs.provider as string) || undefined);
@@ -1432,17 +2068,18 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
   // history + new user message
   const history = listMessages(convId);
   // context window: keep recent messages, compress the rest into a rolling summary
-  const { kept, summary } = applyContextWindow(convId, conv, history.filter((m) => m.id !== userMsg.id));
-  const { system, messages } = buildMessages({ world, persona, cards, scenario, conversation: conv, summary }, kept);
+  const { kept, summary, memory } = applyContextWindow(convId, conv, history.filter((m) => m.id !== userMsg.id));
+  const { system, messages } = buildMessages({ world, persona, cards, scenario, conversation: conv, summary, memory }, kept);
   messages.push({ role: "user", content: modelText || directive });
   // interpellation directive (e.g. "ask the narrator / a character to speak")
   if (directive) messages[messages.length - 1].content += `\n\n[Directive : ${directive}]`;
 
   const settings = JSON.parse(conv.settings || "{}");
+  const preset = presetFromKey(settings.preset);
   const provider = getProvider((settings.provider as string) || undefined);
   const model = (settings.model as string) || defaultModelFor(provider.id);
-  const temperature = Number(settings.temperature ?? getSetting("temperature", 0.9));
-  const maxTokens = Number(settings.max_tokens ?? getSetting("max_tokens", 2048));
+  const temperature = Number(settings.temperature ?? preset?.temperature ?? getSetting("temperature", 0.9));
+  const maxTokens = Number(settings.max_tokens ?? preset?.maxTokens ?? getSetting("max_tokens", 2048));
   const ttsEnabled = Boolean(settings.tts_enabled ?? getSetting("tts_enabled", true));
 
   // hard timeout: a stuck model must not leave the UI on "…" forever
@@ -1507,6 +2144,10 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
       }
       // dashboard preview = the latest exchange
       updateConversation(convId, { last_message: full.trim().slice(0, 200) });
+      // game-master directives apply to THIS turn only — clear the pending flag
+      if (settings.dm) {
+        updateConversation(convId, { settings: JSON.stringify({ ...settings, dm_pending: false }) });
+      }
       send("done", { message: messageView(assistant) });
       // suggestions run in parallel with the (slow) TTS synthesis — the local
       // model accepts concurrent requests

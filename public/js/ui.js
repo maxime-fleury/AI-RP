@@ -12,6 +12,10 @@ export function el(tag, attrs = {}, ...children) {
     if (c == null) continue;
     node.append(c instanceof Node ? c : document.createTextNode(String(c)));
   }
+  // a11y: every icon/tooltip button gets an accessible name from its title
+  if (!node.hasAttribute("aria-label") && node.getAttribute("title")) {
+    node.setAttribute("aria-label", node.getAttribute("title"));
+  }
   return node;
 }
 
@@ -32,7 +36,7 @@ export function fmtTime(ts) {
 
 export function toast(msg, type = "ok", ms = 3800) {
   const root = document.getElementById("toasts");
-  const t = el("div", { class: `toast ${type}` }, type === "err" ? "⚠️" : "✅", msg);
+  const t = el("div", { class: `toast ${type}`, role: "status", "aria-live": "polite" }, type === "err" ? "⚠️" : "✅", msg);
   root.append(t);
   setTimeout(() => {
     t.style.opacity = "0";
@@ -41,19 +45,31 @@ export function toast(msg, type = "ok", ms = 3800) {
   }, ms);
 }
 
+/** Toast with a clickable action (e.g. "Annuler") — used for undoable deletes. */
+export function actionToast(msg, actionLabel, onAction, ms = 6000) {
+  const root = document.getElementById("toasts");
+  const btn = el("button", { class: "toast-action", onclick: () => { onAction?.(); dismiss(); } }, actionLabel);
+  const t = el("div", { class: "toast ok action", role: "status", "aria-live": "polite" }, "✅", msg, btn);
+  const dismiss = () => { t.style.opacity = "0"; t.style.transition = "opacity .3s"; setTimeout(() => t.remove(), 320); };
+  root.append(t);
+  setTimeout(dismiss, ms);
+}
+
 export function openModal({ title, sub, body, footer, wide = false, onClose }) {
   const root = document.getElementById("modal-root");
   const backdrop = el("div", { class: "modal-backdrop" });
-  const modal = el("div", { class: `modal${wide ? " wide" : ""}` });
-  if (title) modal.append(el("h3", {}, title));
+  const modal = el("div", { class: `modal${wide ? " wide" : ""}`, role: "dialog", "aria-modal": "true", "aria-labelledby": "airp-modal-title" });
+  if (title) modal.append(el("h3", { id: "airp-modal-title" }, title));
   if (sub) modal.append(el("div", { class: "m-sub" }, sub));
   if (body) modal.append(body);
   if (footer) modal.append(el("div", { class: "modal-footer" }, footer));
   backdrop.append(modal);
   root.append(backdrop);
+  const previousFocus = document.activeElement;
   const close = () => {
     document.removeEventListener("keydown", escKey);
     backdrop.remove();
+    if (previousFocus && typeof previousFocus.focus === "function") previousFocus.focus();
     onClose?.();
   };
   backdrop.addEventListener("mousedown", (e) => { if (e.target === backdrop) close(); });
@@ -62,6 +78,10 @@ export function openModal({ title, sub, body, footer, wide = false, onClose }) {
     if (e.key === "Escape" && backdrop === root.lastElementChild) close();
   }
   document.addEventListener("keydown", escKey);
+  setTimeout(() => {
+    const focusable = modal.querySelector("input, textarea, select, button, [tabindex]");
+    focusable?.focus();
+  }, 0);
   return { close, modal, backdrop };
 }
 

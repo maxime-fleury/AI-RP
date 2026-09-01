@@ -5,7 +5,23 @@
 import fs from "node:fs";
 import path from "node:path";
 import { UPLOADS_DIR } from "./paths";
-import { createCard, updateCard, getCard, type CardRow } from "./db";
+import { createCard, updateCard, getCard, cardByFingerprint, type CardRow } from "./db";
+
+// per-type size limits: PNG cards can be heavy, JSON must stay small
+// (guards against oversized imports and pathological JSON payloads)
+export const MAX_PNG_BYTES = 50 * 1024 * 1024; // 50 Mo
+export const MAX_JSON_BYTES = 5 * 1024 * 1024; // 5 Mo
+
+export type ImportStatus = "imported" | "duplicate" | "invalid";
+
+export interface ImportResult {
+  status: ImportStatus;
+  name: string;
+  /** human-readable reason (shown in the per-file report) */
+  reason?: string;
+  /** the created card, when status === "imported" */
+  card?: CardRow;
+}
 
 export interface ParsedCard {
   name: string;
@@ -113,12 +129,52 @@ export function parseJsonCard(bytes: Uint8Array): ParsedCard | null {
   return null;
 }
 
+/**
+ * Stable content fingerprint: canonical JSON (sorted keys) of the parsed card
+ * data, hashed with SHA-256. Two files carrying the same character content
+ * (whatever the whitespace/key order) hash identically → duplicate detection.
+ */
+export function fingerprintFor(raw: unknown): string {
+  const canonical = JSON.stringify(sortKeys(raw));
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(canonical);
+  return hasher.digest("hex");
+}
+
+function sortKeys(v: any): any {
+  if (Array.isArray(v)) return v.map(sortKeys);
+  if (v && typeof v === "object") {
+    const out: Record<string, any> = {};
+    for (const k of Object.keys(v).sort()) out[k] = sortKeys(v[k]);
+    return out;
+  }
+  return v;
+}
+
+/** Max allowed bytes for a given file name (PNG vs JSON), or 0 when unsupported. */
+export function sizeLimitFor(fileName: string): number {
+  const lower = (fileName || "").toLowerCase();
+  if (lower.endsWith(".png")) return MAX_PNG_BYTES;
+  if (lower.endsWith(".json")) return MAX_JSON_BYTES;
+  return 0;
+}
+
 export function importFile(
   fileName: string,
   bytes: Uint8Array,
   onProgress?: (name: string, status: string) => void,
-): CardRow | null {
+): ImportResult {
   const lower = fileName.toLowerCase();
+  const limit = sizeLimitFor(fileName);
+  if (!limit) {
+    onProgress?.(fileName, "ignoré (format non reconnu)");
+    return { status: "invalid", name: fileName, reason: "Format non reconnu (PNG ou JSON attendu)" };
+  }
+  if (bytes.byteLength > limit) {
+    onProgress?.(fileName, `ignoré (${(bytes.byteLength / 1024 / 1024).toFixed(1)} Mo > ${(limit / 1024 / 1024)} Mo)`);
+    return { status: "invalid", name: fileName, reason: `Fichier trop volumineux (${(bytes.byteLength / 1024 / 1024).toFixed(1)} Mo > limite ${(limit / 1024 / 1024).toFixed(0)} Mo)` };
+  }
+
   let parsed: ParsedCard | null = null;
   let avatar: Uint8Array | null = null;
 
@@ -134,7 +190,15 @@ export function importFile(
 
   if (!parsed) {
     onProgress?.(fileName, "ignoré (format non reconnu)");
-    return null;
+    return { status: "invalid", name: fileName, reason: "Contenu invalide : ni carte V1/V2/V3 ni PNG « chara »" };
+  }
+
+  // duplicate detection: same character content already imported?
+  const fp = fingerprintFor(parsed.raw);
+  const existing = cardByFingerprint(fp);
+  if (existing) {
+    onProgress?.(fileName, `doublon de « ${existing.name} »`);
+    return { status: "duplicate", name: fileName, reason: `Déjà importée : « ${existing.name} » (id ${existing.id})` };
   }
 
   const card = createCard({
@@ -150,6 +214,7 @@ export function importFile(
     tags: JSON.stringify(parsed.tags),
     creator: parsed.creator,
     data: JSON.stringify(parsed.raw),
+    fingerprint: fp,
   });
 
   if (avatar) {
@@ -162,7 +227,7 @@ export function importFile(
 
   onProgress?.(fileName, `importé : ${parsed.name}`);
   // re-read: the card row was updated with the avatar after createCard
-  return getCard(card.id);
+  return { status: "imported", name: fileName, card: getCard(card.id)! };
 }
 
 export function scanDirectory(dirPath: string, onProgress?: (name: string, status: string) => void): number {
@@ -171,7 +236,7 @@ export function scanDirectory(dirPath: string, onProgress?: (name: string, statu
   for (const e of entries) {
     if (e.isFile() && /\.(png|json)$/i.test(e.name)) {
       const bytes = new Uint8Array(fs.readFileSync(path.join(dirPath, e.name)));
-      if (importFile(e.name, bytes, onProgress)) count++;
+      if (importFile(e.name, bytes, onProgress).status === "imported") count++;
     }
   }
   return count;

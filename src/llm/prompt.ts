@@ -2,8 +2,8 @@
  * SillyTavern-inspired prompt assembly for roleplay, plus parsing of assistant
  * output into segments (narration / character dialogue) used by the TTS.
  */
-import type { CardRow, ConversationRow, MessageRow, PersonaRow, ScenarioRow, WorldRow } from "../server/db";
-import { getSetting } from "../server/db";
+import type { CardRow, ConversationRow, LorebookRow, MessageRow, PersonaRow, ScenarioRow, WorldRow } from "../server/db";
+import { getSetting, activeLorebook } from "../server/db";
 
 export interface NarratorPreset {
   label: string;
@@ -48,6 +48,115 @@ export function narratorPresets(): Record<string, NarratorPreset> {
   return out;
 }
 
+// ─── generation presets (per-party style profiles) ───────────────────────────
+export interface GenerationPreset {
+  label: string;
+  temperature: number;
+  maxTokens: number;
+  /** style directive injected into the system prompt while the preset is active */
+  directive: string;
+}
+
+export const GENERATION_PRESETS: Record<string, GenerationPreset> = {
+  cinematique: {
+    label: "Cinématique", temperature: 0.95, maxTokens: 3000,
+    directive: "Style cinématique : plans larges, transitions de scène nettes, rythme soutenu, dialogues percutants, descriptions évocatrices mais jamais verbeuses.",
+  },
+  rapide: {
+    label: "Rapide", temperature: 0.85, maxTokens: 1200,
+    directive: "Style rapide : actions courtes et directes, descriptions minimales, l'histoire avance vite à chaque tour.",
+  },
+  canon: {
+    label: "Fidèle au canon", temperature: 0.5, maxTokens: 2500,
+    directive: "Style fidèle au canon : respect strict des faits déjà établis, cohérence absolue, aucune invention qui contredirait le passé.",
+  },
+  chaotique: {
+    label: "Chaotique", temperature: 1.2, maxTokens: 3000,
+    directive: "Style chaotique : situations imprévisibles, retournements absurdes, humour noir, tout peut basculer à tout moment.",
+  },
+  dialogue: {
+    label: "Dialogue", temperature: 1.0, maxTokens: 2000,
+    directive: "Style dialogue : priorité aux échanges entre personnages, narration minimale, répliques vivantes et naturelles.",
+  },
+  horreur: {
+    label: "Horreur", temperature: 0.9, maxTokens: 2500,
+    directive: "Style horreur : atmosphère oppressante, tension montante, détails dérangeants, le danger se fait sentir avant d'apparaître.",
+  },
+  romance: {
+    label: "Romance", temperature: 1.0, maxTokens: 2200,
+    directive: "Style romance : attention aux émotions, regards, non-dits, gestes tendres, tension romantique qui se construit.",
+  },
+  narration_courte: {
+    label: "Narration courte", temperature: 0.8, maxTokens: 900,
+    directive: "Style narration courte : 2 à 4 phrases par tour, essentielles et évocatrices, jamais de remplissage.",
+  },
+};
+
+/** Resolve a preset key from conversation settings ("" or unknown → null). */
+export function presetFromKey(key: unknown): GenerationPreset | null {
+  if (typeof key !== "string" || !key) return null;
+  return GENERATION_PRESETS[key] ?? null;
+}
+
+export interface MemoryState {
+  location?: string;
+  characters?: string[];
+  goals?: string[];
+  facts?: string[];
+  items?: string[];
+  relationships?: Record<string, string>;
+}
+
+/** Parse structured memory from LLM output — tolerates ```json fences and noise. */
+export function parseMemory(text: unknown): MemoryState | null {
+  if (typeof text !== "string" || !text.trim()) return null;
+  let raw = text.trim();
+  raw = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  let obj: any = null;
+  try {
+    obj = JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return null;
+  const str = (v: any): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+  const strArr = (v: any): string[] | undefined => {
+    if (!Array.isArray(v)) return undefined;
+    const arr = v.map((x) => String(x).trim()).filter(Boolean);
+    return arr.length ? arr : undefined;
+  };
+  const rel: Record<string, string> = {};
+  if (obj.relationships && typeof obj.relationships === "object" && !Array.isArray(obj.relationships)) {
+    for (const [k, v] of Object.entries(obj.relationships)) rel[k] = String(v);
+  }
+  const out: MemoryState = {
+    location: str(obj.location) || undefined,
+    characters: strArr(obj.characters),
+    goals: strArr(obj.goals),
+    facts: strArr(obj.facts),
+    items: strArr(obj.items),
+    relationships: Object.keys(rel).length ? rel : undefined,
+  };
+  return Object.values(out).some((v) => v !== undefined) ? out : null;
+}
+
+/** Readable rendering of the structured memory (used for list views + fallback). */
+export function memoryToText(m: MemoryState): string {
+  const lines: string[] = [];
+  if (m.location) lines.push(`📍 Lieu : ${m.location}`);
+  if (m.characters?.length) lines.push(`👥 Personnages : ${m.characters.join(", ")}`);
+  if (m.goals?.length) lines.push(`🎯 Objectifs : ${m.goals.join(" ; ")}`);
+  if (m.items?.length) lines.push(`📦 Objets : ${m.items.join(", ")}`);
+  if (m.relationships && Object.keys(m.relationships).length) {
+    lines.push(`🔗 Relations : ${Object.entries(m.relationships).map(([k, v]) => `${k} → ${v}`).join(" ; ")}`);
+  }
+  if (m.facts?.length) lines.push(`📌 Faits : ${m.facts.join(" ; ")}`);
+  return lines.join("\n");
+}
+
 export interface CastContext {
   world?: WorldRow | null;
   persona?: PersonaRow | null;
@@ -55,6 +164,8 @@ export interface CastContext {
   scenario?: ScenarioRow | null;
   conversation: ConversationRow;
   summary?: string; // rolling summary of events older than the kept history
+  memory?: MemoryState; // structured memory (location, characters, goals, facts…)
+  lore?: LorebookRow[]; // active lorebook entries (triggers matched), injected below
 }
 
 export function buildSystemPrompt(ctx: CastContext): string {
@@ -76,10 +187,16 @@ export function buildSystemPrompt(ctx: CastContext): string {
     );
   }
 
-  // narrator voice preset (settings) — overrides the world narration style.
-  // Presets live in narrator_presets (settings) : custom keys + overrides of
-  // the built-ins, seeded with the defaults below.
-  const styleKey = String(getSetting("narrator_style", "epique"));
+  // narrator voice preset — the world can override the global setting (each
+  // world picks its own narration style in the world editor, stored in the
+  // narration_style column). Presets live in narrator_presets (settings) :
+  // custom keys + overrides of the built-ins. Unresolvable keys (e.g. legacy
+  // free-text values) fall back to the global style.
+  let styleKey = String(getSetting("narrator_style", "epique"));
+  if (world && world.narration_style?.trim()) {
+    const wsKey = world.narration_style.trim();
+    if (narratorPresets()[wsKey]) styleKey = wsKey;
+  }
   const styleDesc = narratorPresets()[styleKey]?.prompt ?? narratorPresets().epique.prompt;
   parts.push(`## Style du narrateur\n${styleDesc}\n`);
 
@@ -106,6 +223,51 @@ export function buildSystemPrompt(ctx: CastContext): string {
     parts.push(`## Situation de départ\n${ctx.scenario.intro}\n`);
   }
 
+  // active generation preset (per-party style profile)
+  {
+    let cs: Record<string, unknown> = {};
+    try { cs = JSON.parse(ctx.conversation.settings || "{}"); } catch { /* ignore */ }
+    const preset = presetFromKey(cs.preset);
+    if (preset) parts.push(`## Directives de style (« ${preset.label} »)\n${preset.directive}\n`);
+  }
+
+  // game-master mode (10.A): one-shot directives applied to the NEXT turn only —
+  // the panel sets settings.dm + dm_pending, cleared server-side once the turn
+  // completes, so the next response follows these instructions then reverts
+  {
+    let cs: Record<string, unknown> = {};
+    try { cs = JSON.parse(ctx.conversation.settings || "{}"); } catch { /* ignore */ }
+    const dm = cs.dm as Record<string, unknown> | undefined;
+    if (dm && cs.dm_pending) {
+      const lines: string[] = [];
+      if (typeof dm.tension === "number") {
+        const t = Number(dm.tension);
+        lines.push(`Tension : ${t < 34 ? "calme et contemplatif" : t < 67 ? "soutenue, avec des enjeux clairs" : "élevée, urgente et oppressante"} (${t}/100).`);
+      }
+      if (typeof dm.focus === "string" && dm.focus) lines.push(`Mets ${dm.focus} au premier plan de la scène : ses actions, son point de vue, sa voix.`);
+      if (typeof dm.reveal === "string" && dm.reveal.trim()) lines.push(`Révèle progressivement : ${dm.reveal.trim().slice(0, 300)} — sans tout dévoiler d'un coup.`);
+      if (typeof dm.pace === "string" && dm.pace && dm.pace !== "normal") {
+        lines.push(dm.pace === "rapide" ? "Rythme rapide : scènes courtes, actions enchaînées, peu de descriptions longues." : "Rythme lent : descriptions détaillées, ambiances posées, temps de respiration.");
+      }
+      if (typeof dm.style === "string" && dm.style) lines.push(`Style de la scène : ${dm.style}.`);
+      if (typeof dm.length === "string" && dm.length) {
+        lines.push(dm.length === "courte" ? "Réponse courte : 1 à 2 paragraphes." : dm.length === "longue" ? "Réponse longue et dense : 5 à 8 paragraphes." : "Longueur normale : 2 à 4 paragraphes.");
+      }
+      if (lines.length) parts.push(`## Directives du maître de jeu (ce tour uniquement)\n${lines.join("\n")}\n`);
+    }
+  }
+
+  // lorebook: conditional world knowledge — only entries whose triggers appear
+  // in the recent text are included, so rich worlds don't blow up the context
+  if (ctx.lore?.length) {
+    parts.push(`## Connaissances du monde (mémoire)\n${ctx.lore.map((e) => `- ${e.name} : ${e.content.trim()}`).join("\n")}\n`);
+  }
+
+  if (ctx.memory) {
+    const t = memoryToText(ctx.memory);
+    parts.push(`## Mémoire structurée (état du monde)\n${t}\n`);
+  }
+
   if (ctx.summary) {
     parts.push(`## Résumé des événements précédents\n${ctx.summary}\n`);
   }
@@ -125,6 +287,13 @@ export function buildSystemPrompt(ctx: CastContext): string {
 }
 
 export function buildMessages(ctx: CastContext, history: MessageRow[]): { system: string; messages: { role: "user" | "assistant"; content: string }[] } {
+  // lorebook triggers are matched against the recent exchange (the last few
+  // messages), so entries activate exactly when the fiction mentions them
+  if (ctx.world && !ctx.lore) {
+    const recent = history.slice(-6).map((m) => m.content).join("\n");
+    const active = activeLorebook(ctx.world.id, recent);
+    if (active.length) ctx.lore = active;
+  }
   const system = buildSystemPrompt(ctx);
   const personaName = ctx.persona?.name ?? "Moi";
   const messages: { role: "user" | "assistant"; content: string }[] = [];
@@ -139,11 +308,16 @@ export function buildMessages(ctx: CastContext, history: MessageRow[]): { system
 }
 
 // instructions for the background rolling-summary task
+// The model is asked for structured JSON (location, characters, goals, facts,
+// items, relationships) so the memory stays robust — a free-text paragraph is
+// accepted as a fallback when the model can't produce JSON.
 export function summarizeSystem(): string {
   return [
-    "Tu compresses un fil de roleplay en un résumé court et utile pour l'IA qui poursuit l'histoire.",
-    "Écris 3 à 6 phrases en français : personnages, lieu, événements importants, état émotionnel, objectifs en cours, indices encore actifs.",
-    "Garde les noms propres et les détails qui resteront importants plus tard. Pas de commentaires, uniquement le résumé.",
+    "Tu compresses un fil de roleplay en une mémoire structurée pour l'IA qui poursuit l'histoire.",
+    "Réponds UNIQUEMENT par un objet JSON valide, sans commentaire, avec ces champs :",
+    '{"location": "lieu actuel", "characters": ["noms"], "goals": ["objectifs en cours"], "facts": ["événements importants, indices actifs"], "items": ["objets possédés/importants"], "relationships": {"X": "nature du lien avec Y"}}',
+    "Garde les noms propres. Complète les informations manquantes, ne répète pas l'ancienne mémoire à l'identique.",
+    "Si tu ne peux pas produire de JSON, écris 3 à 6 phrases en français à la place.",
   ].join("\n");
 }
 

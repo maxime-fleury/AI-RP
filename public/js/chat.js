@@ -1,4 +1,4 @@
-import { api, readSseStream } from "./api.js?v=30";
+import { api, apiFetch, readSseStream } from "./api.js?v=30";
 import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=30";
 import { store, refreshAll, navigate, applyTheme } from "./app.js?v=30";
 
@@ -8,43 +8,184 @@ let busy = false;
 let streamGeneration = 0;
 let abortController = null;
 let chipsRowRef = null;
+let sceneRefreshHook = null; // set by renderChat; fired after each completed turn
+let lastAutoValidateAt = 0; // per-session throttle for the auto coherence check
+let autoValidateBusy = false;
+// multi-select mode (module-level so renderMessage can read it)
+let selectionMode = false;
+const selectedIds = new Set();
+let selectionBarRef = null; // wired by renderChat
+let selectionExitRef = null; // wired by renderChat (the ☑ button)
+function paintSelectionBar() {
+  const bar = selectionBarRef;
+  if (!bar) return;
+  const conv = currentConversation;
+  if (!selectionMode || !selectedIds.size || !conv) { bar.hidden = true; return; }
+  bar.hidden = false;
+  const count = selectedIds.size;
+  const md = () => {
+    const sel = (conv.messages || []).filter((m) => selectedIds.has(m.id));
+    return sel.map((m) => {
+      const who = m.role === "user" ? (conv.persona?.name || "Moi") : (m.name || "Narrateur");
+      return m.role === "user" ? `**${who}** : ${m.content || ""}` : `> **${who}** : ${m.content || ""}`;
+    }).join("\n\n");
+  };
+  const copyBtn = el("button", { class: "mini-btn", onclick: () => copyText(md(), "Sélection") }, "📋 Copier");
+  const expBtn = el("button", { class: "mini-btn", onclick: () => {
+    const blob = new Blob([md()], { type: "text/markdown" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${(conv.title || "partie").replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-") || "partie"}-selection.md`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast("Sélection exportée (.md) ✓");
+  } }, "📄 Exporter .md");
+  const delBtn = el("button", { class: "mini-btn", style: { color: "var(--danger)" }, onclick: async () => {
+    if (!(await confirmModal({ title: "Supprimer les messages", message: `Supprimer définitivement ${count} message${count > 1 ? "s" : ""} ?` }))) return;
+    try {
+      await api(`/api/conversations/${conv.id}/messages/bulk-delete`, { body: { ids: [...selectedIds] } });
+      selectedIds.clear();
+      toast(`${count} message${count > 1 ? "s" : ""} supprimé${count > 1 ? "s" : ""} ✓`);
+      renderChat(conv.id);
+    } catch (e) { toast(e.message, "err"); }
+  } }, ICONS.trash);
+  const closeBtn = el("button", { class: "mini-btn", "aria-label": "Fermer la sélection", onclick: () => selectionExitRef?.click() }, "✕");
+  bar.replaceChildren(
+    el("span", { class: "sel-count" }, `☑ ${count} sélectionné${count > 1 ? "s" : ""}`),
+    copyBtn,
+    expBtn,
+    delBtn,
+    closeBtn,
+  );
+}
 const audioPrepared = new Set();
 
 // ─── audio queue ──────────────────────────────────────────────────────────────
+// ── global TTS playback queue (pause/resume, volume per voice, current voice) ──
+// items are { url, voice }; volume = global slider × role slider (localStorage)
+const roleVolumeKey = (convId, voice) => `ai-rp-role-vol-${convId}-${voice}`;
+const roleVolume = (convId, voice) => {
+  try {
+    const raw = localStorage.getItem(roleVolumeKey(convId, voice));
+    if (raw != null) { const v = Number(raw); if (v >= 0 && v <= 1) return v; }
+  } catch { /* ignore */ }
+  return 1;
+};
+export function setRoleVolume(convId, voice, v) {
+  try { localStorage.setItem(roleVolumeKey(convId, voice), String(Math.max(0, Math.min(1, v)))); } catch { /* ignore */ }
+}
+export function globalVolume() {
+  try {
+    const raw = localStorage.getItem("ai-rp-global-vol");
+    if (raw != null) { const v = Number(raw); if (v >= 0 && v <= 1) return v; }
+  } catch { /* ignore */ }
+  return 1;
+}
+// UI hook: renderChat wires the floating audio bar here
+let audioUI = { playing: false, paused: false, voice: null, convId: null };
+export function setAudioUI(hook) { audioUI = hook; }
+
+// ── game-master mode (10.A): directives for the next turn only ───────────────
+const DM_RYTHME = ["normal", "rapide", "lent"];
+const DM_STYLES = ["", "Horreur", "Drame", "Action", "Léger & humoristique", "Héroïque", "Émotionnel"];
+const DM_LENGTHS = ["normale", "courte", "longue"];
+function dmState(conv) {
+  try { return JSON.parse(conv.settings || "{}").dm || {}; } catch { return {}; }
+}
+function dmPending(conv) {
+  try { return Boolean(JSON.parse(conv.settings || "{}").dm_pending); } catch { return false; }
+}
+async function dmSave(convId, dm, pending) {
+  const conv = currentConversation;
+  if (!conv) return;
+  const cs = JSON.parse(conv.settings || "{}");
+  cs.dm = dm;
+  cs.dm_pending = Boolean(pending);
+  await api(`/api/conversations/${convId}`, { method: "PATCH", body: { settings: cs } });
+  conv.settings = JSON.stringify(cs);
+}
 const audioQueue = {
   items: [],
   playing: false,
+  paused: false,
   current: null,
+  currentVoice: null,
   resolveCurrent: null,
   gen: 0,
-  async play(urls) {
+  async play(urls, convId) {
     for (const u of urls) this.items.push(u);
+    this.convId = convId;
     if (!this.playing) await this.pump();
+  },
+  async waitWhilePaused() {
+    while (this.paused && !this.current) await new Promise((r) => setTimeout(r, 150));
   },
   async pump() {
     this.playing = true;
+    audioUI.playing = true;
+    audioUI.paused = false;
+    audioUI.convId = this.convId;
+    audioUI.onchange?.();
     const myGen = this.gen;
     while (this.items.length) {
-      const url = this.items.shift();
+      await this.waitWhilePaused();
+      if (myGen !== this.gen) break;
+      const item = this.items.shift();
+      const voice = item?.voice ?? null;
       await new Promise((resolve) => {
         this.resolveCurrent = resolve;
-        const a = new Audio(url);
+        this.currentVoice = voice;
+        audioUI.voice = voice;
+        audioUI.onchange?.();
+        const a = new Audio(item.url);
         this.current = a;
+        a.volume = globalVolume() * (voice ? roleVolume(this.convId, voice) : 1);
         const done = () => { if (this.resolveCurrent === resolve) this.resolveCurrent = null; resolve(); };
         a.onended = done;
         a.onerror = done;
         a.play().catch(done);
       });
+      this.currentVoice = null;
       if (myGen !== this.gen) break; // stopped mid-play → abandon this pump
     }
-    if (myGen === this.gen) { this.playing = false; this.current = null; }
+    if (myGen === this.gen) {
+      this.playing = false;
+      this.current = null;
+      this.currentVoice = null;
+      audioUI.playing = false;
+      audioUI.paused = false;
+      audioUI.voice = null;
+      audioUI.onchange?.();
+    }
+  },
+  pause() {
+    if (!this.playing) return;
+    this.paused = true;
+    audioUI.paused = true;
+    audioUI.onchange?.();
+    if (this.current) { try { this.current.pause(); } catch { /* ignore */ } }
+  },
+  resume() {
+    this.paused = false;
+    audioUI.paused = false;
+    audioUI.onchange?.();
+    if (this.current && this.playing) { this.current.volume = globalVolume() * (this.currentVoice ? roleVolume(this.convId, this.currentVoice) : 1); this.current.play().catch(() => {}); }
+  },
+  togglePause() {
+    if (this.paused) this.resume(); else this.pause();
   },
   stop() {
     this.items = [];
     this.gen++;
     this.playing = false;
+    this.paused = false;
+    this.currentVoice = null;
     if (this.resolveCurrent) { const r = this.resolveCurrent; this.resolveCurrent = null; r(); }
     if (this.current) { try { this.current.pause(); } catch { /* ignore */ } }
+    audioUI.playing = false;
+    audioUI.paused = false;
+    audioUI.voice = null;
+    audioUI.onchange?.();
   },
 };
 
@@ -87,12 +228,151 @@ export async function renderChat(convIdRaw) {
   );
   const settingsBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Réglages de la partie", onclick: convSettingsModal }, "⚙️");
   const searchBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Rechercher dans l'historique (Entrée = suivant)", onclick: () => { searchBar.hidden = !searchBar.hidden; if (!searchBar.hidden) searchInput.focus(); } }, "🔍");
+  const sceneBtn = el("button", { class: "btn btn-ghost btn-icon", title: "État de la scène (lieu, objectifs, dangers)", onclick: () => { sceneEnabled = !sceneEnabled; scenePanel.hidden = !scenePanel.hidden; if (!scenePanel.hidden) refreshScene(); } }, "🧭");
+  const branchesBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Variantes de la partie (branches)", onclick: branchesModal }, "🌿");
+  const memoryBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Mémoire structurée (lieu, personnages, objectifs)", onclick: memoryModal }, "🧠");
+  const dmBtn = el("button", { class: "btn btn-ghost btn-icon" + (dmPending(conv) ? " on" : ""), title: "Mode maître de jeu (directives pour le prochain tour)", onclick: () => { dmEnabled = !dmEnabled; dmPanel.hidden = !dmPanel.hidden; if (!dmPanel.hidden) dmPaint(); } }, "🎮");
+  const validateBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Vérifier la cohérence du fil (IA)", onclick: validateModal }, "🛡");
+  const bookmarkFilterBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Afficher seulement les favoris", onclick: () => {
+    bookmarkFilter = !bookmarkFilter;
+    bookmarkFilterBtn.classList.toggle("on", bookmarkFilter);
+    bookmarkFilterBtn.title = bookmarkFilter ? "Afficher tout le fil" : "Afficher seulement les favoris";
+    paintThread();
+  } }, "★");
+  const copyThreadBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Copier le fil en Markdown", onclick: () => {
+    const lines = (conv.messages || []).map((m) => {
+      const who = m.role === "user" ? (conv.persona?.name || "Moi") : (m.name || "Narrateur");
+      return m.role === "user" ? `**${who}** : ${m.content || ""}` : `> **${who}** : ${m.content || ""}`;
+    });
+    copyText(lines.join("\n\n"), "Fil");
+  } }, "📋");
+  const selectBtn = el("button", { class: "btn btn-ghost btn-icon" + (selectionMode ? " on" : ""), title: selectionMode ? "Quitter la sélection" : "Sélectionner plusieurs messages", onclick: () => {
+    selectionMode = !selectionMode;
+    selectedIds.clear();
+    selectBtn.classList.toggle("on", selectionMode);
+    selectBtn.title = selectionMode ? "Quitter la sélection" : "Sélectionner plusieurs messages";
+    paintSelectionBar();
+    paintThread();
+  } }, "☑");
+  const mdBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Exporter en Markdown (livre avec chapitres)", onclick: async () => {
+    mdBtn.disabled = true;
+    try {
+      // if the conversation is part of a branch family, let the user choose
+      // between the current branch and the canon (main + ⭐) branches only
+      let branchMode = "current";
+      try {
+        const { branches } = await api(`/api/conversations/${convId}/branches`);
+        if (branches?.length > 1) {
+          branchMode = await new Promise((resolve) => {
+            const { close } = openModal({
+              title: "📄 Exporter en Markdown",
+              sub: "Cette partie fait partie d'une famille de branches.",
+              body: el("div", { class: "export-branch-pick" },
+                el("button", { class: "btn btn-ghost", onclick: () => { close(); resolve("current"); } }, "🌿 Cette branche (actuelle)"),
+                el("button", { class: "btn btn-primary", onclick: () => { close(); resolve("canon"); } }, "⭐ Canon (branches principales uniquement)"),
+              ),
+              footer: [el("button", { class: "btn btn-ghost", onclick: () => { close(); resolve(""); } }, "Annuler")],
+            });
+          });
+          if (!branchMode) return;
+        }
+      } catch { /* famille indisponible → export de la branche actuelle */ }
+      const res = await apiFetch(`/api/conversations/${convId}/export-md?branch=${encodeURIComponent(branchMode)}`);
+      if (!res.ok) throw new Error((await res.text().catch(() => "")) || "Export impossible");
+      const blob = await res.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `${(conv.title || "partie").replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-") || "partie"}${branchMode === "canon" ? "-canon" : ""}.md`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      toast(branchMode === "canon" ? "Export canon ✓" : "Export Markdown ✓");
+    } catch (e) { toast(e.message, "err"); }
+    finally { mdBtn.disabled = false; }
+  } }, "📄");
   const exportBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Exporter la partie (ZIP : texte + audio + images)", onclick: exportZip }, "⬇");
   const galleryBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Galerie d'illustrations", onclick: openGallery }, "🖼");
   const delBtn = el("button", { class: "btn btn-ghost btn-icon", style: { color: "var(--danger)" }, title: "Archiver cette partie", onclick: deleteConversation }, "🗑");
 
   const searchInput = el("input", { placeholder: "Rechercher dans le fil… (Entrée = suivant)" });
   const searchBar = el("div", { class: "search-bar", hidden: true }, searchInput);
+
+  // ── game-master panel (collapsible): tension / focus / reveal / pace / style ──
+  let dmEnabled = false;
+  const dmPanel = el("div", { class: "dm-panel", hidden: true });
+  let dm = dmState(conv);
+  let dmActive = dmPending(conv);
+  const dmPaint = () => {
+    const tension = el("input", { type: "range", min: 0, max: 100, step: 5, value: dm.tension ?? 50, "aria-label": "Tension" });
+    const tensionLbl = el("span", { class: "dm-val" });
+    const paintTension = () => {
+      const t = Number(tension.value);
+      tensionLbl.textContent = t < 34 ? `calme (${t})` : t < 67 ? `soutenue (${t})` : `élevée (${t})`;
+    };
+    tension.addEventListener("input", () => { dm.tension = Number(tension.value); paintTension(); });
+    paintTension();
+    const focusSel = el("select", { class: "mini-select" },
+      ["", "Narrateur", ...(conv.cards || []).map((c) => c.name)].map((n) => el("option", { value: n, ...(dm.focus === n ? { selected: "" } : {}) }, n || "— aucun focus —")),
+    );
+    focusSel.addEventListener("change", () => { dm.focus = focusSel.value; });
+    const revealInput = el("input", { placeholder: "Secret à révéler (ex: l'identité du mage)", value: dm.reveal || "" });
+    revealInput.addEventListener("input", () => { dm.reveal = revealInput.value; });
+    const paceSel = el("select", { class: "mini-select" },
+      DM_RYTHME.map((r) => el("option", { value: r, ...(dm.pace === r ? { selected: "" } : {}) }, r === "normal" ? "rythme normal" : r === "rapide" ? "⚡ rapide" : "🐢 lent")),
+    );
+    paceSel.addEventListener("change", () => { dm.pace = paceSel.value; });
+    const styleSel = el("select", { class: "mini-select" },
+      DM_STYLES.map((s) => el("option", { value: s, ...(dm.style === s ? { selected: "" } : {}) }, s || "style par défaut")),
+    );
+    styleSel.addEventListener("change", () => { dm.style = styleSel.value; });
+    const lenSel = el("select", { class: "mini-select" },
+      DM_LENGTHS.map((l) => el("option", { value: l, ...(dm.length === l ? { selected: "" } : {}) }, l === "normale" ? "longueur normale" : l === "courte" ? "courte" : "longue")),
+    );
+    lenSel.addEventListener("change", () => { dm.length = lenSel.value; });
+    const applyBtn = el("button", { class: "btn btn-primary btn-sm" + (dmActive ? " on" : "") }, dmActive ? "🎯 Actif — prochain tour" : "🎯 Appliquer au prochain tour");
+    applyBtn.addEventListener("click", async () => {
+      dmActive = !dmActive;
+      applyBtn.textContent = dmActive ? "🎯 Actif — prochain tour" : "🎯 Appliquer au prochain tour";
+      applyBtn.classList.toggle("on", dmActive);
+      dmBtn.classList.toggle("on", dmActive);
+      try { await dmSave(convId, dm, dmActive); toast(dmActive ? "Directives du maître de jeu actives pour le prochain tour ✓" : "Directives désactivées ✓"); }
+      catch (e) { toast(e.message, "err"); }
+    });
+    const row = (label, control) => el("label", { class: "dm-row" }, el("span", { class: "dm-label" }, label), control);
+    dmPanel.replaceChildren(
+      el("div", { class: "dm-head" },
+        el("span", {}, "🎮 Directives du maître de jeu"),
+        el("span", { class: "dm-note" }, dmActive ? "actives — appliquées au prochain tour, puis désactivées" : "inactives — le prochain tour reste normal"),
+      ),
+      el("div", { class: "dm-grid" },
+        row("Tension", el("div", { class: "dm-tension" }, tension, tensionLbl)),
+        row("Focus", focusSel),
+        row("Rythme", paceSel),
+        row("Style", styleSel),
+        row("Longueur", lenSel),
+      ),
+      row("Révéler", revealInput),
+      el("div", { style: { display: "flex", justifyContent: "flex-end", marginTop: "10px" } }, applyBtn),
+    );
+  };
+
+  // ── scene-state panel (collapsible, LLM-maintained) ──
+  let sceneEnabled = false;
+  const scenePanel = el("div", { class: "scene-panel", hidden: true });
+  const refreshScene = async () => {
+    try {
+      const r = await api(`/api/conversations/${convId}/scene`);
+      scenePanel.replaceChildren(renderScenePanel(r.state, r.updatedAt, generateScene));
+    } catch { /* panel is best-effort */ }
+  };
+  const generateScene = async () => {
+    try {
+      const r = await api(`/api/conversations/${convId}/scene`, { method: "POST", body: {} });
+      scenePanel.replaceChildren(renderScenePanel(r.state, r.updatedAt, generateScene));
+      toast(r.throttled ? "État déjà récent (2 min) ✓" : "État de la scène actualisé ✓");
+    } catch (e) { toast(e.message, "err"); }
+  };
+  // keep the panel fresh after each completed turn (only when it was opened)
+  sceneRefreshHook = async () => { if (sceneEnabled && !busy) await generateScene().catch(() => {}); };
   let searchMatches = [];
   let searchIdx = 0;
   searchInput.addEventListener("input", () => {
@@ -125,12 +405,12 @@ export async function renderChat(convIdRaw) {
     }
   }
 
-  const header = el("div", { class: "chat-header" }, backBtn, titleBlock, castStrip, groupBtn, searchBtn, galleryBtn, exportBtn, delBtn, settingsBtn);
+  const header = el("div", { class: "chat-header" }, backBtn, titleBlock, castStrip, groupBtn, sceneBtn, memoryBtn, dmBtn, branchesBtn, validateBtn, bookmarkFilterBtn, selectBtn, copyThreadBtn, mdBtn, searchBtn, galleryBtn, exportBtn, delBtn, settingsBtn);
 
   async function exportZip() {
     exportBtn.disabled = true;
     try {
-      const res = await fetch(`/api/conversations/${convId}/export`);
+      const res = await apiFetch(`/api/conversations/${convId}/export`);
       if (!res.ok) throw new Error((await res.text().catch(() => "")) || "Export impossible");
       const blob = await res.blob();
       const a = document.createElement("a");
@@ -208,16 +488,29 @@ export async function renderChat(convIdRaw) {
     });
   }
 
-  // scroll area
+  // scroll area (with time separators + bookmark filter, re-paintable)
   const scroll = el("div", { class: "chat-scroll" });
-  for (const m of conv.messages || []) scroll.append(renderMessage(m));
-  // floating "back to latest" button (shown when scrolled up)
   const toBottom = el("button", { class: "to-bottom", title: "Retour aux derniers messages", onclick: () => scroll.scrollTo({ top: scroll.scrollHeight, behavior: "smooth" }) }, "↓");
   scroll.append(toBottom);
   scroll.addEventListener("scroll", () => {
     const near = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 180;
     toBottom.classList.toggle("show", !near);
   }, { passive: true });
+  let bookmarkFilter = false;
+  const paintThread = () => {
+    while (scroll.firstChild && scroll.firstChild !== toBottom) scroll.firstChild.remove();
+    let prevTs = 0;
+    for (const m of conv.messages || []) {
+      if (bookmarkFilter && !m.meta?.bookmark) continue;
+      if (prevTs && m.created_at - prevTs > 2 * 3600 * 1000) {
+        scroll.insertBefore(el("div", { class: "time-sep" }, "── " + timeAgo(prevTs) + " ──"), toBottom);
+      }
+      scroll.insertBefore(renderMessage(m), toBottom);
+      prevTs = m.created_at;
+    }
+    scrollToBottom(scroll, true);
+  };
+  paintThread();
 
   // composer
   const textarea = el("textarea", { rows: 1, placeholder: conv.cards?.[0] ? `Écris ta réplique à ${conv.cards[0].name}…` : "Écris ton action ou ta réplique…" });
@@ -324,7 +617,71 @@ export async function renderChat(convIdRaw) {
     el("span", { class: "spinner" }),
     el("span", {}, "🔊 Préparation des voix en cours…"),
   );
-  const composerWrap = el("div", { class: "composer-wrap" }, ttsBar, slashMenu, speakRow, chipsRow, composer);
+  // ── auto-validate: non-blocking coherence banner after a turn (opt-in) ──
+  let lastFindings = [];
+  const coherenceBanner = el("div", { class: "coherence-banner", hidden: true });
+  const showCoherenceBanner = (findings) => {
+    lastFindings = findings || [];
+    if (!lastFindings.length) { coherenceBanner.hidden = true; return; }
+    coherenceBanner.hidden = false;
+    const viewBtn = el("button", { class: "mini-btn", onclick: () => openFindings(lastFindings) }, "Voir");
+    const closeBtn = el("button", { class: "mini-btn", "aria-label": "Fermer", onclick: () => { coherenceBanner.hidden = true; } }, "✕");
+    coherenceBanner.replaceChildren(
+      el("span", {}, "🛡 " + lastFindings.length + " incohérence" + (lastFindings.length > 1 ? "s" : "") + " possible" + (lastFindings.length > 1 ? "s" : "") + " détectée" + (lastFindings.length > 1 ? "s" : "") + " — " + esc(lastFindings[0].message || "")),
+      viewBtn,
+      closeBtn,
+    );
+  };
+  const maybeAutoValidate = async () => {
+    if (!currentConversation || autoValidateBusy) return;
+    let cs = {};
+    try { cs = JSON.parse(currentConversation.settings || "{}"); } catch { /* ignore */ }
+    if (!cs.validate_auto) return;
+    const now = Date.now();
+    if (now - (lastAutoValidateAt || 0) < 10 * 60 * 1000) return;
+    lastAutoValidateAt = now;
+    autoValidateBusy = true;
+    try {
+      const r = await api(`/api/conversations/${currentConversation.id}/validate`, { body: {} });
+      showCoherenceBanner(r.findings || []);
+    } catch { /* silent — the model may be busy */ }
+    finally { autoValidateBusy = false; }
+  };
+
+  // ── multi-select bar (☑): count + copy / export / delete of the selection ──
+  const selectionBar = el("div", { class: "selection-bar", hidden: true });
+  selectionBarRef = selectionBar;
+
+  // ── global audio control bar (visible while the TTS queue plays) ──
+  const abVoice = el("span", { class: "ab-voice" });
+  const abPause = el("button", { class: "ab-btn", title: "Pause / Reprendre", "aria-label": "Pause / Reprendre la lecture" }, "⏸");
+  const abVol = el("input", { class: "ab-vol", type: "range", min: 0, max: 1, step: 0.05, value: globalVolume(), title: "Volume", "aria-label": "Volume global" });
+  const abStop = el("button", { class: "ab-btn", title: "Arrêter la lecture", "aria-label": "Arrêter la lecture" }, "⏹");
+  const audioBar = el("div", { class: "audio-bar", hidden: true }, abVoice, abPause, abVol, abStop);
+  abPause.addEventListener("click", () => audioQueue.togglePause());
+  abStop.addEventListener("click", () => { audioQueue.stop(); audioBar.hidden = true; });
+  abVol.addEventListener("input", () => {
+    const v = Number(abVol.value);
+    try { localStorage.setItem("ai-rp-global-vol", String(v)); } catch { /* ignore */ }
+    if (audioQueue.current && audioQueue.playing) {
+      audioQueue.current.volume = v * (audioQueue.currentVoice ? roleVolume(convId, audioQueue.currentVoice) : 1);
+    }
+  });
+  setAudioUI({
+    playing: false,
+    paused: false,
+    voice: null,
+    convId,
+    onchange: () => {
+      if (!audioUI.playing && !audioUI.paused) { audioBar.hidden = true; return; }
+      audioBar.hidden = false;
+      abVoice.textContent = audioUI.voice ? "🔊 " + (audioUI.voice || "…") : "🔊 …";
+      abPause.textContent = audioUI.paused ? "▶" : "⏸";
+      abPause.title = audioUI.paused ? "Reprendre" : "Pause";
+    },
+  });
+  selectionExitRef = selectBtn;
+  const composerWrap = el("div", { class: "composer-wrap" }, selectionBar, coherenceBanner, audioBar, ttsBar, slashMenu, speakRow, chipsRow, composer);
 
   chipsRowRef = chipsRow;
 
@@ -348,7 +705,7 @@ export async function renderChat(convIdRaw) {
   const lastMsg = [...(conv.messages || [])].reverse().find((m) => m.role === "assistant");
   if (lastMsg?.meta?.suggestions?.length) renderChips(lastMsg.meta.suggestions);
 
-  const chatMain = el("div", { class: "chat-main" }, header, searchBar, scroll, composerWrap);
+  const chatMain = el("div", { class: "chat-main" }, header, searchBar, scenePanel, dmPanel, scroll, composerWrap);
   main.replaceChildren(el("div", { class: "chat-layout" }, chatMain));
   scrollToBottom(scroll, true);
   setTimeout(() => textarea.focus(), 80);
@@ -407,11 +764,34 @@ export async function renderChat(convIdRaw) {
     const castNames = (currentConversation.cards || []).map((c) => c.name).join(", ");
 
     // ── Modèle & génération ──
+    const GENERATION_PRESETS = {
+      cinematique: { label: "Cinématique", temperature: 0.95, maxTokens: 3000 },
+      rapide: { label: "Rapide", temperature: 0.85, maxTokens: 1200 },
+      canon: { label: "Fidèle au canon", temperature: 0.5, maxTokens: 2500 },
+      chaotique: { label: "Chaotique", temperature: 1.2, maxTokens: 3000 },
+      dialogue: { label: "Dialogue", temperature: 1.0, maxTokens: 2000 },
+      horreur: { label: "Horreur", temperature: 0.9, maxTokens: 2500 },
+      romance: { label: "Romance", temperature: 1.0, maxTokens: 2200 },
+      narration_courte: { label: "Narration courte", temperature: 0.8, maxTokens: 900 },
+    };
     const provider = field("Fournisseur", store.settings.provider || "lmstudio", { type: "select", options: [["lmstudio", "LM Studio (local)"], ["openrouter", "OpenRouter (cloud)"]] });
     const model = field("Modèle", convSettings.model || "", { placeholder: "Vide = défaut (ex: qwen2.5-7b, claude-3.5…)" });
+    const presetSel = field("Preset de style", convSettings.preset || "", { type: "select", options: [["", "Par défaut (réglages manuels)"], ...Object.entries(GENERATION_PRESETS).map(([k, v]) => [k, v.label])] });
     const temp = field("Température", convSettings.temperature ?? 0.9, { type: "number", min: 0, max: 2, step: 0.1 });
     const maxTok = field("Max tokens", convSettings.max_tokens ?? 2048, { type: "number", min: 64, max: 8192, step: 64 });
     const ctxMax = field("Tours gardés en mémoire", convSettings.context_max_messages ?? store.settings.context_max_messages ?? 20, { type: "number", min: 4, max: 100, step: 1 });
+    const autoValCb = el("label", { class: "setting-row" },
+      el("span", { class: "lbl" }, "Vérifier la cohérence après chaque tour"),
+      el("input", { type: "checkbox", ...(convSettings.validate_auto ? { checked: "" } : {}) }),
+    );
+    // choosing a preset pre-fills the temperature / max tokens fields (still editable)
+    presetSel.input.addEventListener("change", () => {
+      const p = GENERATION_PRESETS[presetSel.input.value];
+      if (p) {
+        temp.input.value = p.temperature;
+        maxTok.input.value = p.maxTokens;
+      }
+    });
 
     // ── Contexte (estimation des tokens envoyés au modèle) ──
     const ctxLine = el("div", { class: "ctx-line" }, "⏳ estimation du contexte…");
@@ -463,6 +843,7 @@ export async function renderChat(convIdRaw) {
     );
 
     // ── Voix (TTS) ──
+    const distinctVoices = [...new Set((currentConversation.messages || []).flatMap((m) => (m.audio || []).map((a) => a.voice).filter(Boolean)))].filter(Boolean);
     const ttsOn = field("TTS", convSettings.tts_enabled ?? store.settings.tts_enabled !== false, { type: "select", options: [["1", "Activé"], ["0", "Désactivé"]] });
     const autoplay = field("Lecture auto", convSettings.tts_autoplay ?? store.settings.tts_autoplay !== false, { type: "select", options: [["1", "Oui"], ["0", "Non"]] });
     const langSel = field("Langue des voix", convSettings.tts_language || store.settings.tts_language || "fr", { type: "select", options: [["fr", "Français"], ["en", "English"]] });
@@ -478,7 +859,9 @@ export async function renderChat(convIdRaw) {
     const body = el("div", { class: "conv-settings" },
       el("div", { class: "modal-section" }, "Modèle & génération"),
       el("div", { class: "row" }, provider.wrap, model.wrap),
+      presetSel.wrap,
       el("div", { class: "row3" }, temp.wrap, maxTok.wrap, ctxMax.wrap),
+      autoValCb,
       ctxLine,
       el("div", { class: "modal-section" }, "Mode de jeu"),
       el("div", { class: "row" }, el("div", { class: "modal-line" },
@@ -490,6 +873,21 @@ export async function renderChat(convIdRaw) {
       el("div", { class: "modal-section" }, "Voix (TTS)"),
       el("div", { class: "row" }, ttsOn.wrap, autoplay.wrap),
       el("div", { class: "row3" }, langSel.wrap, narratorSel.wrap, defCharSel.wrap),
+      el("div", { class: "vol-grid" },
+        el("div", { class: "vol-head" }, "🎚 Volume par voix (cette partie)"),
+        ...distinctVoices.map((voice) => {
+          const slider = el("input", { type: "range", min: 0, max: 1, step: 0.05, value: roleVolume(convId, voice), title: voice, "aria-label": `Volume ${voice}` });
+          slider.addEventListener("input", () => {
+            setRoleVolume(convId, voice, Number(slider.value));
+            if (audioQueue.currentVoice === voice && audioQueue.current) audioQueue.current.volume = globalVolume() * Number(slider.value);
+          });
+          return el("label", { class: "vol-row" },
+            el("span", { class: "vol-name" }, esc(voice)),
+            slider,
+            el("span", { class: "vol-pct" }, Math.round(Number(slider.value) * 100) + "%"),
+          );
+        }),
+      ),
       el("p", { class: "modal-note" }, "Ces réglages ne valent que pour cette partie. Les voix du narrateur et des personnages peuvent être redéfinies par carte. L'historique au-delà de la mémoire est résumé automatiquement par le modèle."),
     );
 
@@ -509,9 +907,11 @@ export async function renderChat(convIdRaw) {
           ...convSettings,
           provider: provider.input.value,
           model: model.input.value.trim(),
+          preset: presetSel.input.value,
           temperature: Number(temp.input.value),
           max_tokens: Number(maxTok.input.value),
           context_max_messages: Number(ctxMax.input.value),
+          validate_auto: autoValCb.querySelector("input").checked,
           tts_enabled: ttsOn.input.value === "1",
           tts_autoplay: autoplay.input.value === "1",
           tts_language: langSel.input.value,
@@ -590,8 +990,40 @@ async function doStream(content, opts = {}) {
   abortController = new AbortController();
   let full = "";
   let lastDoneId = null;
+  // throttled incremental rendering: deltas only mark dirty state, a rAF pass
+  // (≤ 1 per frame) diffs against what's already on screen and touches only
+  // the last block — no full DOM rebuild per delta (long replies stay smooth)
+  let renderedFull = "";
+  let renderQueued = false;
+  const renderDelta = () => {
+    renderQueued = false;
+    if (!full || full === renderedFull) return;
+    renderedFull = full;
+    if (bodyEl.dataset.streaming !== "1") {
+      // first visible token: drop the typing dots + timer placeholder
+      bodyEl.dataset.streaming = "1";
+      bodyEl.replaceChildren();
+    }
+    const segs = splitBlocks(full);
+    while (bodyEl.children.length > segs.length) bodyEl.lastChild?.remove();
+    segs.forEach((b, i) => {
+      const fresh = formatBody(b);
+      if (i < bodyEl.children.length) {
+        const node = bodyEl.children[i];
+        if (node.textContent !== fresh.textContent) node.replaceChildren(fresh);
+      } else {
+        bodyEl.append(el("div", {}, fresh));
+      }
+    });
+    scrollToBottom(scroll);
+  };
+  const scheduleRender = () => {
+    if (renderQueued) return;
+    renderQueued = true;
+    requestAnimationFrame(renderDelta);
+  };
   try {
-    const res = await fetch(`/api/conversations/${currentConversation.id}/stream`, {
+    const res = await apiFetch(`/api/conversations/${currentConversation.id}/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content, directive: opts.directive || "", prompt: opts.prompt || "" }),
@@ -600,12 +1032,7 @@ async function doStream(content, opts = {}) {
     await readSseStream(res, async (event, data) => {
       if (event === "delta") {
         full += data.text || "";
-        const segs = splitBlocks(full);
-        bodyEl.replaceChildren();
-        for (const b of segs) {
-          bodyEl.append(el("div", {}, formatBody(b)));
-        }
-        scrollToBottom(scroll);
+        scheduleRender();
       } else if (event === "done") {
         sfx("chime");
         if (document.hidden) notify("Réponse prête ✨", (currentConversation?.title || "Partie") + " — " + (data.message?.content || "").slice(0, 80));
@@ -623,6 +1050,10 @@ async function doStream(content, opts = {}) {
         pendingNode.replaceWith(node);
         scrollToBottom(scroll);
         if (autoplay && ttsEnabled) playMessageAudio(m.id);
+        // keep the scene-state panel fresh (throttled server-side)
+        sceneRefreshHook?.();
+        // optional auto-coherence check (opt-in in the party settings, throttled)
+        maybeAutoValidate();
       } else if (event === "tts-status") {
         // visible "voice being generated" state on the just-finished message
         const node = lastDoneId ? document.querySelector(`[data-mid="${lastDoneId}"]`) : null;
@@ -829,6 +1260,230 @@ async function askToSpeak(target) {
   await doStream(display, { directive });
 }
 
+// ─── scene-state panel content ───────────────────────────────────────────────
+function renderScenePanel(state, updatedAt, generate) {
+  const box = el("div", { class: "scene-panel" });
+  if (!state) {
+    box.append(
+      el("div", { class: "scene-empty" },
+        el("span", {}, "🧭 Pas encore d'état de scène — un résumé structuré du lieu, des objectifs et des dangers, maintenu par le modèle."),
+        el("button", { class: "mini-btn", onclick: generate }, ICONS.sparkles, "Générer l'état"),
+      ),
+    );
+    return box;
+  }
+  const row = (icon, label, items) => {
+    if (!items || (Array.isArray(items) && !items.length)) return null;
+    const val = Array.isArray(items) ? items.join(" · ") : String(items);
+    return el("div", { class: "scene-row" },
+      el("span", { class: "scene-icon" }, icon),
+      el("span", { class: "scene-label" }, label),
+      el("span", { class: "scene-value" }, esc(val)),
+    );
+  };
+  box.append(
+    el("div", { class: "scene-head" },
+      el("span", { class: "scene-title" }, "🧭 État de la scène"),
+      el("div", { style: { display: "flex", gap: "8px", alignItems: "center" } },
+        updatedAt ? el("span", { class: "chip tiny" }, fmtTime(updatedAt)) : null,
+        el("button", { class: "mini-btn", onclick: generate }, "↻ Actualiser"),
+      ),
+    ),
+    row("📍", "Lieu", state.location),
+    row("🎯", "Objectifs", state.goals),
+    row("👥", "Présents", state.characters),
+    row("⚠️", "Danger", state.dangers),
+    row("🔒", "Secrets", state.secrets),
+    state.notes ? el("div", { class: "scene-notes" }, esc(String(state.notes))) : null,
+  );
+  return box;
+}
+
+// human-friendly "il y a …" label for the time separators
+function timeAgo(ts) {
+  const diff = Date.now() - ts;
+  if (diff < 2 * 3600 * 1000) return "";
+  const min = Math.floor(diff / 60000);
+  if (min < 60) return `il y a ${min} min`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `il y a ${h} h`;
+  const d = Math.floor(h / 24);
+  if (d < 7) return `il y a ${d} jour${d > 1 ? "s" : ""}`;
+  return new Date(ts).toLocaleDateString("fr-FR", { day: "numeric", month: "short", year: "numeric" });
+}
+
+// ─── branch family (variantes) ───────────────────────────────────────────────
+async function branchesModal() {
+  if (!currentConversation) return;
+  let data;
+  try { data = await api(`/api/conversations/${currentConversation.id}/branches`); }
+  catch (e) { return toast(e.message, "err"); }
+  const branches = data.branches || [];
+  const KIND_LABEL = { main: "principale", canon: "canon", alternative: "variante", draft: "brouillon", abandoned: "abandonnée" };
+  const list = el("div", { class: "branch-list" });
+  // build a tree: roots first (no parent in the family), then children by depth
+  const childrenOf = (id) => branches.filter((b) => b.parent_id === id);
+  const treeRows = () => {
+    const byId = new Map(branches.map((b) => [b.id, b]));
+    const out = [];
+    const walk = (b, depth) => {
+      out.push([b, depth]);
+      for (const c of childrenOf(b.id)) walk(c, depth + 1);
+    };
+    for (const r of branches.filter((b) => !b.parent_id || !byId.has(b.parent_id))) walk(r, 0);
+    return out;
+  };
+  const paint = () => { list.replaceChildren(...treeRows().map(([b, depth]) => branchRow(b, depth))); };
+  const branchRow = (b, depth) => {
+    const isCurrent = b.id === currentConversation.id;
+    const kindSel = el("select", { class: "mini-select", title: "Statut de cette branche", "aria-label": "Statut" },
+      Object.entries(KIND_LABEL).map(([k, l]) => el("option", { value: k, ...(b.branch_kind === k ? { selected: "" } : {}) }, l)),
+    );
+    kindSel.addEventListener("change", async () => {
+      try {
+        await api(`/api/conversations/${b.id}`, { method: "PATCH", body: { branch_kind: kindSel.value } });
+        toast("Statut mis à jour ✓");
+      } catch (e) { toast(e.message, "err"); }
+    });
+    const openBtn = el("button", { class: "mini-btn", title: "Ouvrir cette branche", onclick: () => { close(); navigate(`#/chat/${b.id}`); } }, ICONS.play);
+    const delBtn = el("button", { class: "mini-btn", style: { color: "var(--danger)" }, title: "Supprimer définitivement", onclick: async () => {
+      if (!(await confirmModal({ title: "Supprimer la variante", message: `Supprimer définitivement « ${b.title} » ainsi que ses audio et images ?` }))) return;
+      try {
+        await api(`/api/conversations/${b.id}/permanent`, { method: "DELETE" });
+        data.branches = data.branches.filter((x) => x.id !== b.id);
+        paint();
+      } catch (e) { toast(e.message, "err"); }
+    } }, ICONS.trash);
+    const kids = childrenOf(b.id).length;
+    const row = el("div", { class: "branch-row" + (isCurrent ? " cur" : "") + (depth ? " branch-child" : " branch-root") },
+      el("span", { class: "branch-icon" }, b.branch_kind === "canon" ? "⭐" : b.parent_id ? "🌿" : "🌳"),
+      el("div", { class: "branch-main" },
+        el("div", { class: "branch-title" }, esc(b.title || "Partie"), isCurrent ? el("span", { class: "chip tiny" }, "actuelle") : null,
+          kids ? el("span", { class: "chip tiny" }, `${kids} enfant${kids > 1 ? "s" : ""}`) : null),
+        el("div", { class: "branch-sub" }, fmtTime(b.updated_at)),
+      ),
+      kindSel,
+      openBtn,
+      delBtn,
+    );
+    row.style.setProperty("--depth", String(depth));
+    return row;
+  };
+  const graphBtn = el("button", { class: "btn btn-ghost btn-sm", title: "Vue complète en arbre de la famille de branches", onclick: () => { close(); navigate(`#/graph/${currentConversation.id}`); } }, "🌿 Ouvrir le graphe complet");
+  const { close } = openModal({
+    title: "🌿 Variantes de la partie",
+    sub: "Chaque « Régénérer » crée une variante. Explore-les, définis le canon, abandonne ou supprime celles qui ne servent plus.",
+    body: el("div", {},
+      el("div", { style: { display: "flex", justifyContent: "flex-end", marginBottom: "10px" } }, graphBtn),
+      branches.length ? list : el("div", { class: "empty" }, el("div", { class: "big" }, "🌿"), el("h3", {}, "Une seule branche"), el("p", {}, "Régénère une réponse pour créer une variante.")),
+    ),
+    wide: true,
+  });
+  paint();
+}
+
+// ─── structured memory (🧠) — view / edit the JSON memory maintained by the ──
+// rolling summary: location, characters, goals, items, facts, relationships.
+async function memoryModal() {
+  if (!currentConversation) return;
+  let conv;
+  try { conv = await api(`/api/conversations/${currentConversation.id}`); }
+  catch (e) { return toast(e.message, "err"); }
+  const mem = conv.memory || {};
+  const ta = (rows, ph, val) => {
+    const node = el("textarea", { rows: Math.max(2, rows), placeholder: ph });
+    node.value = val || ""; // el() uses setAttribute — textarea needs the live value
+    return node;
+  };
+  const memField = (label, textarea) => el("label", { class: "mem-field" }, el("span", { class: "mem-label" }, label), textarea);
+  const relTxt = Object.entries(mem.relationships || {}).map(([k, v]) => `${k} → ${v}`).join("\n");
+  const locInput = el("input", { placeholder: "Lieu actuel", value: mem.location || "" });
+  const charArea = ta((mem.characters || []).length + 1, "un par ligne", (mem.characters || []).join("\n"));
+  const goalArea = ta((mem.goals || []).length + 1, "un par ligne", (mem.goals || []).join("\n"));
+  const itemArea = ta((mem.items || []).length + 1, "un par ligne", (mem.items || []).join("\n"));
+  const factArea = ta((mem.facts || []).length + 1, "un par ligne", (mem.facts || []).join("\n"));
+  const relArea = ta(Object.keys(mem.relationships || {}).length + 1, "Alba → méfiance (une relation par ligne, format : Qui → lien)", relTxt);
+  const saveBtn = el("button", { class: "btn btn-primary" }, "💾 Enregistrer la mémoire");
+  saveBtn.addEventListener("click", async () => {
+    const lines = (t) => t.value.split(/\n/).map((s) => s.trim()).filter(Boolean);
+    const rel = {};
+    for (const line of relArea.value.split(/\n/)) {
+      const m = line.match(/^(.+?)\s*[→\-]\s*(.+)$/);
+      if (m) rel[m[1].trim()] = m[2].trim();
+    }
+    const body = {
+      memory: {
+        location: locInput.value.trim() || undefined,
+        characters: lines(charArea),
+        goals: lines(goalArea),
+        items: lines(itemArea),
+        facts: lines(factArea),
+        relationships: Object.keys(rel).length ? rel : undefined,
+      },
+    };
+    try {
+      const updated = await api(`/api/conversations/${currentConversation.id}`, { method: "PATCH", body });
+      currentConversation.memory = updated.memory || null;
+      toast("Mémoire mise à jour ✓");
+      close();
+    } catch (e) { toast(e.message, "err"); }
+  });
+  const body = el("div", { class: "mem-grid" },
+    memField("📍 Lieu", locInput),
+    memField("👥 Personnages", charArea),
+    memField("🎯 Objectifs", goalArea),
+    memField("📦 Objets", itemArea),
+    memField("📌 Faits", factArea),
+    memField("🔗 Relations", relArea),
+  );
+  const { close } = openModal({
+    title: "🧠 Mémoire structurée",
+    sub: "Mise à jour automatiquement par le résumé quand le fil devient trop long. Modifie-la si un détail compte pour la suite.",
+    body: el("div", {}, body, el("div", { style: { marginTop: "14px", display: "flex", justifyContent: "flex-end" } }, saveBtn)),
+    wide: true,
+  });
+}
+
+// ─── narrative consistency check (IA, button-triggered) ─────────────────────
+async function validateModal() {
+  if (!currentConversation) return;
+  try {
+    const r = await api(`/api/conversations/${currentConversation.id}/validate`, { body: {} });
+    const findings = r.findings || [];
+    if (!findings.length) {
+      openModal({ title: "🛡 Cohérence", body: el("div", { class: "empty" }, el("div", { class: "big" }, "✨"), el("h3", {}, "Aucune incohérence détectée"), el("p", {}, "Le fil est cohérent selon le modèle.")) });
+      return;
+    }
+    openFindings(findings);
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
+// shared findings modal (button-triggered and auto-validate banner)
+function openFindings(findings) {
+  const sevIcon = { critical: "🔴", warning: "🟠", info: "🔵" };
+  const lastAssist = [...(currentConversation.messages || [])].reverse().find((m) => m.role === "assistant");
+  const body = el("div", { class: "val-list" }, findings.map((f) =>
+    el("div", { class: `val-row sev-${f.severity || "info"}` },
+      el("span", { class: "val-icon" }, sevIcon[f.severity] || "🔵"),
+      el("div", { class: "val-main" },
+        el("div", { class: "val-msg" }, esc(String(f.message || ""))),
+        f.suggestion ? el("div", { class: "val-sugg" }, "💡 " + esc(String(f.suggestion))) : null,
+      ),
+    ),
+  ));
+  const closeBtn = el("button", { class: "btn btn-ghost" }, "Ignorer");
+  const fixBtn = el("button", { class: "btn btn-primary" }, "↻ Corriger la réponse");
+  const { close } = openModal({ title: "🛡 Incohérences détectées", sub: "Problèmes possibles relevés par le modèle — à toi de trancher.", body, footer: [closeBtn, fixBtn], wide: true });
+  closeBtn.addEventListener("click", close);
+  fixBtn.addEventListener("click", () => {
+    close();
+    if (lastAssist) regenerate(lastAssist.id);
+    else toast("Rien à corriger.", "err");
+  });
+}
+
 // ─── message rendering ────────────────────────────────────────────────────────
 function renderMessage(m) {
   const isMe = m.role === "user";
@@ -879,6 +1534,10 @@ function renderMessage(m) {
   if (!isMe && m.id && !String(m.id).startsWith("pending")) {
     bubble.append(el("div", { class: "msg-actions" }, ...messageActions(m.id, m.audio || [])));
   }
+  // private note (visible only to the player, never sent to the model)
+  if (m.meta?.note && !String(m.id).startsWith("pending")) {
+    bubble.append(el("div", { class: "msg-note" }, "📌 " + esc(m.meta.note)));
+  }
   // emoji reactions (kept server-side in meta.reactions)
   if (m.id && !String(m.id).startsWith("pending")) {
     const list = Array.isArray(m.meta?.reactions) ? m.meta.reactions : [];
@@ -904,10 +1563,17 @@ function renderMessage(m) {
     bubble.append(reacts);
   }
   const avatar = avatarFor(m);
-  return el("div", { class: `msg${isMe ? " me" : ""}`, dataset: { mid: m.id, role: m.role } },
-    avatar,
-    bubble,
-  );
+  const node = el("div", { class: `msg${isMe ? " me" : ""}${selectedIds.has(m.id) ? " sel" : ""}`, dataset: { mid: m.id, role: m.role } }, avatar, bubble);
+  if (selectionMode && m.id && !String(m.id).startsWith("pending")) {
+    const cb = el("input", { type: "checkbox", class: "sel-cb", "aria-label": "Sélectionner ce message", ...(selectedIds.has(m.id) ? { checked: "" } : {}) });
+    cb.addEventListener("change", () => {
+      if (cb.checked) selectedIds.add(m.id); else selectedIds.delete(m.id);
+      node.classList.toggle("sel", cb.checked);
+      paintSelectionBar();
+    });
+    node.prepend(cb);
+  }
+  return node;
 }
 
 // inline edit: double-click a message, Enter to validate, Esc to cancel
@@ -981,9 +1647,37 @@ function avatarFor(m) {
   return initialAvatar(name, isNarrator ? "🪄" : null);
 }
 
+async function copyText(text, label) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // non-secure context fallback
+    const ta = el("textarea", { value: text });
+    document.body.append(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  }
+  toast((label || "Message") + " copié ✓");
+}
+
 function messageActions(messageId, audio) {
   const real = (audio || []).filter((a) => a.path).length;
+  const m = (currentConversation?.messages || []).find((x) => x.id === messageId) || {};
   const playBtn = el("button", { class: "mini-btn", onclick: () => playMessageAudio(messageId, playBtn) }, ICONS.voice, real ? `Voix (${real})` : "Voix");
+  const favBtn = el("button", { class: "mini-btn" + (m.meta?.bookmark ? " on" : ""), title: m.meta?.bookmark ? "Retirer des favoris" : "Ajouter aux favoris", onclick: async () => {
+    try {
+      const updated = await api(`/api/conversations/${currentConversation.id}/messages/${messageId}`, { method: "PATCH", body: { meta: { bookmark: m.meta?.bookmark ? 0 : 1 } } });
+      const idx = currentConversation.messages.findIndex((x) => x.id === messageId);
+      if (idx >= 0) currentConversation.messages[idx] = updated;
+      document.querySelector(`[data-mid="${messageId}"]`)?.replaceWith(renderMessage(updated));
+    } catch (e) { toast(e.message, "err"); }
+  } }, "★");
+  const noteBtn = el("button", { class: "mini-btn" + (m.meta?.note ? " on" : ""), title: m.meta?.note ? "Modifier la note privée" : "Ajouter une note privée", onclick: () => noteModal(m) }, "📌");
+  const copyBtn = el("button", { class: "mini-btn", title: "Copier le message", onclick: () => {
+    const mm = (currentConversation?.messages || []).find((x) => x.id === messageId);
+    copyText(mm?.content || "", "Message");
+  } }, "📋 Copier");
   const illuSel = el("select", { class: "mini-select", title: "Générer une illustration (auto / paysage / personnage)" },
     el("option", { value: "auto" }, "🖼 Illustrer"),
     el("option", { value: "landscape" }, "🏞 Paysage"),
@@ -1010,7 +1704,29 @@ function messageActions(messageId, audio) {
   );
   rateSel.addEventListener("change", () => { segRate = Number(rateSel.value); });
   const retryBtn = el("button", { class: "mini-btn regen-btn", onclick: () => regenerate(messageId) }, ICONS.retry, "Régénérer");
-  return [playBtn, illuSel, rateSel, retryBtn];
+  return [playBtn, favBtn, noteBtn, copyBtn, illuSel, rateSel, retryBtn];
+}
+
+// private note on a message (stored in meta.note, never sent to the model)
+async function noteModal(m) {
+  const ta = el("textarea", { class: "edit-ta", rows: 3, placeholder: "Note privée — pour toi seul·e, jamais envoyée au modèle." }, m.meta?.note || "");
+  const clearBtn = el("button", { class: "btn btn-ghost", style: { color: "var(--danger)" } }, "Effacer");
+  const cancelBtn = el("button", { class: "btn btn-ghost" }, "Annuler");
+  const saveBtn = el("button", { class: "btn btn-primary" }, "Enregistrer");
+  const { close } = openModal({ title: "📌 Note privée", body: el("div", {}, ta), footer: [clearBtn, cancelBtn, saveBtn] });
+  const save = async (note) => {
+    try {
+      const updated = await api(`/api/conversations/${currentConversation.id}/messages/${m.id}`, { method: "PATCH", body: { meta: { note } } });
+      const idx = currentConversation.messages.findIndex((x) => x.id === m.id);
+      if (idx >= 0) currentConversation.messages[idx] = updated;
+      document.querySelector(`[data-mid="${m.id}"]`)?.replaceWith(renderMessage(updated));
+      close();
+      toast(note ? "Note enregistrée ✓" : "Note supprimée");
+    } catch (e) { toast(e.message, "err"); }
+  };
+  cancelBtn.addEventListener("click", close);
+  saveBtn.addEventListener("click", () => save(ta.value.trim()));
+  clearBtn.addEventListener("click", () => save(""));
 }
 
 // ─── mini segment player: click one segment to hear it ───────────────────────
@@ -1092,7 +1808,7 @@ async function playMessageAudio(messageId, btn) {
     btn.classList.add("playing");
     btn.textContent = "⏹ Arrêter";
   }
-  await audioQueue.play(real.map((a) => a.path));
+  await audioQueue.play(real.map((a) => ({ url: a.path, voice: a.voice || null })), currentConversation.id);
   if (btn) { btn.classList.remove("playing"); btn.textContent = ICONS.voice + ` Voix (${real.length})`; }
 }
 

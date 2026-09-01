@@ -4,7 +4,7 @@ import { handleApi } from "./server/routes";
 import { PUBLIC_DIR, AUDIO_DIR, IMAGES_DIR, UPLOADS_DIR, DATA_DIR, SAMPLES_DIR } from "./server/paths";
 import { warmupTts } from "./tts/service";
 import { ensureImageServer } from "./server/image";
-import { getSetting } from "./server/db";
+import { getSetting, cleanupStaleJobs } from "./server/db";
 import { scheduleDailyBackup } from "./server/backup";
 
 const NAME = "ai-rp";
@@ -34,10 +34,14 @@ const MIME: Record<string, string> = {
   ".md": "text/markdown; charset=utf-8",
 };
 
-function serveFile(filePath: string): Response | null {
+function serveFile(filePath: string, rootDir?: string): Response | null {
   let resolved: string;
   try {
     resolved = path.resolve(filePath);
+    if (rootDir) {
+      const root = path.resolve(rootDir);
+      if (resolved !== root && !resolved.startsWith(root + path.sep)) return null;
+    }
   } catch {
     return null;
   }
@@ -60,22 +64,22 @@ function handler(req: Request): Response {
 
   // static data dirs
   if (p.startsWith("/audio/")) {
-    const file = serveFile(path.join(AUDIO_DIR, p.slice("/audio/".length)));
+    const file = serveFile(path.join(AUDIO_DIR, p.slice("/audio/".length)), AUDIO_DIR);
     if (file) return file;
     return new Response("not found", { status: 404 });
   }
   if (p.startsWith("/images/")) {
-    const file = serveFile(path.join(IMAGES_DIR, p.slice("/images/".length)));
+    const file = serveFile(path.join(IMAGES_DIR, p.slice("/images/".length)), IMAGES_DIR);
     if (file) return file;
     return new Response("not found", { status: 404 });
   }
   if (p.startsWith("/samples/")) {
-    const file = serveFile(path.join(SAMPLES_DIR, p.slice("/samples/".length)));
+    const file = serveFile(path.join(SAMPLES_DIR, p.slice("/samples/".length)), SAMPLES_DIR);
     if (file) return file;
     return new Response("not found", { status: 404 });
   }
   if (p.startsWith("/uploads/")) {
-    const file = serveFile(path.join(UPLOADS_DIR, p.slice("/uploads/".length)));
+    const file = serveFile(path.join(UPLOADS_DIR, p.slice("/uploads/".length)), UPLOADS_DIR);
     if (file) return file;
     return new Response("not found", { status: 404 });
   }
@@ -83,7 +87,7 @@ function handler(req: Request): Response {
   // static app files
   if (p !== "/") {
     const rel = p.replace(/^\/+/, "");
-    const file = serveFile(path.join(PUBLIC_DIR, rel));
+    const file = serveFile(path.join(PUBLIC_DIR, rel), PUBLIC_DIR);
     if (file) return file;
   }
   // SPA fallback
@@ -127,5 +131,9 @@ if (getSetting("image_preload", false)) {
 
 for (const d of [DATA_DIR]) fs.mkdirSync(d, { recursive: true });
 scheduleDailyBackup();
+
+// mark jobs left dangling by a previous crash as failed (no zombies in the queue)
+const cleaned = cleanupStaleJobs();
+if (cleaned) console.log(`[jobs] ${cleaned} tâche(s) interrompue(s) marquée(s) comme échouées`);
 
 export default server;

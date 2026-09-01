@@ -1,6 +1,6 @@
-import { api, apiForm, uploadFiles, setToken } from "./api.js?v=33";
-import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=33";
-import { renderChat } from "./chat.js?v=33";
+import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=35";
+import { el, esc, toast, actionToast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=35";
+import { renderChat } from "./chat.js?v=35";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -28,6 +28,31 @@ export async function refreshAll() {
     loaded: true,
   });
   return store;
+}
+
+// ─── narrator presets (shared by the settings editor and the world modal) ───
+const BUILTIN_NARRATOR = {
+  neutre: { label: "Neutre", prompt: "Sobre, direct et factuel : tu décris sans t'impliquer." },
+  epique: { label: "Épique", prompt: "Grandiose, lyrique et dramatique : chaque scène devient une épopée." },
+  sarcastique: { label: "Sarcastique", prompt: "Sarcastique et mordant : tu commentes les actions du joueur avec ironie et piques bien placées." },
+  cynique: { label: "Cynique", prompt: "Cynique et désabusé : le monde est dur, injuste, et tu le fais sentir à chaque phrase." },
+  en_colere: { label: "En colère", prompt: "En colère : la narration est tendue, brutale, presque rageuse. Les descriptions frappent fort." },
+  nagatoro: { label: "Nagatoro (taquin)", prompt: "Taquin et espiègle, comme Nagatoro : tu provoques gentiment le joueur avec des piques affectueuses, un sourire malicieux et beaucoup d'assurance." },
+};
+
+/** [[key, label], …] for the narrator-style selects, incl. user customs from settings. */
+export function narratorStyleOptions() {
+  const map = {};
+  for (const [k, v] of Object.entries(BUILTIN_NARRATOR)) map[k] = v.label;
+  try {
+    for (const [k, v] of Object.entries((store.settings.narrator_presets) || {})) {
+      if (v?.prompt) map[k] = v.label || (BUILTIN_NARRATOR[k]?.label ?? k);
+    }
+  } catch { /* ignore */ }
+  return [
+    ["", "Par défaut (réglages)"],
+    ...Object.entries(map).map(([k, l]) => [k, l + (k === "epique" ? " (défaut)" : "") + (!BUILTIN_NARRATOR[k] ? " ⭐" : "")]),
+  ];
 }
 
 // personalization: accent color + background image (local to this device)
@@ -126,6 +151,43 @@ function providerLabel() {
 const main = () => document.getElementById("main");
 // which sidebar section is active — used by renderSidebar/toggleSidebar
 let currentSection = "";
+let paletteOpen = false;
+
+function globalSearch(query) {
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+  const results = [];
+  for (const c of store.conversations) if (!c.archived && `${c.title} ${c.last_message}`.toLowerCase().includes(q)) results.push({ type: "Partie", label: c.title, href: `#/chat/${c.id}` });
+  for (const w of store.worlds) if (`${w.name} ${w.description} ${w.lore}`.toLowerCase().includes(q)) results.push({ type: "Monde", label: w.name, href: `#/world/${w.id}` });
+  for (const c of store.cards) if (`${c.name} ${c.description} ${c.personality} ${c.tags || ""}`.toLowerCase().includes(q)) results.push({ type: "Carte", label: c.name, href: "#/cards" });
+  for (const p of store.personas) if (`${p.name} ${p.description}`.toLowerCase().includes(q)) results.push({ type: "Persona", label: p.name, href: "#/personas" });
+  return results.slice(0, 20);
+}
+
+function openCommandPalette() {
+  if (paletteOpen) return;
+  paletteOpen = true;
+  const root = document.getElementById("palette-root");
+  const input = el("input", { class: "palette-input", placeholder: "Rechercher ou lancer une commande…", autofocus: true });
+  const results = el("div", { class: "palette-results" });
+  const commands = [
+    ["Nouvelle partie", () => newGameWizard()], ["Accueil", () => navigate("#/")],
+    ["Mondes", () => navigate("#/worlds")], ["Cartes", () => navigate("#/cards")],
+    ["Personas", () => navigate("#/personas")], ["Réglages", () => navigate("#/settings")],
+  ];
+  const close = () => { paletteOpen = false; backdrop.remove(); };
+  const paint = () => {
+    const q = input.value.trim();
+    const matches = q ? globalSearch(q).map((r) => [r.label, () => navigate(r.href), r.type]) : commands.map((r) => [r[0], r[1], "Commande"]);
+    results.replaceChildren(...matches.map(([label, action, type]) => el("button", { class: "palette-item", onclick: () => { close(); action(); } }, el("span", { class: "chip" }, type), el("span", {}, label))));
+    if (!matches.length) results.append(el("div", { class: "palette-empty" }, "Aucun résultat"));
+  };
+  input.addEventListener("input", paint);
+  input.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); else if (e.key === "Enter") results.querySelector("button")?.click(); });
+  const backdrop = el("div", { class: "palette-backdrop" }, el("div", { class: "palette", role: "dialog", "aria-modal": "true" }, input, results));
+  backdrop.addEventListener("mousedown", (e) => { if (e.target === backdrop) close(); });
+  root.append(backdrop); paint(); setTimeout(() => input.focus(), 0);
+}
 
 export function navigate(hash) {
   location.hash = hash;
@@ -139,6 +201,7 @@ function doRender(section, parts) {
   if (section === "personas") return renderPersonas();
   if (section === "settings") return renderSettings();
   if (section === "chat") return renderChat(parts[1]);
+  if (section === "graph") return renderBranchGraph(parts[1]);
   return renderDashboard();
 }
 
@@ -181,32 +244,60 @@ function isTypingTarget(e) {
   return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable);
 }
 
+// ─── configurable keyboard shortcuts ──────────────────────────────────────────
+// bindings are stored in settings.shortcuts as canonical strings: "ctrl+k", "n", "?"
+const SHORTCUT_DEFAULTS = { palette: "ctrl+k", new_game: "n", help: "?", composer: "/", regen: "r", group: "g" };
+const SHORTCUT_LABELS = {
+  palette: "Palette de commandes", new_game: "Nouvelle partie", help: "Aide des raccourcis",
+  composer: "Écrire un message (dans une partie)", regen: "Régénérer la dernière réponse", group: "Basculer solo / groupe",
+};
+export function getShortcuts() {
+  const custom = store.settings.shortcuts || {};
+  return { ...SHORTCUT_DEFAULTS, ...custom };
+}
+// canonical form of a keypress: modifiers first (ctrl/alt/shift, shift only for
+// letters so "?" stays "?") + the key, lowercase — e.g. "ctrl+k", "shift+n", "?"
+function canonShortcut(e) {
+  const mods = [];
+  if (e.ctrlKey || e.metaKey) mods.push("ctrl");
+  if (e.altKey) mods.push("alt");
+  if (e.shiftKey && /^[a-z]$/i.test(e.key)) mods.push("shift");
+  return [...mods, e.key.toLowerCase()].join("+");
+}
 function shortcutsHelp() {
+  const S = getShortcuts();
   const row = (k, desc) => el("div", { class: "k-row" }, el("kbd", {}, k), el("span", {}, desc));
   openModal({
     title: "⌨️ Raccourcis clavier",
     body: el("div", { class: "shortcuts" },
-      row("n", "Nouvelle partie"),
-      row("/", "Écrire un message (dans une partie)"),
-      row("r", "Régénérer la dernière réponse (variante)"),
-      row("g", "Basculer solo / groupe"),
+      row(S.palette, SHORTCUT_LABELS.palette),
+      row(S.new_game, SHORTCUT_LABELS.new_game),
+      row(S.composer, SHORTCUT_LABELS.composer + " (dans une partie)"),
+      row(S.regen, SHORTCUT_LABELS.regen + " (dans une partie)"),
+      row(S.group, SHORTCUT_LABELS.group + " (dans une partie)"),
       row("Esc", "Fermer la fenêtre / annuler l'édition"),
-      row("?", "Afficher cette aide"),
+      row(S.help, SHORTCUT_LABELS.help),
+      el("p", { class: "modal-note" }, "Personnalisables dans Réglages → Raccourcis clavier."),
     ),
   });
 }
-
+let shortcutCapturing = false; // set while the settings editor awaits a keypress
+function fireShortcut(k) {
+  import("./chat.js?v=35").then((m) => m.chatShortcut(k)).catch(() => {});
+}
 document.addEventListener("keydown", (e) => {
+  if (shortcutCapturing) return; // the settings key-capture owns this press
+  const press = canonShortcut(e);
+  const S = getShortcuts();
+  if (press === S.palette) { e.preventDefault(); openCommandPalette(); return; }
   if (e.ctrlKey || e.metaKey || e.altKey || e.key === "Escape") return;
   if (isTypingTarget(e) || document.querySelector(".modal")) return;
-  const k = e.key.toLowerCase();
   const inChat = location.hash.startsWith("#/chat/");
-  if (k === "?") { e.preventDefault(); shortcutsHelp(); }
-  else if (k === "n") { e.preventDefault(); newGameWizard(); }
-  else if (inChat && (k === "r" || k === "g" || k === "/")) {
-    e.preventDefault();
-    import("./chat.js?v=33").then((m) => m.chatShortcut(k)).catch(() => {});
-  }
+  if (press === S.help) { e.preventDefault(); shortcutsHelp(); }
+  else if (press === S.new_game) { e.preventDefault(); newGameWizard(); }
+  else if (inChat && press === S.regen) { e.preventDefault(); fireShortcut("r"); }
+  else if (inChat && press === S.group) { e.preventDefault(); fireShortcut("g"); }
+  else if (inChat && press === S.composer) { e.preventDefault(); fireShortcut("/"); }
 });
 
 // ─── mobile sidebar drawer ────────────────────────────────────────────────────
@@ -221,6 +312,36 @@ document.getElementById("sidebar")?.addEventListener("click", (e) => {
 // ─── dashboard ────────────────────────────────────────────────────────────────
 let trashMode = false;
 
+function paintGlobalResults(query) {
+  const input = document.querySelector(".global-search");
+  const box = document.querySelector(".global-results");
+  if (!input || !box) return;
+  const results = globalSearch(query);
+  box.hidden = !query.trim();
+  box.replaceChildren(...results.map((r) => el("a", { href: r.href, class: "global-result" }, el("span", { class: "chip" }, r.type), el("span", {}, r.label))));
+  if (query.trim() && !results.length) box.append(el("div", { class: "palette-empty" }, "Aucun résultat"));
+}
+
+// soft-delete with an undoable toast (resource → trash, restore possible)
+async function softDeleteResource(type, id, label, after) {
+  try {
+    await api(`/api/${type}s/${id}`, { method: "DELETE" });
+    await refreshAll();
+    after?.();
+    actionToast(`${label} déplacé${type === "world" || type === "scenario" ? " " : "e "}dans la corbeille`, "Annuler", async () => {
+      try {
+        await api("/api/trash/restore", { body: { type, id } });
+        await refreshAll();
+        after?.();
+        toast("Restauration ✓");
+      } catch (e) { toast(e.message, "err"); }
+    });
+  } catch (e) { toast(e.message, "err"); }
+}
+
+const TRASH_TYPE_LABEL = { world: "Monde", scenario: "Scénario", card: "Carte", persona: "Persona" };
+const TRASH_TYPE_ICON = { world: "🌍", scenario: "📜", card: "🎭", persona: "🧑‍🤝‍🧑" };
+
 function renderDashboard() {
   const all = store.conversations;
   const archived = all.filter((c) => c.archived);
@@ -229,26 +350,74 @@ function renderDashboard() {
   const rest = active.filter((c) => !c.pinned);
   const worldCards = store.worlds.slice(0, 6);
   const banner = store.worlds[0]?.cover;
+  // most recently updated active party → dominant "Reprendre" action
+  const lastActive = rest[0];
 
   if (trashMode) {
-    main().replaceChildren(...[
+    const trashBox = el("div", {});
+    const resSection = el("div", {});
+    api("/api/trash").then(({ items }) => {
+      if (!items.length) {
+        resSection.replaceChildren(el("div", { class: "empty" },
+          el("div", { class: "big" }, "🗑"),
+          el("h3", {}, "Corbeille vide"),
+          el("p", {}, "Rien d'archivé pour l'instant."),
+        ));
+        return;
+      }
+      resSection.replaceChildren(
+        el("div", { class: "section-title" }, "Mondes, cartes, personas & scénarios"),
+        el("div", { class: "grid" }, items.map((it) => {
+          const restoreBtn = el("button", { class: "mini-btn", onclick: async () => {
+            try {
+              await api("/api/trash/restore", { body: { type: it.type, id: it.id } });
+              await refreshAll();
+              renderDashboard();
+              toast("Restauration ✓");
+            } catch (e) { toast(e.message, "err"); }
+          } }, "↺ Restaurer");
+          const delBtn = el("button", { class: "mini-btn", style: { color: "var(--danger)" }, onclick: async () => {
+            if (!(await confirmModal({ title: "Supprimer définitivement", message: `Effacer définitivement « ${it.name} » ? Cette action est irréversible.` }))) return;
+            try {
+              await api("/api/trash/permanent", { body: { type: it.type, id: it.id } });
+              await refreshAll();
+              renderDashboard();
+              toast("Supprimé définitivement ✓");
+            } catch (e) { toast(e.message, "err"); }
+          } }, ICONS.trash);
+          return el("div", { class: "card trash-res" },
+            el("div", { class: "card-body" },
+              el("h3", {}, TRASH_TYPE_ICON[it.type] + " " + esc(it.name)),
+              el("div", { class: "sub" }, TRASH_TYPE_LABEL[it.type] + " · supprimé " + fmtTime(it.updated_at)),
+              el("div", { class: "card-actions" }, restoreBtn, delBtn),
+            ),
+          );
+        })),
+      );
+    }).catch(() => {});
+    trashBox.append(
       el("div", { class: "hero" },
         el("h2", {}, "🗑 Corbeille"),
-        el("p", {}, "Les parties archivées restent ici (texte + audio + images) jusqu'à restauration ou suppression définitive."),
+        el("p", {}, "Les parties archivées et les ressources supprimées restent ici jusqu'à restauration ou suppression définitive."),
         el("div", { class: "cta-row" },
           el("button", { class: "btn btn-ghost", onclick: () => { trashMode = false; renderDashboard(); } }, "← Retour à l'accueil"),
         ),
       ),
-      archived.length ? el("div", { class: "grid" }, archived.map(trashCard)) : el("div", { class: "empty" },
-        el("div", { class: "big" }, "🗑"),
-        el("h3", {}, "Corbeille vide"),
-        el("p", {}, "Rien d'archivé pour l'instant."),
-      ),
-    ].filter(Boolean));
+    );
+    if (archived.length) {
+      trashBox.append(el("div", { class: "section-title" }, "Parties archivées"));
+      trashBox.append(el("div", { class: "grid" }, archived.map(trashCard)));
+    }
+    trashBox.append(resSection);
+    main().replaceChildren(trashBox);
     return;
   }
 
   main().replaceChildren(...[
+    el("div", { class: "global-search-wrap" },
+      el("input", { class: "global-search", placeholder: "Rechercher dans tes mondes, cartes et parties…", "aria-label": "Recherche globale", oninput: (e) => paintGlobalResults(e.target.value) }),
+      el("div", { class: "global-results", hidden: true }),
+    ),
     el("div", { class: "hero" + (banner ? " hero-banner" : ""), style: banner ? { backgroundImage: `url(${banner})` } : null },
       el("div", { class: "hero-inner" },
         el("h2", {}, "Bienvenue, aventurier. ✨"),
@@ -260,9 +429,12 @@ function renderDashboard() {
         ),
       ),
     ),
-    archived.length ? el("div", { class: "section-title" }, "Corbeille",
+    lastActive ? resumeCard(lastActive) : null,
+    // the trash section shows when conversations are archived OR resources were
+    // soft-deleted — the count is filled in asynchronously
+    el("div", { class: "section-title", id: "trash-sec", hidden: true }, "Corbeille",
       el("button", { class: "chip-btn slim", style: { marginLeft: "10px" }, onclick: () => { trashMode = true; renderDashboard(); } }, "🗑 " + archived.length),
-    ) : null,
+    ),
     pinned.length ? el("div", { class: "section-title" }, "⭐ Parties épinglées") : null,
     pinned.length ? el("div", { class: "grid" }, pinned.map(convCard)) : null,
     rest.length ? el("div", { class: "section-title" }, "Continuer une partie") : null,
@@ -271,6 +443,13 @@ function renderDashboard() {
     worldCards.length ? el("div", { class: "grid" }, worldCards.map(worldCard)) : null,
     !store.worlds.length && !store.cards.length ? onboardingPanel() : null,
   ].filter(Boolean));
+  api("/api/trash").then(({ items }) => {
+    const sec = document.getElementById("trash-sec");
+    if (!sec) return;
+    const total = archived.length + (items || []).length;
+    sec.hidden = total === 0;
+    sec.querySelector("button").textContent = "🗑 " + total;
+  }).catch(() => {});
 }
 
 // ─── first-run onboarding (no world, no card yet) ────────────────────────────
@@ -358,6 +537,26 @@ function trashCard(c) {
   );
 }
 
+// dominant "Reprendre" action for the most recent active party
+function resumeCard(c) {
+  const world = c.world;
+  const castNames = (c.cards || []).map((x) => x.name).slice(0, 3).join(", ");
+  return el("div", { class: "resume-card", onclick: () => navigate(`#/chat/${c.id}`), role: "button", tabindex: 0 },
+    el("div", { class: "resume-art", style: world?.cover ? { backgroundImage: `url(${world.cover})` } : null },
+      el("span", { class: "resume-play" }, "▶"),
+    ),
+    el("div", { class: "resume-main" },
+      el("div", { class: "resume-label" }, "Reprendre ta dernière partie"),
+      el("h3", {}, esc(c.title || "Partie")),
+      el("div", { class: "resume-meta" },
+        [world?.name, castNames, c.group_mode ? "groupe" : "solo"].filter(Boolean).join(" · ") || fmtTime(c.updated_at),
+      ),
+      c.last_message ? el("div", { class: "resume-preview" }, "« " + esc(c.last_message.slice(0, 110)) + (c.last_message.length > 110 ? "…" : "") + " »") : null,
+    ),
+    el("button", { class: "btn btn-primary btn-lg", onclick: (e) => { e.stopPropagation(); navigate(`#/chat/${c.id}`); } }, ICONS.play, "Continuer ▶"),
+  );
+}
+
 function convCard(c) {
   const world = c.world;
   const last = c.last_message ? c.last_message.slice(0, 90) : "";
@@ -432,9 +631,22 @@ function worldModal(existing) {
   const desc = field("Description courte", f(existing?.description), { type: "textarea", rows: 2, placeholder: "Une phrase qui donne envie" });
   const lore = field("Lore / univers", f(existing?.lore), { type: "textarea", rows: 5, placeholder: "L'histoire du monde, ses règles, sa géographie, ses factions…" });
   const tone = field("Tonalité", f(existing?.tone), { placeholder: "Ex: épique, sombre, léger, comique" });
-  const nstyle = field("Style de narration", f(existing?.narration_style), { placeholder: "Ex: immersive et cinématique" });
+  // narrator style: picks a preset key (built-in or custom) — empty = follow the global settings
+  const narrStyleOptions = narratorStyleOptions();
+  const currentStyle = narrStyleOptions.some(([k]) => k === f(existing?.narration_style)) ? existing?.narration_style : "";
+  const nstyle = field("Style du narrateur (preset)", currentStyle, { type: "select", options: narrStyleOptions });
+  const stylePromptOf = (key) => (key && (store.settings.narrator_presets || {})[key]?.prompt) || BUILTIN_NARRATOR[key]?.prompt || "";
+  const nstylePreview = el("p", { class: "style-preview" }, stylePromptOf(currentStyle));
+  nstyle.input.addEventListener("change", () => { nstylePreview.textContent = stylePromptOf(nstyle.input.value); });
   const lang = field("Langue du monde", f(existing?.language), {
     type: "select", options: [["", "Par défaut (réglages)"], ["fr", "Français"], ["en", "English"]],
+  });
+  // per-world negative prompt for the illustrations (overrides the global one)
+  let worldSettings = {};
+  try { worldSettings = JSON.parse(existing?.settings || "{}"); } catch { /* ignore */ }
+  const negative = field("Prompt négatif (illustrations)", f(worldSettings.negative), {
+    type: "textarea", rows: 2,
+    placeholder: "Ce que les illustrations de ce monde doivent éviter (ex: mains déformées, texte, logo…)",
   });
   // jaquette générée par IA (édition seulement — il faut un id de monde)
   const coverBox = el("div", { class: "cover-box", style: { marginTop: "16px" } });
@@ -456,7 +668,7 @@ function worldModal(existing) {
     if (preview) coverBox.append(preview);
     coverBox.append(genBtn);
   }
-  const body = el("div", {}, name.wrap, desc.wrap, lore.wrap, el("div", { class: "row" }, tone.wrap, nstyle.wrap), lang.wrap, coverBox);
+  const body = el("div", {}, name.wrap, desc.wrap, lore.wrap, el("div", { class: "row" }, tone.wrap, nstyle.wrap), nstylePreview, lang.wrap, negative.wrap, coverBox);
   const { close } = openModal({
     title: existing ? "Modifier le monde" : "Nouveau monde",
     body,
@@ -468,8 +680,9 @@ function worldModal(existing) {
           description: desc.input.value.trim(),
           lore: lore.input.value.trim(),
           tone: tone.input.value.trim(),
-          narration_style: nstyle.input.value.trim(),
+          narration_style: nstyle.input.value,
           language: lang.input.value,
+          settings: JSON.stringify({ ...worldSettings, negative: negative.input.value.trim() }),
         };
         try {
           if (existing) await api(`/api/worlds/${existing.id}`, { method: "PATCH", body: payload });
@@ -501,6 +714,11 @@ async function renderWorldDetail(id) {
     el("div", { style: { display: "flex", gap: "10px" } },
       el("button", { class: "btn btn-ghost", onclick: () => worldModal(world) }, ICONS.edit, "Modifier"),
       el("button", { class: "btn btn-primary", onclick: () => startGameFromWorld(world.id) }, ICONS.plus, "Nouvelle partie"),
+      el("button", { class: "btn btn-ghost", style: { color: "var(--danger)" }, title: "Supprimer ce monde (corbeille)", onclick: async () => {
+        if (await confirmModal({ title: "Supprimer le monde", message: `Supprimer « ${world.name} » ? Il ira dans la corbeille (ses parties restent accessibles).` })) {
+          softDeleteResource("world", world.id, world.name, () => navigate("#/worlds"));
+        }
+      } }, ICONS.trash),
     ),
   );
 
@@ -535,7 +753,7 @@ async function renderWorldDetail(id) {
       const b = e.target;
       b.disabled = true;
       try {
-        const res = await fetch(`/api/worlds/${world.id}/export`);
+        const res = await apiFetch(`/api/worlds/${world.id}/export`);
         if (!res.ok) throw new Error("Export impossible");
         const blob = await res.blob();
         const a = document.createElement("a");
@@ -597,7 +815,514 @@ async function renderWorldDetail(id) {
     body.append(el("div", { class: "grid" }, plays.map(convCard)));
   }
 
-  main().replaceChildren(head, body);
+  // workspace tabs: overview + lieux / lorebook / relations / chronologie
+  const tabRenders = [
+    ["Vue d'ensemble", () => body],
+    ["Lieux", () => renderLocationsTab(world)],
+    ["Lorebook", () => renderLorebookTab(world)],
+    ["Relations", () => renderRelationsTab(world)],
+    ["Chronologie", () => renderTimelineTab(world)],
+    ["Galerie", () => renderGalleryTab(world)],
+  ];
+  const tabBar = el("div", { class: "world-tabs", role: "tablist" });
+  const tabContent = el("div", { class: "world-tab-content" });
+  const activate = (i) => {
+    [...tabBar.children].forEach((b, j) => b.classList.toggle("on", j === i));
+    tabContent.replaceChildren(tabRenders[i][1]());
+  };
+  tabRenders.forEach(([label], i) => tabBar.append(el("button", { class: "world-tab", role: "tab", onclick: () => activate(i) }, label)));
+  activate(0);
+  main().replaceChildren(head, tabBar, tabContent);
+}
+
+// ─── world workspace: lieux / lorebook / relations / chronologie ─────────────
+function renderLocationsTab(world) {
+  const box = el("div", { class: "tab-box" });
+  const paint = async () => {
+    const { locations } = await api(`/api/worlds/${world.id}/locations`).catch(() => ({ locations: [] }));
+    box.replaceChildren(
+      el("div", { class: "tab-head" },
+        el("div", {},
+          el("h3", {}, "📍 Lieux"),
+          el("div", { class: "sub" }, "Les endroits clés du monde, avec leur position sur la carte (0-100)."),
+        ),
+        el("button", { class: "btn btn-primary btn-sm", onclick: () => locationModal(world, null, paint) }, ICONS.plus, "Ajouter un lieu"),
+      ),
+      locations.length
+        ? el("div", { class: "workspace-list" }, locations.map((l) =>
+            el("div", { class: "ws-row" },
+              el("div", { class: "ws-main" },
+                el("strong", {}, esc(l.name)),
+                el("div", { class: "ws-sub" }, esc(l.description || "—")),
+              ),
+              el("span", { class: "chip" }, `x ${l.x} · y ${l.y}`),
+              el("div", { class: "ws-actions" },
+                el("button", { class: "mini-btn", onclick: () => locationModal(world, l, paint) }, ICONS.edit),
+                el("button", { class: "mini-btn", style: { color: "var(--danger)" }, onclick: async () => {
+                  if (await confirmModal({ title: "Supprimer le lieu", message: `Supprimer « ${l.name} » ?` })) {
+                    await api(`/api/locations/${l.id}`, { method: "DELETE" });
+                    paint();
+                  }
+                } }, ICONS.trash),
+              ),
+            ),
+          ))
+        : el("div", { class: "empty" }, el("div", { class: "big" }, "📍"), el("h3", {}, "Aucun lieu"), el("p", {}, "Ajoute les endroits clés du monde (capitale, forêt, donjon…).")),
+    );
+  };
+  paint();
+  return box;
+}
+
+function locationModal(world, existing, onDone) {
+  const name = field("Nom", existing?.name, { autofocus: true });
+  const desc = field("Description", existing?.description, { type: "textarea", rows: 2 });
+  const x = field("Position X (%)", existing?.x ?? 50, { type: "number", min: 0, max: 100, step: 1 });
+  const y = field("Position Y (%)", existing?.y ?? 50, { type: "number", min: 0, max: 100, step: 1 });
+  const cancelBtn = el("button", { class: "btn btn-ghost" }, "Annuler");
+  const saveBtn = el("button", { class: "btn btn-primary" }, "Enregistrer");
+  const { close } = openModal({
+    title: existing ? "Modifier le lieu" : "Nouveau lieu",
+    body: el("div", {}, name.wrap, desc.wrap, el("div", { class: "row" }, x.wrap, y.wrap)),
+    footer: [cancelBtn, saveBtn],
+  });
+  cancelBtn.addEventListener("click", close);
+  saveBtn.addEventListener("click", async () => {
+    try {
+      const payload = { name: name.input.value.trim() || "Lieu", description: desc.input.value.trim(), x: Number(x.input.value), y: Number(y.input.value) };
+      if (existing) await api(`/api/locations/${existing.id}`, { method: "PATCH", body: payload });
+      else await api(`/api/worlds/${world.id}/locations`, { body: payload });
+      close();
+      toast(existing ? "Lieu modifié ✓" : "Lieu ajouté ✓");
+      onDone?.();
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+function renderLorebookTab(world) {
+  const box = el("div", { class: "tab-box" });
+  const paint = async () => {
+    const { entries } = await api(`/api/worlds/${world.id}/lorebook`).catch(() => ({ entries: [] }));
+    box.replaceChildren(
+      el("div", { class: "tab-head" },
+        el("div", {},
+          el("h3", {}, "📖 Lorebook"),
+          el("div", { class: "sub" }, "Mémoire conditionnelle : une entrée n'est injectée dans le prompt que si l'un de ses déclencheurs apparaît dans la partie."),
+        ),
+        el("button", { class: "btn btn-primary btn-sm", onclick: () => lorebookModal(world, null, paint) }, ICONS.plus, "Ajouter une entrée"),
+      ),
+      entries.length
+        ? el("div", { class: "workspace-list" }, entries.map((e) =>
+            el("div", { class: "ws-row" },
+              el("div", { class: "ws-main" },
+                el("div", { style: { display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" } },
+                  el("strong", {}, esc(e.name)),
+                  el("span", { class: "chip" }, "priorité " + e.priority),
+                  e.enabled ? null : el("span", { class: "chip dim" }, "désactivée"),
+                ),
+                e.triggers ? el("div", { class: "ws-sub" }, e.triggers.split(",").map((t) => t.trim()).filter(Boolean).map((t) => el("span", { class: "chip tiny" }, t))) : null,
+                el("div", { class: "ws-desc" }, esc(e.content)),
+              ),
+              el("div", { class: "ws-actions" },
+                el("button", { class: "mini-btn", onclick: () => lorebookModal(world, e, paint) }, ICONS.edit),
+                el("button", { class: "mini-btn", style: { color: "var(--danger)" }, onclick: async () => {
+                  if (await confirmModal({ title: "Supprimer l'entrée", message: `Supprimer « ${e.name} » ?` })) {
+                    await api(`/api/lorebook/${e.id}`, { method: "DELETE" });
+                    paint();
+                  }
+                } }, ICONS.trash),
+              ),
+            ),
+          ))
+        : el("div", { class: "empty" }, el("div", { class: "big" }, "📖"), el("h3", {}, "Aucune entrée"), el("p", {}, "Ex : « La Guilde des Cendres », déclencheurs « guilde, cendres, maître forgeron » — le contenu n'entre dans le contexte que quand ces mots apparaissent.")),
+    );
+  };
+  paint();
+  return box;
+}
+
+function lorebookModal(world, existing, onDone) {
+  const name = field("Nom", existing?.name, { autofocus: true });
+  const triggers = field("Déclencheurs (séparés par des virgules)", existing?.triggers, { placeholder: "guilde, cendres, maître forgeron" });
+  const content = field("Contenu", existing?.content, { type: "textarea", rows: 4 });
+  const priority = field("Priorité", existing?.priority ?? 1, { type: "number", min: 1, max: 10, step: 1 });
+  const enabled = el("label", { class: "modal-line" },
+    el("div", { class: "ml-txt" }, el("strong", {}, "Entrée active")),
+    el("input", { type: "checkbox", ...(existing?.enabled !== 0 ? { checked: "" } : {}) }),
+  );
+  const cancelBtn = el("button", { class: "btn btn-ghost" }, "Annuler");
+  const saveBtn = el("button", { class: "btn btn-primary" }, "Enregistrer");
+  const { close } = openModal({
+    title: existing ? "Modifier l'entrée" : "Nouvelle entrée de lorebook",
+    body: el("div", {}, name.wrap, triggers.wrap, content.wrap, priority.wrap, enabled),
+    footer: [cancelBtn, saveBtn],
+  });
+  cancelBtn.addEventListener("click", close);
+  saveBtn.addEventListener("click", async () => {
+    try {
+      const payload = {
+        name: name.input.value.trim() || "Entrée",
+        triggers: triggers.input.value.trim(),
+        content: content.input.value.trim(),
+        priority: Number(priority.input.value),
+        enabled: enabled.querySelector("input").checked ? 1 : 0,
+      };
+      if (existing) await api(`/api/lorebook/${existing.id}`, { method: "PATCH", body: payload });
+      else await api(`/api/worlds/${world.id}/lorebook`, { body: payload });
+      close();
+      toast(existing ? "Entrée modifiée ✓" : "Entrée ajoutée ✓");
+      onDone?.();
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+function renderRelationsTab(world) {
+  const box = el("div", { class: "tab-box" });
+  const paint = async () => {
+    const { relations } = await api(`/api/worlds/${world.id}/relations`).catch(() => ({ relations: [] }));
+    box.replaceChildren(
+      el("div", { class: "tab-head" },
+        el("div", {},
+          el("h3", {}, "🕸 Relations"),
+          el("div", { class: "sub" }, "Le réseau entre personnages : alliés, rivaux, familles… Les liens peuvent évoluer pendant les parties."),
+        ),
+        el("button", { class: "btn btn-primary btn-sm", onclick: () => relationModal(world, null, paint) }, ICONS.plus, "Ajouter une relation"),
+      ),
+      relations.length
+        ? el("div", { class: "workspace-list" }, relations.map((r) =>
+            el("div", { class: "ws-row" },
+              el("div", { class: "ws-main rel-line" },
+                el("strong", {}, esc(r.from_name)),
+                el("span", { class: "rel-kind" }, "— " + esc(r.kind) + " →"),
+                el("strong", {}, esc(r.to_name)),
+              ),
+              el("div", { class: "ws-actions" },
+                el("button", { class: "mini-btn", onclick: () => relationModal(world, r, paint) }, ICONS.edit),
+                el("button", { class: "mini-btn", style: { color: "var(--danger)" }, onclick: async () => {
+                  if (await confirmModal({ title: "Supprimer la relation", message: `Supprimer le lien « ${r.from_name} — ${r.kind} — ${r.to_name} » ?` })) {
+                    await api(`/api/relations/${r.id}`, { method: "DELETE" });
+                    paint();
+                  }
+                } }, ICONS.trash),
+              ),
+            ),
+          ))
+        : el("div", { class: "empty" }, el("div", { class: "big" }, "🕸"), el("h3", {}, "Aucune relation"), el("p", {}, "Relie deux personnages : « Alba — méfiance → Kael ».")),
+    );
+  };
+  paint();
+  return box;
+}
+
+function relationModal(world, existing, onDone) {
+  const from = field("De", existing?.from_name, { autofocus: true });
+  const kind = field("Type de lien", existing?.kind || "allié", { type: "select", options: [["allié", "allié"], ["rivale", "rivale"], ["amoureux", "amoureux"], ["famille", "famille"], ["méfiance", "méfiance"], ["neutre", "neutre"], ["ennemi", "ennemi"]] });
+  const to = field("Vers", existing?.to_name);
+  const cancelBtn = el("button", { class: "btn btn-ghost" }, "Annuler");
+  const saveBtn = el("button", { class: "btn btn-primary" }, "Enregistrer");
+  const { close } = openModal({
+    title: existing ? "Modifier la relation" : "Nouvelle relation",
+    body: el("div", {}, el("div", { class: "row" }, from.wrap, to.wrap), kind.wrap),
+    footer: [cancelBtn, saveBtn],
+  });
+  cancelBtn.addEventListener("click", close);
+  saveBtn.addEventListener("click", async () => {
+    try {
+      const payload = { from_name: from.input.value.trim(), kind: kind.input.value, to_name: to.input.value.trim() };
+      if (!payload.from_name || !payload.to_name) return toast("Les deux personnages sont requis", "err");
+      if (existing) await api(`/api/relations/${existing.id}`, { method: "PATCH", body: payload });
+      else await api(`/api/worlds/${world.id}/relations`, { body: payload });
+      close();
+      toast(existing ? "Relation modifiée ✓" : "Relation ajoutée ✓");
+      onDone?.();
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+function renderTimelineTab(world) {
+  const box = el("div", { class: "tab-box" });
+  const paint = async () => {
+    const { events } = await api(`/api/worlds/${world.id}/timeline`).catch(() => ({ events: [] }));
+    box.replaceChildren(
+      el("div", { class: "tab-head" },
+        el("div", {},
+          el("h3", {}, "🗓 Chronologie"),
+          el("div", { class: "sub" }, "Les grands événements du monde, dans l'ordre."),
+        ),
+        el("div", { style: { display: "flex", gap: "10px" } },
+          el("button", { class: "btn btn-ghost btn-sm", onclick: () => proposeTimeline(world, paint) }, ICONS.sparkles, "Proposer depuis les parties"),
+          el("button", { class: "btn btn-primary btn-sm", onclick: () => timelineModal(world, paint) }, ICONS.plus, "Ajouter un événement"),
+        ),
+      ),
+      events.length
+        ? el("div", { class: "timeline" }, events.map((ev) =>
+            el("div", { class: "tl-item" },
+              el("div", { class: "tl-date" }, fmtTime(ev.created_at)),
+              el("div", { class: "tl-body" }, esc(ev.label)),
+              el("button", { class: "mini-btn", style: { color: "var(--danger)" }, title: "Supprimer", onclick: async () => {
+                if (await confirmModal({ title: "Supprimer l'événement", message: `Supprimer « ${ev.label} » ?` })) {
+                  await api(`/api/timeline/${ev.id}`, { method: "DELETE" });
+                  paint();
+                }
+              } }, ICONS.trash),
+            ),
+          ))
+        : el("div", { class: "empty" }, el("div", { class: "big" }, "🗓"), el("h3", {}, "Chronologie vide"), el("p", {}, "Note les événements majeurs : arrivées, pactes, batailles, révélations…")),
+    );
+  };
+  paint();
+  return box;
+}
+
+// ── proposer des événements depuis les parties (l'IA ne fait QUE suggérer) ──
+async function proposeTimeline(world, paint) {
+  const toastShow = (msg, type = "ok") => toast(msg, type);
+  let proposals = [];
+  const list = el("div", { class: "prop-list" });
+  const paintProps = () => {
+    if (!proposals.length) {
+      list.replaceChildren(el("div", { class: "empty" }, el("div", { class: "big" }, "✨"), el("h3", {}, "Rien à proposer"), el("p", {}, "L'IA n'a pas repéré d'événement majeur récent (ou ils sont déjà tous acceptés).")));
+      return;
+    }
+    list.replaceChildren(...proposals.map((p) => {
+      const acceptBtn = el("button", { class: "mini-btn", onclick: async () => {
+        try {
+          await api("/api/worlds/" + world.id + "/timeline", { body: { label: p.label, conversation_id: p.conversation_id ?? undefined } });
+          proposals = proposals.filter((x) => x !== p);
+          paintProps();
+          paint();
+          toastShow("Événement ajouté à la chronologie ✓");
+        } catch (e) { toastShow(e.message, "err"); }
+      } }, "✓ Accepter");
+      const dropBtn = el("button", { class: "mini-btn", title: "Ignorer cette proposition", onclick: () => { proposals = proposals.filter((x) => x !== p); paintProps(); } }, "✕ Ignorer");
+      return el("div", { class: "prop-row" },
+        el("div", { class: "prop-main" },
+          el("div", { class: "prop-label" }, p.duplicate ? el("span", { class: "chip tiny", title: "Un événement similaire existe déjà" }, "déjà présent") : null, esc(p.label)),
+          p.conversation ? el("div", { class: "prop-sub" }, "Partie : " + esc(p.conversation)) : null,
+          p.extract ? el("div", { class: "prop-extract" }, "« " + esc(p.extract) + " »") : null,
+        ),
+        acceptBtn,
+        dropBtn,
+      );
+    }));
+  };
+  const { close } = openModal({
+    title: "✨ Événements proposés par l'IA",
+    sub: "Repérés dans les parties récentes de ce monde. Rien n'est appliqué automatiquement — accepte ou ignore chaque proposition.",
+    body: el("div", {}, list),
+    wide: true,
+  });
+  try {
+    const r = await api(`/api/worlds/${world.id}/timeline/propose`, { body: {} });
+    proposals = r.proposals || [];
+  } catch (e) {
+    list.replaceChildren(el("div", { class: "empty" }, el("div", { class: "big" }, "😵"), el("h3", {}, "Analyse impossible"), el("p", {}, esc(e.message))));
+    return;
+  }
+  paintProps();
+}
+
+function timelineModal(world, onDone) {
+  const label = field("Événement", "", { type: "textarea", rows: 2, autofocus: true, placeholder: "Jour 3 — Pacte avec le gardien de la porte noire" });
+  const cancelBtn = el("button", { class: "btn btn-ghost" }, "Annuler");
+  const addBtn = el("button", { class: "btn btn-primary" }, "Ajouter");
+  const { close } = openModal({
+    title: "Nouvel événement",
+    body: el("div", {}, label.wrap),
+    footer: [cancelBtn, addBtn],
+  });
+  cancelBtn.addEventListener("click", close);
+  addBtn.addEventListener("click", async () => {
+    const text = label.input.value.trim();
+    if (!text) return toast("Décris l'événement", "err");
+    try {
+      await api(`/api/worlds/${world.id}/timeline`, { body: { label: text } });
+      close();
+      toast("Événement ajouté ✓");
+      onDone?.();
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+// ─── world gallery: every illustration of the world (parties + cover + map), ──
+// with filters (paysage / personnage / favoris), favorites and seed-locked regen
+function renderGalleryTab(world) {
+  const box = el("div", { class: "tab-box" });
+  let items = [];
+  let filter = "all";
+  let charFilter = null;
+  const grid = el("div", { class: "gallery-grid" });
+  const load = async () => {
+    try {
+      const r = await api(`/api/worlds/${world.id}/gallery`);
+      items = r.items || [];
+      paint();
+    } catch (e) { box.replaceChildren(el("div", { class: "empty" }, el("div", { class: "big" }, "🖼"), el("h3", {}, "Galerie indisponible"), el("p", {}, esc(e.message)))); }
+  };
+  const visible = () => items.filter((it) => {
+    if (charFilter && it.character !== charFilter) return false;
+    if (filter === "fav") return it.fav;
+    if (filter === "landscape") return it.kind === "landscape" || (!it.kind && !it.character);
+    if (filter === "portrait") return it.kind === "portrait" || it.character;
+    return true;
+  });
+  const characters = [...new Set(items.map((i) => i.character).filter(Boolean))];
+  const paint = () => {
+    const pills = el("div", { class: "gallery-filters" },
+      ["all", "landscape", "portrait", "fav"].map((k) =>
+        el("button", { class: "chip-btn slim" + (filter === k ? " on" : ""), onclick: () => { filter = k; paint(); } },
+          k === "all" ? "Toutes" : k === "landscape" ? "🏞 Paysages" : k === "portrait" ? "🎭 Personnages" : "⭐ Favoris")),
+      ...characters.map((c) => el("button", { class: "chip-btn slim" + (charFilter === c ? " on" : ""), onclick: () => { charFilter = charFilter === c ? null : c; paint(); } }, "🎭 " + esc(c))),
+    );
+    const vis = visible();
+    grid.replaceChildren(...(vis.length ? vis.map((it) => galleryCard(it)) : [el("div", { class: "empty" }, el("div", { class: "big" }, "🖼"), el("h3", {}, "Aucune illustration"), el("p", {}, "Génère des scènes dans les parties de ce monde."))]));
+    box.replaceChildren(
+      el("div", { class: "tab-head" },
+        el("div", {},
+          el("h3", {}, "🖼 Galerie du monde"),
+          el("div", { class: "sub" }, `${items.length} illustration${items.length > 1 ? "s" : ""} — toutes les parties de « ${esc(world.name)} » + couverture et carte`),
+        ),
+      ),
+      pills,
+      grid,
+    );
+  };
+  const toggleFav = async (it) => {
+    if (typeof it.id !== "number") return; // world cover/map have no message to patch
+    const next = it.fav ? 0 : 1;
+    try {
+      await api(`/api/conversations/${it.conversation_id}/messages/${it.id}`, { method: "PATCH", body: { meta: { image_fav: next } } });
+      it.fav = next;
+      paint();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  const regen = async (it, mode) => {
+    if (typeof it.id !== "number") return toast("Couverture et carte ne se régénèrent pas ici.", "err");
+    toast(mode === "seed" ? "🔒 Régénération (même seed)…" : "🎲 Variation…", "ok", 4000);
+    try {
+      const body = { kind: it.kind === "landscape" ? "landscape" : "portrait", ...(mode === "seed" ? { seed: it.seed, variation: "composition identique, détails et ambiance différents" } : { vary: true }) };
+      await api(`/api/conversations/${it.conversation_id}/messages/${it.id}/image`, { body });
+      toast("Illustration régénérée ✓");
+      await load();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  const galleryCard = (it) => {
+    const img = el("img", { src: it.image, alt: it.message || "illustration", loading: "lazy" });
+    img.addEventListener("click", () => {
+      const lb = el("div", { class: "lightbox" },
+        el("img", { src: it.image }),
+        el("div", { class: "lb-meta" },
+          it.character ? el("span", { class: "chip" }, "🎭 " + esc(it.character)) : null,
+          it.kind === "landscape" ? el("span", { class: "chip" }, "🏞 paysage") : it.character ? el("span", { class: "chip" }, "🎭 portrait") : null,
+          it.seed != null ? el("span", { class: "chip" }, "seed " + it.seed) : null,
+          it.fav ? el("span", { class: "chip" }, "⭐ favori") : null,
+        ),
+        it.conversation ? el("div", { class: "lb-conv" }, "Partie : " + esc(it.conversation)) : null,
+        el("p", { class: "lb-caption" }, esc(it.message || "")),
+        el("div", { class: "lb-actions" },
+          el("button", { class: "mini-btn", title: "Régénérer avec le même seed (composition similaire)", onclick: () => { lb.remove(); regen(it, "seed"); } }, "🔒 Même seed"),
+          el("button", { class: "mini-btn", title: "Varier avec un nouveau seed", onclick: () => { lb.remove(); regen(it, "vary"); } }, "🎲 Varier"),
+          el("button", { class: "mini-btn" + (it.fav ? " on" : ""), title: "Favori", onclick: () => toggleFav(it) }, it.fav ? "⭐ Retirer des favoris" : "☆ Ajouter aux favoris"),
+        ),
+      );
+      lb.addEventListener("click", (e) => { if (e.target === lb) lb.remove(); });
+      document.body.append(lb);
+    });
+    return el("div", { class: "gallery-card" },
+      img,
+      el("div", { class: "gallery-cap" },
+        it.character ? el("span", { class: "chip tiny" }, "🎭 " + esc(it.character)) : null,
+        el("span", { class: "gallery-txt" }, esc(it.message || "")),
+        el("button", { class: "mini-btn gal-fav" + (it.fav ? " on" : ""), title: "Favori", "aria-label": "Favori", onclick: (e) => { e.stopPropagation(); toggleFav(it); } }, it.fav ? "★" : "☆"),
+      ),
+    );
+  };
+  load();
+  return box;
+}
+
+// ─── full branch graph view (#/graph/:id) — the whole fork family as a tree ──
+// with connectors, statuses and per-node actions (open / kind / delete)
+async function renderBranchGraph(id) {
+  const main = document.getElementById("main");
+  let data;
+  try { data = await api(`/api/conversations/${id}/branches`); }
+  catch (e) { return main.replaceChildren(el("div", { class: "empty" }, el("div", { class: "big" }, "🌿"), el("h3", {}, "Graphe indisponible"), el("p", {}, esc(e.message)))); }
+  const branches = data.branches || [];
+  const currentId = Number(id);
+  const KIND_META = {
+    main: { icon: "🌳", label: "principale" }, canon: { icon: "⭐", label: "canon" },
+    alternative: { icon: "🌿", label: "variante" }, draft: { icon: "📝", label: "brouillon" },
+    abandoned: { icon: "💤", label: "abandonnée" },
+  };
+  const byId = new Map(branches.map((b) => [b.id, b]));
+  const childrenOf = (bid) => branches.filter((b) => b.parent_id === bid);
+  const tree = [];
+  const walk = (b, depth) => { tree.push([b, depth]); for (const c of childrenOf(b.id)) walk(c, depth + 1); };
+  for (const r of branches.filter((b) => !b.parent_id || !byId.has(b.parent_id))) walk(r, 0);
+  const kindSel = (b) => {
+    const sel = el("select", { class: "mini-select", title: "Statut de cette branche", "aria-label": "Statut" },
+      Object.entries(KIND_META).map(([k, m]) => el("option", { value: k, ...(b.branch_kind === k ? { selected: "" } : {}) }, m.label)),
+    );
+    sel.addEventListener("change", async () => {
+      try {
+        await api(`/api/conversations/${b.id}`, { method: "PATCH", body: { branch_kind: sel.value } });
+        toast("Statut mis à jour ✓");
+        renderBranchGraph(id);
+      } catch (e) { toast(e.message, "err"); }
+    });
+    return sel;
+  };
+  const nodeCard = (b, depth) => {
+    const meta = KIND_META[b.branch_kind] || KIND_META.alternative;
+    const isCurrent = b.id === currentId;
+    const kids = childrenOf(b.id).length;
+    const card = el("div", { class: "graph-node" + (isCurrent ? " cur" : "") + (depth ? " child" : " root") },
+      el("div", { class: "gn-top" },
+        el("span", { class: "gn-icon" }, meta.icon),
+        el("div", { class: "gn-title" }, esc(b.title || "Partie"),
+          isCurrent ? el("span", { class: "chip tiny" }, "actuelle") : null,
+          kids ? el("span", { class: "chip tiny" }, `${kids} enfant${kids > 1 ? "s" : ""}`) : null),
+      ),
+      b.last_message ? el("div", { class: "gn-preview" }, esc(b.last_message)) : null,
+      el("div", { class: "gn-sub" }, fmtTime(b.updated_at), " · ", meta.label),
+      el("div", { class: "gn-actions" },
+        el("button", { class: "mini-btn", title: "Ouvrir cette branche", onclick: () => navigate(`#/chat/${b.id}`) }, ICONS.play, "Ouvrir"),
+        kindSel(b),
+        el("button", { class: "mini-btn", style: { color: "var(--danger)" }, title: "Supprimer définitivement", "aria-label": "Supprimer", onclick: async () => {
+          if (!(await confirmModal({ title: "Supprimer la variante", message: `Supprimer définitivement « ${b.title} » ainsi que ses audio et images ?` }))) return;
+          try {
+            await api(`/api/conversations/${b.id}/permanent`, { method: "DELETE" });
+            toast("Branche supprimée ✓");
+            renderBranchGraph(id);
+          } catch (e) { toast(e.message, "err"); }
+        } }, ICONS.trash),
+      ),
+    );
+    card.style.setProperty("--depth", String(depth));
+    return card;
+  };
+  const legend = el("div", { class: "graph-legend" },
+    Object.entries(KIND_META).map(([k, m]) => el("span", { class: "chip" }, `${m.icon} ${m.label}`)),
+  );
+  const backBtn = el("a", { href: "#", class: "btn btn-ghost btn-icon", onclick: (e) => { e.preventDefault(); navigate(`#/chat/${currentId}`); } }, ICONS.back);
+  main.replaceChildren(
+    el("div", { class: "graph-page" },
+      el("div", { class: "page-head" },
+        el("div", { style: { display: "flex", gap: "14px", alignItems: "center" } },
+          backBtn,
+          el("div", {},
+            el("h2", {}, "🌿 Graphe des variantes"),
+            el("div", { class: "sub" }, `${branches.length} branche${branches.length > 1 ? "s" : ""} · chaque « Régénérer » crée une variante reliée à sa source`),
+          ),
+        ),
+      ),
+      legend,
+      branches.length
+        ? el("div", { class: "graph-tree" }, tree.map(([b, d]) => nodeCard(b, d)))
+        : el("div", { class: "empty" }, el("div", { class: "big" }, "🌿"), el("h3", {}, "Une seule branche"), el("p", {}, "Régénère une réponse pour créer une variante.")),
+    ),
+  );
 }
 
 function scenarioCard(world, s) {
@@ -609,10 +1334,8 @@ function scenarioCard(world, s) {
         el("button", { class: "mini-btn", onclick: () => navigate(`#/chat/new?world=${world.id}&scenario=${s.id}`) }, "Jouer ▶"),
         el("button", { class: "mini-btn", onclick: () => scenarioModal(world, s) }, ICONS.edit),
         el("button", { class: "mini-btn", style: { color: "var(--danger)" }, onclick: async () => {
-          if (await confirmModal({ title: "Supprimer le scénario", message: `Supprimer « ${s.name} » ?` })) {
-            await api(`/api/scenarios/${s.id}`, { method: "DELETE" });
-            await refreshAll();
-            renderWorldDetail(world.id);
+          if (await confirmModal({ title: "Supprimer le scénario", message: `Supprimer « ${s.name} » ? Il ira dans la corbeille.` })) {
+            softDeleteResource("scenario", s.id, s.name, () => renderWorldDetail(world.id));
           }
         } }, ICONS.trash),
       ),
@@ -685,6 +1408,22 @@ function scenarioModal(world, existing) {
 
 // ─── cards ────────────────────────────────────────────────────────────────────
 async function renderCards() {
+  let cardQuery = "";
+  let tagFilter = "";
+  const cardSearch = el("input", { class: "search", placeholder: "Rechercher une carte…", "aria-label": "Rechercher une carte" });
+  const allTags = [...new Set(store.cards.flatMap((c) => { try { return JSON.parse(c.tags || "[]"); } catch { return []; } }))].sort();
+  const tagSelect = el("select", { class: "mini-select", "aria-label": "Filtrer par tag" }, el("option", { value: "" }, "Tous les tags"), ...allTags.map((t) => el("option", { value: t }, t)));
+  const cardGrid = el("div", { class: "grid" });
+  const paintCards = () => {
+    const q = cardQuery.toLowerCase();
+    const list = store.cards.filter((c) => {
+      const tags = (() => { try { return JSON.parse(c.tags || "[]"); } catch { return []; } })();
+      return (!q || `${c.name} ${c.description} ${c.personality} ${tags.join(" ")}`.toLowerCase().includes(q)) && (!tagFilter || tags.includes(tagFilter));
+    });
+    cardGrid.replaceChildren(...(list.length ? list.map(cardTile) : [el("div", { class: "empty" }, el("h3", {}, "Aucune carte trouvée"), el("p", {}, "Modifie la recherche ou le filtre."))]));
+  };
+  cardSearch.addEventListener("input", () => { cardQuery = cardSearch.value; paintCards(); });
+  tagSelect.addEventListener("change", () => { tagFilter = tagSelect.value; paintCards(); });
   const dropzone = el("div", { class: "dropzone" },
     el("span", { class: "big" }, "🎭"),
     el("strong", {}, "Dépose tes cartes SillyTavern ici"),
@@ -708,6 +1447,7 @@ async function renderCards() {
       newBtn,
       scanBtn,
     ),
+    el("div", { class: "library-tools" }, cardSearch, tagSelect),
     dropzone,
   );
   if (!store.cards.length) {
@@ -718,8 +1458,9 @@ async function renderCards() {
       el("button", { class: "btn btn-primary", onclick: () => cardModal() }, ICONS.plus, "Créer un personnage"),
     ));
   } else {
-    container.append(el("div", { class: "grid" }, store.cards.map(cardTile)));
+    container.append(cardGrid);
   }
+  paintCards();
   main().replaceChildren(container);
 }
 
@@ -728,7 +1469,27 @@ async function doImport(files) {
   try {
     const list = await uploadFiles(files);
     const res = await api("/api/import", { body: { files: list } });
-    toast(`${res.imported.length} carte${res.imported.length > 1 ? "s" : ""} importée${res.imported.length > 1 ? "s" : ""} ✓`);
+    const report = res.report || [];
+    const imported = report.filter((r) => r.status === "imported").length;
+    const duplicates = report.filter((r) => r.status === "duplicate");
+    const invalid = report.filter((r) => r.status === "invalid");
+    toast(`${imported} carte${imported > 1 ? "s" : ""} importée${imported > 1 ? "s" : ""} ✓` + (duplicates.length || invalid.length ? ` (${duplicates.length + invalid.length} ignorée${duplicates.length + invalid.length > 1 ? "s" : ""})` : ""));
+    if (duplicates.length || invalid.length) {
+      const okBtn = el("button", { class: "btn btn-primary" }, "OK");
+      const { close } = openModal({
+        title: "Rapport d'import",
+        sub: "Certains fichiers n'ont pas été importés",
+        body: el("div", { class: "import-report" }, report.map((r) =>
+          el("div", { class: `import-line imp-${r.status}` },
+            el("span", { class: "imp-icon" }, r.status === "imported" ? "✅" : r.status === "duplicate" ? "🔁" : "⚠️"),
+            el("span", { class: "imp-name" }, esc(r.name)),
+            el("span", { class: "imp-reason" }, esc(r.reason || (r.status === "imported" ? "importé" : r.status === "duplicate" ? "doublon" : "invalide"))),
+          ),
+        )),
+        footer: [okBtn],
+      });
+      okBtn.addEventListener("click", close);
+    }
     await refreshAll();
     renderCards();
   } catch (e) { toast(e.message, "err"); }
@@ -754,6 +1515,10 @@ async function scanDir() {
   });
 }
 
+function parseTags(raw) {
+  try { return Array.isArray(raw) ? raw.map(String) : JSON.parse(raw || "[]").map(String); } catch { return []; }
+}
+
 function cardTile(card) {
   return el("div", { class: "card" },
     el("div", { style: { display: "flex", alignItems: "center", gap: "14px", padding: "18px 18px 8px" } },
@@ -765,16 +1530,14 @@ function cardTile(card) {
           card.language ? el("span", { class: "chip" }, card.language.toUpperCase()) : null,
         ),
       ),
-    ),
-    el("div", { class: "card-body" },
+    ),      el("div", { class: "card-body" },
+      el("div", { class: "card-tags" }, ...parseTags(card.tags).map((tag) => el("span", { class: "chip" }, "#" + tag))),
       el("div", { class: "desc" }, esc(card.description || card.personality || "Personnage sans description")),
       el("div", { class: "card-actions" },
         el("button", { class: "mini-btn", onclick: () => cardModal(card) }, ICONS.edit, "Éditer"),
         el("button", { class: "mini-btn", style: { color: "var(--danger)" }, onclick: async () => {
-          if (await confirmModal({ title: "Supprimer la carte", message: `Supprimer « ${card.name} » ?` })) {
-            await api(`/api/cards/${card.id}`, { method: "DELETE" });
-            await refreshAll();
-            renderCards();
+          if (await confirmModal({ title: "Supprimer la carte", message: `Supprimer « ${card.name} » ? Elle ira dans la corbeille.` })) {
+            softDeleteResource("card", card.id, card.name, () => renderCards());
           }
         } }, ICONS.trash),
       ),
@@ -791,6 +1554,12 @@ function cardModal(existing) {
   const firstMes = field("Premier message (greeting)", f(existing?.first_mes), { type: "textarea", rows: 3 });
   const example = field("Exemple de dialogue", f(existing?.mes_example), { type: "textarea", rows: 4 });
   const sys = field("Prompt système (bonus)", f(existing?.system_prompt), { type: "textarea", rows: 2 });
+  const tags = field("Tags (séparés par des virgules)", parseTags(existing?.tags).join(", "), { placeholder: "mage, romance, pnJ" });
+  const avatarInput = el("input", { type: "file", accept: "image/png,image/jpeg,image/webp" });
+  const avatarPreview = existing?.avatar ? el("img", { src: existing.avatar, class: "avatar avatar-lg" }) : el("div", { class: "avatar avatar-lg", style: { display: "grid", placeItems: "center" } }, "🎭");
+  const avatarBox = el("div", { class: "avatar-editor" }, avatarPreview, avatarInput);
+  let avatarData = null;
+  avatarInput.addEventListener("change", () => { const file = avatarInput.files?.[0]; if (!file || file.size > 5 * 1024 * 1024) return toast("Avatar limité à 5 Mo", "err"); const reader = new FileReader(); reader.onload = () => { avatarData = String(reader.result); avatarPreview.replaceWith(el("img", { src: avatarData, class: "avatar avatar-lg" })); }; reader.readAsDataURL(file); });
   const lang = field("Langue de la voix", f(existing?.language), { type: "select", options: [["", "Par défaut"], ["fr", "Français"], ["en", "English"]] });
   // voices filtered by the chosen language (empty = toutes)
   const voiceOptsFor = () => {
@@ -850,7 +1619,7 @@ function cardModal(existing) {
     inp.addEventListener("change", updatePreview);
   }
   updatePreview();
-  const formCol = el("div", { class: "card-form-col" }, name.wrap, el("div", { class: "row" }, lang.wrap, voice.wrap), desc.wrap, perso.wrap, scenario.wrap, firstMes.wrap, example.wrap, sys.wrap);
+  const formCol = el("div", { class: "card-form-col" }, avatarBox, name.wrap, el("div", { class: "row" }, lang.wrap, voice.wrap), tags.wrap, desc.wrap, perso.wrap, scenario.wrap, firstMes.wrap, example.wrap, sys.wrap);
   const body = el("div", { class: "card-modal-grid" }, formCol, preview);
   const { close } = openModal({
     title: existing ? `Éditer ${existing.name}` : "Nouvelle carte",
@@ -863,7 +1632,7 @@ function cardModal(existing) {
           description: desc.input.value.trim(), personality: perso.input.value.trim(),
           scenario: scenario.input.value.trim(), first_mes: firstMes.input.value.trim(),
           mes_example: example.input.value.trim(), system_prompt: sys.input.value.trim(),
-          voice: voice.input.value, language: lang.input.value,
+          voice: voice.input.value, language: lang.input.value, tags: JSON.stringify(tags.input.value.split(",").map((x) => x.trim()).filter(Boolean)), ...(avatarData ? { avatar: avatarData } : {}),
         };
         try {
           if (existing) await api(`/api/cards/${existing.id}`, { method: "PATCH", body: payload });
@@ -907,10 +1676,8 @@ async function renderPersonas() {
           el("div", { class: "card-actions" },
             el("button", { class: "mini-btn", onclick: () => personaModal(p) }, ICONS.edit, "Éditer"),
             el("button", { class: "mini-btn", style: { color: "var(--danger)" }, onclick: async () => {
-              if (await confirmModal({ title: "Supprimer le persona", message: `Supprimer « ${p.name} » ?` })) {
-                await api(`/api/personas/${p.id}`, { method: "DELETE" });
-                await refreshAll();
-                renderPersonas();
+              if (await confirmModal({ title: "Supprimer le persona", message: `Supprimer « ${p.name} » ? Il ira dans la corbeille.` })) {
+                softDeleteResource("persona", p.id, p.name, () => renderPersonas());
               }
             } }, ICONS.trash),
           ),
@@ -966,8 +1733,10 @@ async function renderSettings() {
     tocItem("tts", "🔊 Voix"),
     tocItem("img", "🖼 Images"),
     tocItem("app", "🎨 Apparence"),
+    tocItem("sc", "⌨️ Raccourcis"),
     tocItem("backup", "💾 Sauvegarde"),
     tocItem("storage", "📦 Stockage"),
+    tocItem("jobs", "🧵 Tâches"),
   ));
 
   // ── IA ──
@@ -980,14 +1749,6 @@ async function renderSettings() {
   const lmModel = field("Modèle LM Studio", s.lmstudio_model || "", { placeholder: "Chargement…" });
   const orModel = field("Modèle OpenRouter", s.openrouter_model || "", { placeholder: "Ex: anthropic/claude-3.7-sonnet" });
   // ── narrator style presets (built-ins + user overrides, editable below) ──
-  const BUILTIN_NARRATOR = {
-    neutre: { label: "Neutre", prompt: "Sobre, direct et factuel : tu décris sans t'impliquer." },
-    epique: { label: "Épique", prompt: "Grandiose, lyrique et dramatique : chaque scène devient une épopée." },
-    sarcastique: { label: "Sarcastique", prompt: "Sarcastique et mordant : tu commentes les actions du joueur avec ironie et piques bien placées." },
-    cynique: { label: "Cynique", prompt: "Cynique et désabusé : le monde est dur, injuste, et tu le fais sentir à chaque phrase." },
-    en_colere: { label: "En colère", prompt: "En colère : la narration est tendue, brutale, presque rageuse. Les descriptions frappent fort." },
-    nagatoro: { label: "Nagatoro (taquin)", prompt: "Taquin et espiègle, comme Nagatoro : tu provoques gentiment le joueur avec des piques affectueuses, un sourire malicieux et beaucoup d'assurance." },
-  };
   const narrMap = {}; // key → { label, prompt, custom, dirty }
   for (const [k, v] of Object.entries(BUILTIN_NARRATOR)) narrMap[k] = { ...v, custom: false, dirty: false };
   try {
@@ -1009,7 +1770,7 @@ async function renderSettings() {
       const models = await api(`/api/health`).catch(() => null); // just to keep import
       void models;
       const prov = providerSel.input.value;
-      const res = await fetch(`/api/models?provider=${prov}`, { method: "GET" }).catch(() => null);
+      const res = await apiFetch(`/api/models?provider=${prov}`, { method: "GET" }).catch(() => null);
       let list = [];
       if (res?.ok) list = (await res.json()).models || [];
       if (prov === "lmstudio" && list.length) {
@@ -1031,6 +1792,17 @@ async function renderSettings() {
     stylePreview,
     el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "12px" } },
       "LM Studio : lance le serveur local (onglet Developer → Start Server, port 1234). OpenRouter : colle ta clé API — les deux peuvent être utilisés et le choix se fait au lancement de partie. Le style du narrateur s'applique aux nouvelles réponses.",
+    ),
+    el("div", { style: { marginTop: "14px" } },
+      el("button", { class: "btn btn-ghost btn-sm", onclick: testServices }, "🧪 Tester tous les services"),
+      el("div", { id: "services-test", style: { marginTop: "10px" } }),
+    ),
+    el("div", { style: { marginTop: "18px", borderTop: "1px solid var(--border)", paddingTop: "14px" } },
+      el("div", { class: "row", style: { justifyContent: "space-between" } },
+        el("span", { class: "sec-sub" }, "🩺 Santé du fournisseur (cette session)"),
+        el("button", { class: "btn btn-ghost btn-sm", title: "Actualiser", onclick: loadProviderHealth, "aria-label": "Actualiser la santé du fournisseur" }, "↻"),
+      ),
+      el("div", { id: "provider-health", style: { marginTop: "10px" } }),
     ),
   ));
 
@@ -1253,6 +2025,48 @@ async function renderSettings() {
     ),
   ));
 
+  // ── Raccourcis clavier (éditeur de touches, configurable) ──
+  container.append(el("div", { class: "section-title", id: "sec-sc" }, "Raccourcis clavier"));
+  const shortcutsDraft = { ...getShortcuts() };
+  const scBox = el("div", { class: "shortcut-list" });
+  const paintShortcuts = () => {
+    scBox.replaceChildren(...Object.keys(SHORTCUT_LABELS).map((name) => {
+      const kbd = el("kbd", {}, shortcutsDraft[name] || "—");
+      const editBtn = el("button", { class: "btn btn-ghost btn-sm", title: `Modifier le raccourci « ${SHORTCUT_LABELS[name]} »` }, "Modifier");
+      const resetBtn = el("button", { class: "mini-btn", title: "Rétablir la valeur par défaut", "aria-label": "Rétablir la valeur par défaut", onclick: () => { shortcutsDraft[name] = SHORTCUT_DEFAULTS[name]; paintShortcuts(); } }, "↺");
+      editBtn.addEventListener("click", () => {
+        editBtn.disabled = true;
+        editBtn.textContent = "Appuie sur une touche… (Esc = annuler)";
+        shortcutCapturing = true;
+        const done = (e) => {
+          if (e.key === "Escape") { /* cancel */ }
+          else {
+            e.preventDefault();
+            e.stopPropagation();
+            shortcutsDraft[name] = canonShortcut(e);
+          }
+          shortcutCapturing = false;
+          document.removeEventListener("keydown", done, true);
+          paintShortcuts();
+        };
+        document.addEventListener("keydown", done, true);
+      });
+      return el("div", { class: "shortcut-row" },
+        el("span", { class: "sc-label" }, SHORTCUT_LABELS[name]),
+        kbd,
+        editBtn,
+        resetBtn,
+      );
+    }));
+  };
+  paintShortcuts();
+  container.append(el("div", { class: "card", style: { padding: "18px 22px" } },
+    scBox,
+    el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "12px" } },
+      "Enregistre les réglages pour appliquer les nouveaux raccourcis. La palette (Ctrl+K) s'ouvre aussi depuis le champ de recherche.",
+    ),
+  ));
+
   // ── Backup / restore ──
   container.append(el("div", { class: "section-title", id: "sec-backup" }, "Sauvegarde"));
   const fileInput = el("input", { type: "file", accept: ".json,application/json", hidden: true });
@@ -1295,10 +2109,32 @@ async function renderSettings() {
   // ── Stockage & backups auto ──
   container.append(el("div", { class: "section-title", id: "sec-storage" }, "Stockage & sauvegardes auto"));
   const storageCard = el("div", { class: "card", style: { padding: "18px 22px" } }, el("div", { class: "storage-line" }, "⏳ lecture du disque…"));
+  const cacheBtn = el("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
+    cacheBtn.disabled = true;
+    try {
+      const ok = await confirmModal({
+        title: "🗑 Purger le cache audio",
+        message: "Tous les clips audio générés seront supprimés du disque. Ils seront régénérés automatiquement (et lentement) au prochain clic sur le bouton 🔊 d'un message. Les fichiers orphelins ne sont pas touchés ici — passe par l'analyse dédiée.",
+        confirmLabel: "Purger le cache",
+      });
+      if (!ok) { cacheBtn.disabled = false; return; }
+      const r = await api("/api/cache/purge", { body: { audio: true } });
+      toast(`${r.removed} clip${r.removed > 1 ? "s" : ""} purgé${r.removed > 1 ? "s" : ""} (≈ ${((r.bytes || 0) / 1e6).toFixed(1)} Mo) ✓`);
+      renderStorage();
+    } catch (e) { toast(e.message, "err"); }
+    cacheBtn.disabled = false;
+  } }, "🗑 Vider le cache audio");
+  const cacheSummary = el("span", { class: "cache-summary" }, "⏳ cache…");
   const renderStorage = async () => {
     try {
       const st = await api("/api/storage");
       const mb = (v) => `${Math.max(0, v).toFixed(1)} Mo`;
+      let cacheLine = "";
+      try {
+        const c = await api("/api/cache");
+        cacheLine = `🎙 Cache audio (régénérable) : ${c.audio.files} fichier${c.audio.files > 1 ? "s" : ""} · ${c.audio.mb} Mo — 🖼 ${c.imageOrphans.files} image${c.imageOrphans.files > 1 ? "s" : ""} orpheline${c.imageOrphans.files > 1 ? "s" : ""} (${c.imageOrphans.mb} Mo)`;
+      } catch { /* cache indisponible → laisse le placeholder */ }
+      cacheSummary.textContent = cacheLine;
       storageCard.replaceChildren(
         el("div", { class: "storage-grid" },
           el("div", { class: "storage-tile" }, el("strong", {}, mb(st.audioMB)), el("span", {}, "🎙 Audio généré")),
@@ -1306,6 +2142,7 @@ async function renderSettings() {
           el("div", { class: "storage-tile" }, el("strong", {}, mb(st.uploadsMB)), el("span", {}, "📎 Avatars & uploads")),
           el("div", { class: "storage-tile" }, el("strong", {}, mb(st.dbMB)), el("span", {}, "🗄 Base de données")),
         ),
+        el("div", { class: "storage-cache" }, cacheSummary, cacheBtn),
         el("div", { class: "row", style: { marginTop: "14px" } },
           el("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
             try {
@@ -1314,6 +2151,7 @@ async function renderSettings() {
               renderStorage();
             } catch (e) { toast(e.message, "err"); }
           } }, "💾 Créer un backup maintenant"),
+          el("button", { class: "btn btn-ghost btn-sm", onclick: () => orphanModal() }, "🧹 Analyser les fichiers orphelins"),
         ),
         el("div", { class: "storage-backups" },
           (st.backups?.length
@@ -1330,6 +2168,38 @@ async function renderSettings() {
   };
   renderStorage();
   container.append(storageCard);
+
+  // ── Tâches en arrière-plan (file de jobs persistante) ──
+  container.append(el("div", { class: "section-title", id: "sec-jobs" }, "Tâches en arrière-plan"));
+  const jobsCard = el("div", { class: "card", style: { padding: "18px 22px" } });
+  const jobsRefresh = el("button", { class: "chip-btn slim", style: { marginLeft: "auto" }, title: "Actualiser", onclick: () => paintJobs() }, "↻");
+  const jobsHead = el("div", { class: "jobs-head" }, el("span", { style: { fontSize: "13px", color: "var(--text-dim)" } }, "TTS, images, résumés et légendes s'enregistrent ici (file persistante, reprise après redémarrage)."), jobsRefresh);
+  container.append(jobsHead, jobsCard);
+  const statusLabel = { pending: "en attente", running: "en cours", done: "terminé", failed: "échec" };
+  let jobsTimer = null;
+  const paintJobs = async () => {
+    try {
+      const { jobs } = await api("/api/jobs").catch(() => ({ jobs: [] }));
+      jobsCard.replaceChildren(
+        jobs.length
+          ? el("div", { class: "jobs-list" }, jobs.map((j) =>
+              el("div", { class: "job-row" },
+                el("span", { class: `job-status st-${j.status}` }, j.status === "done" ? "✓" : j.status === "failed" ? "✗" : "⏳"),
+                el("span", { class: "job-type" }, esc(j.type)),
+                el("span", { class: "job-meta" }, `${statusLabel[j.status] || j.status}${j.progress ? " · " + j.progress + "%" : ""} · ${fmtTime(j.created_at)}`),
+                j.error ? el("span", { class: "job-error" }, esc(String(j.error).slice(0, 90))) : null,
+              ),
+            ))
+          : el("p", { style: { color: "var(--text-dim)", fontSize: "13px" } }, "Aucune tâche enregistrée pour l'instant."),
+      );
+      // live refresh while something is still running
+      if (jobs.some((j) => j.status === "running" || j.status === "pending")) {
+        clearTimeout(jobsTimer);
+        jobsTimer = setTimeout(paintJobs, 4000);
+      }
+    } catch { /* ignore */ }
+  };
+  paintJobs();
 
   container.append(el("div", { class: "settings-save" },
     el("button", { class: "btn btn-primary", style: { padding: "12px 30px" }, onclick: async () => {
@@ -1361,6 +2231,7 @@ async function renderSettings() {
             auth_token: authField.input.value.trim(),
             notifications: notifCb.input.checked,
             sound_effects: soundCb.input.checked,
+            shortcuts: shortcutsDraft,
           },
         });
         applyCustom();
@@ -1373,6 +2244,115 @@ async function renderSettings() {
 
   main().replaceChildren(container);
   refreshModels();
+  loadProviderHealth();
+}
+
+// Réglages → IA : vérifie d'un coup le modèle, le TTS et le service d'images
+async function testServices() {
+  const box = document.getElementById("services-test");
+  if (!box) return;
+  box.replaceChildren(el("div", { class: "storage-line" }, "⏳ test des services…"));
+  try {
+    const r = await api("/api/test", { body: {} });
+    const row = (icon, title, ok, detail) => el("div", { class: "svc-row" },
+      el("span", { class: "svc-icon" }, ok ? "✅" : "❌"),
+      el("span", { class: "svc-name" }, title),
+      el("span", { class: "svc-detail" }, esc(detail)),
+      el("span", { class: "svc-ms" }, r[icon]?.ms != null ? `${r[icon].ms} ms` : ""),
+    );
+    const p = r.provider || {};
+    const im = r.image || {};
+    box.replaceChildren(
+      row("provider", "Modèle " + (p.provider || ""), p.ok, p.ok ? (p.models || []).join(", ") : "aucun modèle détecté — LM Studio démarré ?"),
+      row("tts", "Synthèse vocale (fr)", !!r.tts?.ok, r.tts?.ok ? "voix prêtes" : "modèle TTS non chargé"),
+      row("image", "Service d'images", !im.error && im.ready, im.error || (im.loading ? "chargement du modèle…" : im.ready ? "prêt" : "non démarré")),
+    );
+  } catch (e) {
+    box.replaceChildren(el("div", { class: "storage-line" }, "Test impossible : " + esc(e.message)));
+  }
+}
+
+// Réglages → Fournisseur : statistiques de santé par provider (latence, erreurs)
+async function loadProviderHealth() {
+  const box = document.getElementById("provider-health");
+  if (!box) return;
+  try {
+    const stats = await api("/api/health/providers", { method: "GET" });
+    const entries = Object.entries(stats || {});
+    if (!entries.length) {
+      box.replaceChildren(el("div", { class: "storage-line" }, "Aucun appel encore mesuré — lance une réponse ou « Tester tous les services »."));
+      return;
+    }
+    const card = ([id, h]) => {
+      const dots = (h.history || []).slice(-10).map((e) =>
+        el("span", { class: "hp-dot" + (e.ok ? " ok" : " err"), title: `${e.ok ? "OK" : "Erreur"} · ${e.ms} ms · ${new Date(e.at).toLocaleTimeString("fr-FR")}` }),
+      );
+      const rate = h.calls ? Math.round((h.ok / h.calls) * 100) : 0;
+      return el("div", { class: "hp-card" },
+        el("div", { class: "hp-head" },
+          el("span", { class: "hp-name" }, id === "openrouter" ? "OpenRouter" : "LM Studio"),
+          el("span", { class: "hp-rate" + (rate >= 80 ? " good" : rate > 0 ? " bad" : "") }, `${rate}% OK`),
+        ),
+        el("div", { class: "hp-line" }, `${h.calls} appel${h.calls > 1 ? "s" : ""} · ${h.ok} ok · ${h.errors} erreur${h.errors > 1 ? "s" : ""}`),
+        el("div", { class: "hp-line" },
+          `moyenne ${h.avgMs} ms` + (h.lastMs != null ? ` · dernier ${h.lastMs} ms` : "") + (h.lastAt ? ` · ${new Date(h.lastAt).toLocaleTimeString("fr-FR")}` : ""),
+        ),
+        h.lastError ? el("div", { class: "hp-line hp-err" }, "⚠ " + esc(h.lastError)) : null,
+        dots.length ? el("div", { class: "hp-dots", title: "10 derniers appels" }, ...dots) : null,
+      );
+    };
+    box.replaceChildren(...entries.map(card));
+  } catch (e) {
+    box.replaceChildren(el("div", { class: "storage-line" }, "Santé indisponible : " + esc(e.message)));
+  }
+}
+
+// Réglages → Stockage : scan (simulation) puis suppression des fichiers orphelins
+async function orphanModal() {
+  let analysis = null;
+  try {
+    analysis = await api("/api/storage/analyze", { body: {} });
+  } catch (e) { return toast(e.message, "err"); }
+  const kindIcon = { audio: "🎙", image: "🖼", upload: "📎" };
+  const rows = (analysis.orphans || []).map((o) => {
+    const cb = el("input", { type: "checkbox", checked: "" });
+    return el("label", { class: "orphan-row" },
+      cb,
+      el("span", { class: "chip" }, kindIcon[o.kind] || "📄"),
+      el("span", { class: "orphan-path", title: o.path }, esc(o.path)),
+      el("span", { class: "orphan-size" }, (o.size / 1024).toFixed(0) + " Ko"),
+    );
+  });
+  const list = el("div", { class: "orphan-list" });
+  const paint = () => {
+    const picked = rows.filter((r) => r.querySelector("input").checked);
+    deleteBtn.disabled = !picked.length;
+    deleteBtn.textContent = `🗑 Supprimer ${picked.length} fichier${picked.length > 1 ? "s" : ""}`;
+  };
+  rows.forEach((r) => r.querySelector("input").addEventListener("change", paint));
+  list.append(...rows);
+  const cancelBtn = el("button", { class: "btn btn-ghost" }, "Annuler");
+  const deleteBtn = el("button", { class: "btn btn-danger" }, "🗑 Supprimer");
+  const { close } = openModal({
+    title: "🧹 Fichiers orphelins",
+    sub: analysis.orphanCount
+      ? `${analysis.orphanCount} fichier${analysis.orphanCount > 1 ? "s" : ""} inutilisé${analysis.orphanCount > 1 ? "s" : ""} (≈ ${analysis.totalMB} Mo) — audio d'anciens messages, avatars remplacés, illustrations de messages supprimés, clips de test…`
+      : "Aucun fichier orphelin : tout ce qui est sur le disque est encore référencé.",
+    body: analysis.orphanCount ? list : el("div", { class: "empty" }, el("div", { class: "big" }, "✨"), el("h3", {}, "Rien à nettoyer")),
+    footer: [cancelBtn, deleteBtn],
+    wide: true,
+  });
+  cancelBtn.addEventListener("click", close);
+  paint();
+  deleteBtn.addEventListener("click", async () => {
+    const picked = rows.filter((r) => r.querySelector("input").checked).map((r) => r.querySelector(".orphan-path").textContent);
+    try {
+      const r = await api("/api/storage/purge", { body: { files: picked } });
+      close();
+      toast(`${r.removed} fichier${r.removed > 1 ? "s" : ""} supprimé${r.removed > 1 ? "s" : ""} (≈ ${((r.bytes || 0) / 1e6).toFixed(1)} Mo) ✓`);
+      renderSettings();
+    } catch (e) { toast(e.message, "err"); }
+  });
 }
 
 function checkbox(key, checked, labelText) {
@@ -1473,7 +2453,11 @@ export function newGameWizard(pre) {
       const s = await api(`/api/worlds/${wid}/scenarios/generate`, {
         body: { genre: genreSel.input.value, theme: world?.description || undefined },
       });
-      scenSel.input.append(el("option", { value: s.id, selected: "" }, s.name));
+      scenSel.input.append(el("option", { value: "draft", selected: "" }, s.name));
+      scenSel.input.dataset.draftName = s.name;
+      scenSel.input.dataset.draftIntro = s.intro;
+      scenSel.input.dataset.draftName = s.name;
+      scenSel.input.dataset.draftIntro = s.intro;
       scenSel.input.value = String(s.id);
       scenPreview.hidden = false;
       scenPreview.replaceChildren(
@@ -1529,7 +2513,8 @@ export function newGameWizard(pre) {
           const conv = await api("/api/conversations", {
             body: {
               world_id: worldSel.input.value ? Number(worldSel.input.value) : null,
-              scenario_id: scenSel.input.value ? Number(scenSel.input.value) : null,
+              scenario_id: scenSel.input.value && scenSel.input.value !== "draft" ? Number(scenSel.input.value) : null,
+              ...(scenSel.input.value === "draft" ? { title: scenSel.input.dataset.draftName, settings: { draft_intro: scenSel.input.dataset.draftIntro } } : {}),
               persona_id: persoSel.input.value ? Number(persoSel.input.value) : null,
               cast,
               group_mode: groupToggle.input.checked,

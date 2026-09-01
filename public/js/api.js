@@ -9,7 +9,7 @@ export function setToken(tok) {
   } catch { /* ignore */ }
 }
 
-function authUrl(path) {
+export function authUrl(path) {
   const tok = getToken();
   if (!tok) return path;
   const u = new URL(path, location.href);
@@ -18,7 +18,7 @@ function authUrl(path) {
 }
 
 export async function api(path, opts = {}) {
-  const res = await fetch(authUrl(path), {
+  const res = await apiFetch(path, {
     method: opts.method || (opts.body ? "POST" : "GET"),
     headers: { "Content-Type": "application/json" },
     ...(opts.body ? { body: JSON.stringify(opts.body) } : {}),
@@ -41,8 +41,12 @@ export async function api(path, opts = {}) {
   return ct.includes("application/json") ? res.json() : res;
 }
 
+export async function apiFetch(path, options = {}) {
+  return fetch(authUrl(path), options);
+}
+
 export async function apiForm(path, formData) {
-  const res = await fetch(authUrl(path), { method: "POST", body: formData });
+  const res = await apiFetch(path, { method: "POST", body: formData });
   if (res.status === 401) {
     window.dispatchEvent(new CustomEvent("airp-unauthorized"));
     throw new Error("Authentification requise — entre le token LAN.");
@@ -95,6 +99,10 @@ export function uploadFiles(files) {
   // files: FileList → [{name, base64}]
   const tasks = Array.from(files).map((f) =>
     new Promise((resolve) => {
+      if (f.size > 50 * 1024 * 1024) {
+        resolve({ name: f.name, base64: "" });
+        return;
+      }
       const fr = new FileReader();
       fr.onload = () => resolve({ name: f.name, base64: String(fr.result).split(",")[1] });
       fr.onerror = () => resolve({ name: f.name, base64: "" });
