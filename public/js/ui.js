@@ -19,10 +19,15 @@ export function el(tag, attrs = {}, ...children) {
   return node;
 }
 
-// All rendering goes through `el()` which builds text nodes, so escaping is
-// unnecessary (and would double-encode entities). Keep as an identity for safety.
+/**
+ * Identity escape for user content. All rendering goes through `el()` which
+ * builds text nodes via document.createTextNode(), so XSS is automatically
+ * prevented. This function exists for clarity and for cases where content
+ * must be serialized into HTML strings (exports, clipboard, lightbox).
+ */
 export function esc(s) {
-  return String(s ?? "");
+  if (s == null) return "";
+  return String(s);
 }
 
 export function fmtTime(ts) {

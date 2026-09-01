@@ -14,4 +14,5 @@ export const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
 export const DB_PATH = path.join(DATA_DIR, "app.db");
 export const PUBLIC_DIR = path.join(ROOT, "public");
 export const PYTHON_DIR = path.join(ROOT, "python", "image_server");
+export const BREEZE_DIR = path.join(ROOT, "python", "breeze_server");
 export const CPU_COUNT = cpus().length;

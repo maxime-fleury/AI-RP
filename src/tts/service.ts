@@ -7,6 +7,8 @@ import path from "node:path";
 import { AUDIO_DIR, SAMPLES_DIR } from "../server/paths";
 import { getSetting, getCard, listCards } from "../server/db";
 import { synthesize, wavBytes, ensureTtsLoaded, type TtsLang } from "./engine";
+import { synthesizeBreeze, ensureBreezeServer, breezeModelPresent } from "./breeze";
+import { breezeVoiceByName, breezeVoiceList, isBreezeEngine, type TtsEngine } from "./breezeVoices";
 import type { Segment } from "../llm/prompt";
 
 export interface VoiceOption {
@@ -14,53 +16,128 @@ export interface VoiceOption {
   lang: "fr" | "en";
   label: string;
   predefined: boolean;
+  engine: TtsEngine;
 }
 
 export function listVoices(): VoiceOption[] {
   const out: VoiceOption[] = [];
   const seen = new Set<string>();
+  const push = (v: VoiceOption) => {
+    const key = `${v.engine}:${v.lang}:${v.name}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(v);
+  };
   for (const lang of ["fr", "en"] as const) {
     const dir = `${import.meta.dir}/../../models/Pocket-tts/${lang === "fr" ? "french_24l" : "english_2026-04"}/voices`;
     try {
       for (const f of fs.readdirSync(dir)) {
         if (f.endsWith(".json")) {
           const name = f.slice(0, -5);
-          const key = `${lang}:${name}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            out.push({ name, lang, label: `${name} (${lang === "fr" ? "FR" : "EN"})`, predefined: true });
-          }
+          push({ name, lang, label: `${name} (${lang === "fr" ? "FR" : "EN"})`, predefined: true, engine: "pocket" });
         }
       }
     } catch {
       /* no bundle voices */
     }
   }
+  for (const v of breezeVoiceList()) {
+    push({
+      name: v.name,
+      lang: v.lang,
+      label: `${v.name} (Breeze · ${v.lang === "fr" ? "FR" : "EN"})`,
+      predefined: true,
+      engine: "breeze",
+    });
+  }
   return out;
 }
 
-let ttsMutex = Promise.resolve();
-function withMutex<T>(fn: () => Promise<T>): Promise<T> {
-  const run = ttsMutex.then(fn, fn);
-  ttsMutex = run.then(() => undefined, () => undefined);
-  return run;
+/**
+ * Async mutex for TTS synthesis — ORT sessions are not thread-safe.
+ * Uses a proper queue pattern that handles errors correctly and never
+ * leaks locked state.
+ */
+class AsyncMutex {
+  private queue: Array<() => void> = [];
+  private locked = false;
+
+  /** Acquire the mutex, run fn, then release. Rejects if fn rejects. */
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    if (!this.locked) {
+      this.locked = true;
+      try {
+        return await fn();
+      } finally {
+        this.locked = false;
+        this.drain();
+      }
+    }
+    return new Promise<T>((resolve, reject) => {
+      this.queue.push(() => {
+        this.locked = true;
+        fn().then(
+          (val) => {
+            this.locked = false;
+            this.drain();
+            resolve(val);
+          },
+          (err) => {
+            this.locked = false;
+            this.drain();
+            reject(err);
+          },
+        );
+      });
+    });
+  }
+
+  private drain(): void {
+    if (!this.locked && this.queue.length) {
+      const next = this.queue.shift()!;
+      next();
+    }
+  }
 }
+
+const ttsMutex = new AsyncMutex();
+export { ttsMutex };
 
 /**
  * Synthesize (once, cached on disk) a short sample clip for a voice, used in
  * the settings to preview each voice. Returns the public URL path.
  */
-export async function getVoiceSample(name: string, lang: TtsLang): Promise<string> {
+export async function getVoiceSample(name: string, lang: TtsLang, engine: TtsEngine = "pocket"): Promise<string> {
   fs.mkdirSync(SAMPLES_DIR, { recursive: true });
-  const fileName = `${lang}-${name}.wav`;
+  // names are user-editable (Breeze presets) — keep the file inside SAMPLES_DIR
+  const safeName = name.replace(/[^\p{L}\p{N}_-]+/gu, "_");
+  const fileName = `${engine}-${lang}-${safeName}.wav`;
   const file = path.join(SAMPLES_DIR, fileName);
   if (fs.existsSync(file)) return `/samples/${fileName}`;
   const text =
     lang === "fr"
       ? `Bonjour ! Moi c'est ${name}. Voilà ma voix pour tes histoires.`
       : `Hello! I'm ${name}. This is my voice for your stories.`;
-  const res = await withMutex(() => synthesize({ text, voice: name, lang, lsdSteps: 4 }));
-  fs.writeFileSync(file, wavBytes(res.pcm, res.sampleRate));
+  const FR_DEFAULT_INSTRUCTION = "Une voix claire, chaleureuse et naturelle, au débit posé et agréable.";
+  const EN_DEFAULT_INSTRUCTION = "A clear, warm, natural voice with a pleasant, calm delivery.";
+  let pcm: Float32Array;
+  let sampleRate: number;
+  if (engine === "breeze") {
+    const preset = breezeVoiceByName(name, lang);
+    const res = await ttsMutex.run(() =>
+      synthesizeBreeze({
+        text,
+        instruction: preset?.instruction ?? (lang === "fr" ? FR_DEFAULT_INSTRUCTION : EN_DEFAULT_INSTRUCTION),
+      }),
+    );
+    pcm = res.pcm;
+    sampleRate = res.sampleRate;
+  } else {
+    const res = await ttsMutex.run(() => synthesize({ text, voice: name, lang, lsdSteps: 4 }));
+    pcm = res.pcm;
+    sampleRate = res.sampleRate;
+  }
+  fs.writeFileSync(file, wavBytes(pcm, sampleRate));
   return `/samples/${fileName}`;
 }
 
@@ -69,6 +146,7 @@ export interface SynthAudio {
   speaker: string;
   path: string;
   voice: string;
+  engine: TtsEngine;
   lang: TtsLang;
   durationMs: number;
   error?: string;
@@ -78,6 +156,7 @@ export interface TtsContext {
   narratorVoice: string;
   defaultVoice: string;
   language: TtsLang;
+  engine: TtsEngine;
   characterVoices: Record<string, string>; // card name → voice
   characterLangs: Record<string, TtsLang>;
   lsdSteps: number;
@@ -88,10 +167,16 @@ export function buildTtsContext(conversation: { world_id: number | null; cast: s
   let cs: Record<string, unknown> = {};
   try { cs = JSON.parse(conversation.settings || "{}"); } catch { /* ignore */ }
   const language = ((cs.tts_language as string) || (getSetting("tts_language", "fr") as string === "en" ? "en" : "fr")) as TtsLang;
+  const engine = (isBreezeEngine(cs.tts_engine)
+    ? cs.tts_engine
+    : getSetting("tts_engine", "pocket") === "breeze"
+      ? "breeze"
+      : "pocket") as TtsEngine;
   const context: TtsContext = {
     narratorVoice: (cs.tts_voice_narrateur || getSetting("tts_voice_narrateur", "jean")) as string,
     defaultVoice: (cs.tts_voice_default || getSetting("tts_voice_default", "cosette")) as string,
     language,
+    engine,
     characterVoices: {},
     characterLangs: {},
     lsdSteps: Number(cs.tts_lsd_steps ?? getSetting("tts_lsd_steps", 4)),
@@ -112,14 +197,14 @@ export function buildTtsContext(conversation: { world_id: number | null; cast: s
   return context;
 }
 
-function resolveVoice(seg: Segment, ctx: TtsContext): { voice: string; lang: TtsLang } {
+function resolveVoice(seg: Segment, ctx: TtsContext): { voice: string; lang: TtsLang; engine: TtsEngine } {
   if (seg.type === "narration" || !seg.speaker) {
-    return { voice: ctx.narratorVoice, lang: ctx.language };
+    return { voice: ctx.narratorVoice, lang: ctx.language, engine: ctx.engine };
   }
   const key = seg.speaker.toLowerCase().trim();
   const voice = ctx.characterVoices[key] || ctx.defaultVoice;
   const lang = ctx.characterLangs[key] || ctx.language;
-  return { voice, lang };
+  return { voice, lang, engine: ctx.engine };
 }
 
 // ─── synthesis units ───────────────────────────────────────────────────────────
@@ -135,6 +220,7 @@ interface SynthUnit {
   segments: Segment[];
   voice: string;
   lang: TtsLang;
+  engine: TtsEngine;
 }
 
 function wordCount(text: string): number {
@@ -160,18 +246,19 @@ export function buildUnits(segments: Segment[], ctx: TtsContext): SynthUnit[] { 
   let cur: Segment[] = [];
   let curVoice = "";
   let curLang: TtsLang = "fr";
+  let curEngine: TtsEngine = "pocket";
   const flush = () => {
     if (!cur.length) return;
-    units.push({ segments: cur, voice: curVoice, lang: curLang });
+    units.push({ segments: cur, voice: curVoice, lang: curLang, engine: curEngine });
     cur = [];
   };
   for (const seg of segments) {
-    const { voice, lang } = resolveVoice(seg, ctx);
+    const { voice, lang, engine } = resolveVoice(seg, ctx);
     const sameSpeaker =
       cur.length > 0 &&
       (cur[0].type === seg.type) &&
       (seg.type !== "dialogue" || cur[0].speaker === seg.speaker) &&
-      curVoice === voice && curLang === lang;
+      curVoice === voice && curLang === lang && curEngine === engine;
     const words = cur.reduce((a, s) => a + wordCount(s.text), 0);
     if (sameSpeaker && words + wordCount(seg.text) <= MERGE_MAX_WORDS && cur.length < MERGE_MAX_SEGMENTS) {
       cur.push(seg);
@@ -180,6 +267,7 @@ export function buildUnits(segments: Segment[], ctx: TtsContext): SynthUnit[] { 
       cur = [seg];
       curVoice = voice;
       curLang = lang;
+      curEngine = engine;
     }
   }
   flush();
@@ -191,22 +279,32 @@ export function buildUnits(segments: Segment[], ctx: TtsContext): SynthUnit[] { 
  * fork/regen when the files were copied but the pattern differs. Capped. */
 const TTS_CACHE_DIR = path.join(AUDIO_DIR, "_cache");
 
-function cachePath(text: string, voice: string, lang: TtsLang, lsdSteps: number): string {
-  const h = Bun.CryptoHasher.hash("sha1", `${voice}|${lang}|${lsdSteps}|${text}`).hex();
+function cacheKey(text: string, unit: SynthUnit, ctx: TtsContext): string {
+  if (unit.engine === "breeze") {
+    const preset = breezeVoiceByName(unit.voice, unit.lang);
+    const salt = preset?.instruction ?? "";
+    const h = Bun.CryptoHasher.hash("sha1", `breeze|${unit.voice}|${unit.lang}|${salt}|${text}`).hex();
+    return path.join(TTS_CACHE_DIR, `${h}.wav`);
+  }
+  const h = Bun.CryptoHasher.hash("sha1", `pocket|${unit.voice}|${unit.lang}|${ctx.lsdSteps}|${text}`).hex();
   return path.join(TTS_CACHE_DIR, `${h}.wav`);
 }
 
-function cacheLookup(text: string, voice: string, lang: TtsLang, lsdSteps: number): string | null {
+function unitText(unit: SynthUnit): string {
+  return joinSegments(unit.segments);
+}
+
+async function cacheLookup(unit: SynthUnit, ctx: TtsContext): Promise<string | null> {
   try {
-    const f = cachePath(text, voice, lang, lsdSteps);
-    return fs.existsSync(f) ? f : null;
+    const file = cacheKey(unitText(unit), unit, ctx);
+    return fs.existsSync(file) ? file : null;
   } catch { return null; }
 }
 
-function cacheStore(from: string, text: string, voice: string, lang: TtsLang, lsdSteps: number): void {
+function cacheStore(from: string, unit: SynthUnit, ctx: TtsContext): void {
   try {
     fs.mkdirSync(TTS_CACHE_DIR, { recursive: true });
-    const f = cachePath(text, voice, lang, lsdSteps);
+    const f = cacheKey(unitText(unit), unit, ctx);
     if (!fs.existsSync(f)) fs.copyFileSync(from, f);
   } catch { /* cache is best-effort */ }
 }
@@ -223,8 +321,8 @@ export function durationOfWav(file: string): number {
 }
 
 const placeholderFor = (seg: Segment, ctx: TtsContext): SynthAudio => {
-  const { voice, lang } = resolveVoice(seg, ctx);
-  return { type: seg.type, speaker: seg.speaker, path: "", voice, lang, durationMs: 0 };
+  const { voice, lang, engine } = resolveVoice(seg, ctx);
+  return { type: seg.type, speaker: seg.speaker, path: "", voice, engine, lang, durationMs: 0 };
 };
 
 /**
@@ -278,9 +376,8 @@ export async function synthSegments(
       segIndex += unit.segments.length;
       continue;
     }
-    const text = joinSegments(unit.segments);
-    // global disk cache: same speaker + same line → same wav, no re-synthesis
-    const cachedWav = cacheLookup(text, unit.voice, unit.lang, ctx.lsdSteps);
+    // global disk cache: same engine + speaker (+ instruction) + same line → same wav
+    const cachedWav = await cacheLookup(unit, ctx);
     try {
       if (cachedWav) {
         fs.copyFileSync(cachedWav, file);
@@ -291,6 +388,7 @@ export async function synthSegments(
             speaker: seg.speaker,
             path: k === 0 ? `/audio/${conversationId}/${messageId}-${segIndex}.wav` : "",
             voice: unit.voice,
+            engine: unit.engine,
             lang: unit.lang,
             durationMs: k === 0 ? dur : 0,
           });
@@ -298,17 +396,16 @@ export async function synthSegments(
         segIndex += unit.segments.length;
         continue;
       }
-      const res = await withMutex(() =>
-        synthesize({ text, voice: unit.voice, lang: unit.lang, lsdSteps: ctx.lsdSteps }),
-      );
+      const res = await ttsMutex.run(() => synthUnit(unit, ctx));
       fs.writeFileSync(file, wavBytes(res.pcm, res.sampleRate));
-      cacheStore(file, text, unit.voice, unit.lang, ctx.lsdSteps);
+      cacheStore(file, unit, ctx);
       unit.segments.forEach((seg, k) => {
         results.push({
           type: seg.type,
           speaker: seg.speaker,
           path: k === 0 ? `/audio/${conversationId}/${messageId}-${segIndex}.wav` : "",
           voice: unit.voice,
+          engine: unit.engine,
           lang: unit.lang,
           durationMs: k === 0 ? res.durationMs : 0,
         });
@@ -323,9 +420,41 @@ export async function synthSegments(
   return results;
 }
 
+/** Dispatch a single unit to the active TTS engine. */
+async function synthUnit(
+  unit: SynthUnit,
+  _ctx: TtsContext,
+): Promise<{ pcm: Float32Array; sampleRate: number; durationMs: number }> {
+  if (unit.engine === "breeze") {
+    const preset = breezeVoiceByName(unit.voice, unit.lang);
+    const instruction =
+      preset?.instruction ??
+      (unit.lang === "fr"
+        ? "Une voix claire, chaleureuse et naturelle, au débit posé et agréable."
+        : "A clear, warm, natural voice with a pleasant, calm delivery.");
+    const res = await synthesizeBreeze({ text: unitText(unit), instruction, seed: 42 });
+    return { pcm: res.pcm, sampleRate: res.sampleRate, durationMs: res.durationMs };
+  }
+  const res = await synthesize({ text: unitText(unit), voice: unit.voice, lang: unit.lang, lsdSteps: _ctx.lsdSteps });
+  return { pcm: res.pcm, sampleRate: res.sampleRate, durationMs: res.durationMs };
+}
+
 export async function warmupTts(): Promise<void> {
   const lang = (getSetting("tts_language", "fr") === "en" ? "en" : "fr") as TtsLang;
   await ensureTtsLoaded(lang);
+}
+
+/** Warm the currently selected engine (sidecar spawn without model preload is
+ * left lazy so a Breeze model isn't pinned on GPU at boot). */
+export function warmupSelectedEngine(): Promise<void> {
+  const engine = getSetting("tts_engine", "pocket") === "breeze" ? "breeze" : "pocket";
+  if (engine === "breeze") {
+    if (!breezeModelPresent()) {
+      throw new Error("Breeze - Le modèle n'est pas encore téléchargé dans models/Breeze-TTS-2.");
+    }
+    return ensureBreezeServer(600_000) as unknown as Promise<void>;
+  }
+  return warmupTts();
 }
 
 export { listCards };

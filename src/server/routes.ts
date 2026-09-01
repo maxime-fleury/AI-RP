@@ -24,8 +24,10 @@ import { importFile, scanDirectory, sizeLimitFor, type ImportResult } from "./im
 import { getProvider, defaultModelFor, type ChatMessage } from "../llm/providers";
 import { buildMessages, buildSystemPrompt, estimateTokens, parseSegments, fallbackSpeaker, summarizeSystem, presetFromKey, parseMemory, memoryToText, type Segment, type CastContext, type MemoryState } from "../llm/prompt";
 import type { ConversationRow, MessageRow } from "./db";
-import { synthSegments, buildTtsContext, listVoices, warmupTts, getVoiceSample } from "../tts/service";
+import { synthSegments, buildTtsContext, listVoices, warmupTts, warmupSelectedEngine, getVoiceSample } from "../tts/service";
 import { ensureTtsLoaded, synthesize, wavBytes } from "../tts/engine";
+import { synthesizeBreeze, probeBreezeStatus, breezeModelPresent } from "../tts/breeze";
+import { breezeVoiceList, saveBreezeVoices, defaultBreezeVoices } from "../tts/breezeVoices";
 import { generateAndSave, probeImageStatus, ensureImageServer } from "./image";
 import { storageInfo, runBackup, analyzeOrphans, purgeOrphans, cacheInfo, purgeAudioCache } from "./backup";
 import { zipFiles } from "./zip";
@@ -254,6 +256,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       return json({
         ok: true,
         tts: { fr: await ensureTtsLoaded("fr").catch(() => false), en: await ensureTtsLoaded("en").catch(() => false) },
+        breeze: await probeBreezeStatus(),
         image: await probeImageStatus(),
       });
     }
@@ -329,6 +332,17 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const body = await readJson(req);
       for (const [k, v] of Object.entries(body)) {
         if (SECRET_KEYS.has(k) && (v === undefined || v === null || String(v) === "")) continue;
+        // validate numeric settings
+        if (typeof v === "number" || (typeof v === "string" && /^[\d.]+$/.test(v))) {
+          const num = Number(v);
+          if (k === "context_max_messages" && (num < 2 || num > 200)) continue;
+          if ((k === "tts_lsd_steps" || k === "image_steps") && (num < 1 || num > 50)) continue;
+          if (k === "tts_max_segments" && (num < 1 || num > 50)) continue;
+          if (k === "temperature" && (num < 0 || num > 2)) continue;
+          if (k === "max_tokens" && (num < 64 || num > 16384)) continue;
+          if (k === "image_cfg" && (num < 1 || num > 20)) continue;
+        }
+        if (k === "tts_engine" && v !== "pocket" && v !== "breeze") continue;
         setSetting(k, v);
       }
       return json(publicSettings());
@@ -340,11 +354,23 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     if (p === "/api/voices/sample" && method === "GET") {
       const name = (url.searchParams.get("name") || "").trim();
       const lang = (url.searchParams.get("lang") === "en" ? "en" : "fr") as "fr" | "en";
+      const engine = url.searchParams.get("engine") === "breeze" ? "breeze" : "pocket";
       if (!name) return json({ error: "name required" }, 400);
-      const pathUrl = await getVoiceSample(name, lang);
+      const pathUrl = await getVoiceSample(name, lang, engine);
       return json({ path: pathUrl });
     }
     if (p === "/api/tts/warmup" && method === "POST") {
+      const body = await readJson(req).catch(() => ({}));
+      const eng = body.engine === "breeze" || body.engine === "pocket" ? body.engine : undefined;
+      const targetIsBreeze = eng === "breeze" || (eng === undefined && getSetting("tts_engine", "pocket") === "breeze");
+      if (targetIsBreeze) {
+        try {
+          await warmupSelectedEngine();
+        } catch (e) {
+          return json({ ok: false, error: String(e) }, 400);
+        }
+        return json({ ok: true });
+      }
       await warmupTts();
       return json({ ok: true });
     }
@@ -356,6 +382,19 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     if (p === "/api/tts/test" && method === "POST") {
       const body = await readJson(req);
       const lang = body.lang === "en" ? "en" : "fr";
+      const engine = body.engine === "breeze" ? "breeze" : "pocket";
+      const file = path.join(AUDIO_DIR, `test-${Date.now()}.wav`);
+      if (engine === "breeze") {
+        const text = body.text || "Bonjour, je suis une voix de test pour cette aventure.";
+        const instruction =
+          body.instruction ||
+          (lang === "fr"
+            ? "Une voix claire, chaleureuse et naturelle, au débit posé et agréable."
+            : "A clear, warm, natural voice with a pleasant, calm delivery.");
+        const res = await synthesizeBreeze({ text, instruction, seed: 42 });
+        fs.writeFileSync(file, wavBytes(res.pcm, res.sampleRate));
+        return json({ url: `/audio/${path.basename(file)}`, durationMs: res.durationMs, voice: body.voice, lang, engine });
+      }
       await ensureTtsLoaded(lang);
       const res = await synthesize({
         text: body.text || "Bonjour, je suis une voix de test pour cette aventure.",
@@ -363,9 +402,25 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         lang,
         lsdSteps: Number(body.lsdSteps ?? getSetting("tts_lsd_steps", 4)),
       });
-      const file = path.join(AUDIO_DIR, `test-${Date.now()}.wav`);
       fs.writeFileSync(file, wavBytes(res.pcm, res.sampleRate));
-      return json({ url: `/audio/${path.basename(file)}`, durationMs: res.durationMs, voice: body.voice, lang });
+      return json({ url: `/audio/${path.basename(file)}`, durationMs: res.durationMs, voice: body.voice, lang, engine });
+    }
+
+    // Breeze TTS 2 — sidecar status + editable voice presets
+    if (p === "/api/tts/breeze/status" && method === "GET") {
+      const [modelPresent, status] = await Promise.all([breezeModelPresent(), probeBreezeStatus()]);
+      return json({ modelPresent, ...status });
+    }
+    if (p === "/api/tts/breeze/voices" && method === "GET") {
+      return json({ voices: breezeVoiceList() });
+    }
+    if (p === "/api/tts/breeze/voices" && method === "POST") {
+      const body = await readJson(req);
+      const voices = Array.isArray(body.voices) ? saveBreezeVoices(body.voices) : breezeVoiceList();
+      return json({ voices });
+    }
+    if (p === "/api/tts/breeze/voices/reset" && method === "POST") {
+      return json({ voices: defaultBreezeVoices() });
     }
 
     // import cards — per-file report (importé / doublon / invalide) + limits

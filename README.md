@@ -18,7 +18,50 @@ PORT=3210 bun src/index.ts
 - L'URL de LM Studio et le modèle se règlent dans **Réglages** (⚙️) de l'app.
 - Le TTS (Pocket-TTS, 8 voix FR + EN) se précharge au démarrage ; les voix se
   règlent par rôle dans les réglages, avec override par carte.
+- Le **Breeze-TTS-2** (3B, haute qualité, GPU) est un second moteur optionnel :
+  choisis-le dans **Réglages → Voix** (moteur de voix). Voir « Breeze-TTS-2 »
+  ci-dessous.
 - Le serveur d'images (Koji) se lance automatiquement à la première demande.
+
+## Breeze-TTS-2 (moteur de voix optionnel)
+
+Breeze est un moteur de synthèse de haute qualité (3B, PyTorch + CUDA) qui fait
+tourner un sidecar Python sur la machine. Contrairement à Pocket-TTS (voix
+embarquées), chaque **voix Breeze est une consigne de voix** : tu décris le
+timbre, le débit et le tempérament en une phrase, et le modèle l'incarne. Tu
+peux **créer, modifier et supprimer** ces presets depuis **Réglages → Voix**
+(éditeur de voix Breeze).
+
+### Installation (une seule fois)
+
+```bash
+# 1. Environnement Python (torch CUDA + deps) — fait dans python/breeze_server/.venv
+cd python/breeze_server
+# (venv déjà créé ; sinon :)
+# python -m venv .venv && .venv/Scripts/activate
+# pip install torch==2.10.0+cu130 torchaudio==2.10.0+cu130 --index-url https://download.pytorch.org/whl/cu130
+# puis : pip install -r requirements.txt
+
+# 2. Télécharger le modèle (~7,2 Go) dans models/Breeze-TTS-2
+.venv/Scripts/python.exe download_model.py
+```
+
+Le sidecar est lancé automatiquement par l'app au premier besoin (chargement du
+modèle ~1–2 min) sur le port 8771. Sans GPU il ne fonctionne pas : Breeze
+requiert CUDA (flash-attn absent → bascule automatique en attention eager).
+
+### Usage
+
+- Dans **Réglages → Voix**, choisis « Breeze-TTS-2 » comme moteur, puis une voix
+  par rôle (narrateur / personnages). Les presets Breeze sont édités dans le
+  panneau « Voix Breeze (éditeur) ».
+- Modifier la description d'une voix en change le timbre et **invalide le cache**
+  audio de cette voix.
+
+| Commande | Rôle |
+| --- | --- |
+| `python/breeze_server/.venv/Scripts/python.exe python/breeze_server/server.py --port 8771` | Sidecar Breeze (manuel) |
+| `python/breeze_server/download_model.py` | Télécharge le modèle (~7 Go) |
 
 ## Scripts utiles
 
@@ -91,10 +134,12 @@ PORT=3210 bun src/index.ts
 ```
 src/server/   API, base de données, routes, import de cartes
 src/llm/      providers (LM Studio / OpenRouter) + prompt RP + parsing segments
-src/tts/      moteur Pocket-TTS (tokenizer WASM, inférence ONNX), service + voix
+src/tts/      moteur Pocket-TTS (tokenizer WASM, inférence ONNX), service + voix,
+               client Breeze (sidecar) + presets de voix
 python/image_server/  sidecar images (diffusers + Koji)
+python/breeze_server/ sidecar Breeze-TTS-2 (PyTorch + CUDA) + clone du repo officiel
 public/       SPA (HTML/CSS/JS)
-models/       modèles locaux (Koji, Pocket-TTS)
+models/       modèles locaux (Koji, Pocket-TTS, Breeze-TTS-2)
 data/samples/ échantillons de voix TTS pré-générés (aperçu dans les réglages)
 data/         base SQLite, audio et images générées (créé au runtime)
 ```

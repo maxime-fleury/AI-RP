@@ -12,8 +12,14 @@ data/
 
 # models: Koji (4 GB+) and Pocket-TTS weights — not uploaded
 models/
+# …except the Breeze sidecar's models/ — Python source, not weights
+!python/breeze_server/models/
 python/image_server/.venv/
 python/image_server/__pycache__/
+
+# Python sidecars: virtualenvs and caches stay local
+.venv/
+**/__pycache__/
 
 # agent workspace
 .freebuff/

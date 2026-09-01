@@ -1,6 +1,6 @@
-import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=35";
-import { el, esc, toast, actionToast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=35";
-import { renderChat } from "./chat.js?v=35";
+import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=36";
+import { el, esc, toast, actionToast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=36";
+import { renderChat } from "./chat.js?v=36";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -28,6 +28,36 @@ export async function refreshAll() {
     loaded: true,
   });
   return store;
+}
+
+/** Partial refresh helpers — cheaper than full refreshAll() for simple mutations. */
+export async function refreshConversations() {
+  const conv = await api("/api/conversations");
+  store.conversations = conv.conversations || [];
+}
+export async function refreshWorlds() {
+  const w = await api("/api/worlds");
+  store.worlds = w.worlds || [];
+}
+export async function refreshCards() {
+  const c = await api("/api/cards");
+  store.cards = c.cards || [];
+}
+export async function refreshPersonas() {
+  const p = await api("/api/personas");
+  store.personas = p.personas || [];
+}
+export async function refreshVoices() {
+  const v = await api("/api/voices");
+  store.voices = v.voices || [];
+}
+/** Update a single conversation in place (e.g. after PATCH). */
+export async function refreshConversation(id) {
+  const conv = await api(`/api/conversations/${id}`);
+  if (!conv) return;
+  const idx = store.conversations.findIndex((c) => c.id === id);
+  if (idx >= 0) store.conversations[idx] = conv;
+  else store.conversations.push(conv);
 }
 
 // ─── narrator presets (shared by the settings editor and the world modal) ───
@@ -176,14 +206,41 @@ function openCommandPalette() {
     ["Personas", () => navigate("#/personas")], ["Réglages", () => navigate("#/settings")],
   ];
   const close = () => { paletteOpen = false; backdrop.remove(); };
+  let selectedIndex = 0;
   const paint = () => {
     const q = input.value.trim();
     const matches = q ? globalSearch(q).map((r) => [r.label, () => navigate(r.href), r.type]) : commands.map((r) => [r[0], r[1], "Commande"]);
     results.replaceChildren(...matches.map(([label, action, type]) => el("button", { class: "palette-item", onclick: () => { close(); action(); } }, el("span", { class: "chip" }, type), el("span", {}, label))));
     if (!matches.length) results.append(el("div", { class: "palette-empty" }, "Aucun résultat"));
+    selectedIndex = 0;
+  };
+  const items = () => [...results.querySelectorAll("button.palette-item")];
+  const selectSelected = () => {
+    const all = items();
+    if (all[selectedIndex]) all[selectedIndex].click();
+  };
+  const moveSelection = (delta) => {
+    const all = items();
+    if (!all.length) return;
+    selectedIndex = (selectedIndex + delta + all.length) % all.length;
+    all.forEach((b, i) => b.classList.toggle("selected", i === selectedIndex));
+    all[selectedIndex]?.scrollIntoView({ block: "nearest" });
   };
   input.addEventListener("input", paint);
-  input.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); else if (e.key === "Enter") results.querySelector("button")?.click(); });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") close();
+    else if (e.key === "Enter") selectSelected();
+    else if (e.key === "ArrowDown") { e.preventDefault(); moveSelection(1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); moveSelection(-1); }
+  });
+  results.addEventListener("click", (e) => {
+    const btn = e.target.closest("button.palette-item");
+    if (btn) {
+      const all = items();
+      selectedIndex = all.indexOf(btn);
+      all.forEach((b, i) => b.classList.toggle("selected", i === selectedIndex));
+    }
+  });
   const backdrop = el("div", { class: "palette-backdrop" }, el("div", { class: "palette", role: "dialog", "aria-modal": "true" }, input, results));
   backdrop.addEventListener("mousedown", (e) => { if (e.target === backdrop) close(); });
   root.append(backdrop); paint(); setTimeout(() => input.focus(), 0);
@@ -283,7 +340,7 @@ function shortcutsHelp() {
 }
 let shortcutCapturing = false; // set while the settings editor awaits a keypress
 function fireShortcut(k) {
-  import("./chat.js?v=35").then((m) => m.chatShortcut(k)).catch(() => {});
+  import("./chat.js?v=36").then((m) => m.chatShortcut(k)).catch(() => {});
 }
 document.addEventListener("keydown", (e) => {
   if (shortcutCapturing) return; // the settings key-capture owns this press
@@ -1900,14 +1957,15 @@ async function renderSettings() {
   container.append(el("div", { class: "section-title", id: "sec-tts" }, "Voix (TTS)"));
   const ttsOn = checkbox("tts_enabled", s.tts_enabled !== false, "Activer la synthèse vocale");
   const ttsLang = field("Langue des voix", s.tts_language || "fr", { type: "select", options: [["fr", "Français"], ["en", "English"]] });
-  const narrator = field("Voix du narrateur", s.tts_voice_narrateur || "jean", { type: "select", options: voicesOptions(ttsLang.input.value) });
-  const defChar = field("Voix par défaut des personnages", s.tts_voice_default || "cosette", { type: "select", options: voicesOptions(ttsLang.input.value) });
+  const ttsEngine = field("Moteur de voix", s.tts_engine || "pocket", { type: "select", options: [["pocket", "Pocket-TTS (rapide, intégré)"], ["breeze", "Breeze-TTS-2 (haute qualité, GPU)"]] });
+  const narrator = field("Voix du narrateur", s.tts_voice_narrateur || "jean", { type: "select", options: voicesOptions(ttsLang.input.value, ttsEngine.input.value) });
+  const defChar = field("Voix par défaut des personnages", s.tts_voice_default || "cosette", { type: "select", options: voicesOptions(ttsLang.input.value, ttsEngine.input.value) });
   const lsd = field("Qualité (pas de décodage)", s.tts_lsd_steps || 4, { type: "number", min: 1, max: 10, step: 1 });
   const maxSeg = field("Segments vocaux par réponse", s.tts_max_segments ?? 5, { type: "number", min: 1, max: 20, step: 1 });
   const autoplay = checkbox("tts_autoplay", s.tts_autoplay !== false, "Lecture auto des réponses");
   // ▶ buttons: play a sample of the currently selected voice
-  const narratorPlay = samplePlayBtn(() => narrator.input.value, () => ttsLang.input.value);
-  const defCharPlay = samplePlayBtn(() => defChar.input.value, () => ttsLang.input.value);
+  const narratorPlay = samplePlayBtn(() => narrator.input.value, () => ttsLang.input.value, () => ttsEngine.input.value);
+  const defCharPlay = samplePlayBtn(() => defChar.input.value, () => ttsLang.input.value, () => ttsEngine.input.value);
   narrator.wrap.append(narratorPlay);
   defChar.wrap.append(defCharPlay);
   // samples strip: every voice, playable
@@ -1915,14 +1973,14 @@ async function renderSettings() {
   const renderStrip = () => {
     stripBox.replaceChildren(el("div", { class: "chips-label" }, "🎧 Aperçu des voix — clique pour écouter"));
     for (const lang of ["fr", "en"]) {
-      const voices = store.voices.filter((v) => v.lang === lang);
+      const voices = store.voices.filter((v) => v.lang === lang && v.engine === ttsEngine.input.value);
       if (!voices.length) continue;
       const uniq = [...new Map(voices.map((v) => [v.name, v])).values()];
       stripBox.append(el("div", { class: "voice-group" },
         el("span", { class: "voice-lang" }, lang === "fr" ? "Français" : "English"),
         el("div", { class: "voice-chips" },
           uniq.map((v) => {
-            const chip = el("button", { class: "voice-chip", onclick: () => playSample(v.name, v.lang, chip) }, "▶ " + esc(v.label));
+            const chip = el("button", { class: "voice-chip", onclick: () => playSample(v.name, v.lang, chip, v.engine) }, "▶ " + esc(v.label));
             return chip;
           }),
         ),
@@ -1931,18 +1989,27 @@ async function renderSettings() {
   };
   renderStrip();
   ttsLang.input.addEventListener("change", () => {
-    // voice selects follow the chosen language (keep selection when possible)
     const lang = ttsLang.input.value;
-    const opts = voicesOptions(lang);
-    for (const sel of [narrator.input, defChar.input]) {
-      const cur = sel.value;
-      sel.replaceChildren(...opts.map(([v, l]) => el("option", { value: v, ...(v === cur ? { selected: "" } : {}) }, l)));
-    }
+    refreshVoiceSelects(narrator, defChar);
     renderStrip();
   });
+  ttsEngine.input.addEventListener("change", () => {
+    refreshVoiceSelects(narrator, defChar);
+    renderStrip();
+  });
+  function refreshVoiceSelects(...sels) {
+    const lang = ttsLang.input.value;
+    const engine = ttsEngine.input.value;
+    const opts = voicesOptions(lang, engine);
+    for (const sel of sels) {
+      const cur = sel.input.value;
+      const still = opts.find(([v]) => v === cur);
+      sel.input.replaceChildren(...opts.map(([v, l]) => el("option", { value: v, ...(v === still?.[0] ? { selected: "" } : {}) }, l)));
+    }
+  }
   container.append(el("div", { class: "card", style: { padding: "18px 22px" } },
     el("div", { class: "row" }, ttsOn.wrap, autoplay.wrap),
-    el("div", { class: "row" }, ttsLang.wrap, lsd.wrap, maxSeg.wrap),
+    el("div", { class: "row" }, ttsLang.wrap, ttsEngine.wrap, lsd.wrap, maxSeg.wrap),
     el("div", { class: "row" }, narrator.wrap, defChar.wrap),
     el("details", { class: "voice-collapse" },
       el("summary", {}, "🎧 Écouter toutes les voix"),
@@ -1957,6 +2024,7 @@ async function renderSettings() {
         } catch (e) { toast(e.message, "err"); }
       } }, ICONS.voice, "Précharger le TTS"),
     ),
+    breezePresetsCard(ttsEngine, () => { refreshVoiceSelects(narrator, defChar); renderStrip(); }),
   ));
 
   // ── Images ──
@@ -2218,6 +2286,7 @@ async function renderSettings() {
             ),
             tts_enabled: ttsOn.input.checked,
             tts_language: ttsLang.input.value,
+            tts_engine: ttsEngine.input.value,
             tts_voice_narrateur: narrator.input.value,
             tts_voice_default: defChar.input.value,
             tts_lsd_steps: Number(lsd.input.value),
@@ -2366,8 +2435,8 @@ function checkbox(key, checked, labelText) {
   return { wrap, input: wrap.querySelector("input") };
 }
 
-function voicesOptions(lang) {
-  const voices = store.voices.filter((v) => v.lang === lang || !lang);
+function voicesOptions(lang, engine) {
+  const voices = store.voices.filter((v) => (v.lang === lang || !lang) && (!engine || v.engine === engine));
   const unique = [...new Map(voices.map((v) => [v.name, v])).values()];
   return unique.map((v) => [v.name, v.label]);
 }
@@ -2383,7 +2452,7 @@ function stopSample() {
     sampleHandler = null;
   }
 }
-async function playSample(name, lang, btn) {
+async function playSample(name, lang, btn, engine) {
   if (sampleHandler && sampleHandler.btn === btn) { stopSample(); return; }
   stopSample();
   if (!name) return;
@@ -2392,7 +2461,7 @@ async function playSample(name, lang, btn) {
   btn.classList.add("busy");
   try {
     // server synthesizes (and caches) the clip on first request
-    const res = await api(`/api/voices/sample?name=${encodeURIComponent(name)}&lang=${lang || "fr"}`);
+    const res = await api(`/api/voices/sample?name=${encodeURIComponent(name)}&lang=${lang || "fr"}${engine ? "&engine=" + engine : ""}`);
     const a = new Audio(res.path);
     a.onended = () => {
       if (sampleHandler?.audio === a) sampleHandler = null;
@@ -2410,9 +2479,170 @@ async function playSample(name, lang, btn) {
     toast(String(e?.message ?? e), "err");
   }
 }
-function samplePlayBtn(getVoice, getLang) {
-  const b = el("button", { class: "mini-btn play-voice", style: { marginTop: "8px" }, onclick: () => playSample(getVoice(), getLang ? getLang() : "fr", b) }, "▶ Écouter");
+function samplePlayBtn(getVoice, getLang, getEngine) {
+  const b = el("button", { class: "mini-btn play-voice", style: { marginTop: "8px" }, onclick: () => playSample(getVoice(), getLang ? getLang() : "fr", b, getEngine ? getEngine() : "pocket") }, "▶ Écouter");
   return b;
+}
+
+// ─── Breeze-TTS-2 voice presets editor ─────────────────────────────────────
+// Breeze voices are design instructions (describe the speaker in words), so
+// users can edit the descriptions and create new presets here. Saving persists
+// the whole list to the server settings (breeze_voices).
+function breezePresetsCard(engineField, onVoicesChanged) {
+  const card = el("div", { class: "card breeze-card", style: { padding: "18px 22px", marginTop: "14px" } });
+  let voices = [];
+  let editIndex = -1;
+  let busy = false;
+
+  const listBox = el("div", { class: "breeze-list" });
+
+  const nameInput = el("input", { class: "fl-field-input", placeholder: "Nom (ex : adèle)" });
+  const langSel = el("select", {},
+    el("option", { value: "fr", selected: "" }, "Français"),
+    el("option", { value: "en" }, "English"),
+  );
+  const instrTa = el("textarea", { class: "fl-field-input", rows: 3, placeholder: "Décris la voix en une phrase… (en français pour une voix fr)" });
+  const saveBtn = el("button", { class: "btn btn-primary btn-sm" }, "＋ Ajouter");
+
+  const paint = () => {
+    listBox.replaceChildren();
+    if (!voices.length) {
+      listBox.append(el("p", { style: { color: "var(--text-dim)", fontSize: "13px" } }, "Aucun preset — ajoute ta première voix."));
+      return;
+    }
+    const chips = el("div", { class: "breeze-chips" });
+    for (let i = 0; i < voices.length; i++) {
+      const v = voices[i];
+      const chip = el("div", { class: "voice-chip wrap" },
+        el("span", { class: "breeze-name" }, esc(v.name) + (v.lang === "en" ? " (EN)" : " (FR)")),
+        el("span", { class: "breeze-instr" }, esc(v.instruction)),
+        el("span", { class: "breeze-chip-actions" },
+          el("button", { class: "mini-btn", title: "Écouter", onclick: (ev) => { ev.stopPropagation(); playSample(v.name, v.lang, ev.currentTarget, "breeze"); } }, "▶"),
+          el("button", { class: "mini-btn", title: "Modifier", onclick: (ev) => {
+            ev.stopPropagation();
+            editIndex = i;
+            nameInput.value = v.name;
+            langSel.value = v.lang;
+            instrTa.value = v.instruction;
+            saveBtn.textContent = "💾 Enregistrer la modification";
+          } }, "✎"),
+          el("button", { class: "mini-btn", style: { color: "var(--danger)" }, title: "Supprimer", onclick: async (ev) => {
+            ev.stopPropagation();
+            if (busy) return;
+            if (!await confirmModal({ title: "Supprimer la voix", message: `Supprimer « ${v.name} » ?`, confirmLabel: "Supprimer" })) return;
+            voices.splice(i, 1);
+            await persist();
+          } }, "🗑"),
+        ),
+      );
+      chips.append(chip);
+    }
+    listBox.append(chips);
+  };
+
+  const persist = async () => {
+    busy = true;
+    try {
+      const r = await api("/api/tts/breeze/voices", { method: "POST", body: { voices } });
+      voices = r.voices || [];
+      editIndex = -1;
+      nameInput.value = ""; instrTa.value = "";
+      saveBtn.textContent = "＋ Ajouter";
+      await refreshStoreVoices();
+      toast("Voix Breeze enregistrées ✓");
+      paint();
+    } catch (e) {
+      toast(e.message, "err");
+    } finally {
+      busy = false;
+    }
+  };
+
+  saveBtn.addEventListener("click", async () => {
+    const name = nameInput.value.trim();
+    const instruction = instrTa.value.trim();
+    if (!name || !instruction) { toast("Nom et description requis.", "err"); return; }
+    if (editIndex >= 0) {
+      voices[editIndex] = { name, lang: langSel.value, instruction };
+    } else {
+      if (voices.some((v) => v.name.toLowerCase() === name.toLowerCase())) {
+        toast("Ce nom existe déjà — choisis-en un autre.", "err");
+        return;
+      }
+      voices.push({ name, lang: langSel.value, instruction });
+    }
+    await persist();
+  });
+
+  const refreshStoreVoices = async () => {
+    const fresh = await api("/api/tts/breeze/voices");
+    store.voices = store.voices.filter((v) => v.engine !== "breeze").concat(
+      (fresh.voices || []).map((v) => ({ name: v.name, lang: v.lang, engine: "breeze", predefined: true, label: `${v.name} (Breeze · ${v.lang === "fr" ? "FR" : "EN"})` })),
+    );
+    onVoicesChanged?.();
+    paint();
+  };
+
+  const load = async () => {
+    try {
+      const r = await api("/api/tts/breeze/status");
+      const { modelPresent, running, ready, error } = r;
+      const stat = el("div", { class: "breeze-status" },
+        modelPresent
+          ? el("span", {}, ready ? "✅ Breeze prêt" : (running ? "⏳ Breeze en cours de chargement…" : "📦 Breeze installé, modèle présent"))
+          : el("span", {}, "⚠️ Modèle Breeze absent — lance le téléchargement (voir docs)."),
+        (error ? el("span", { class: "breeze-err" }, esc(error)) : null),
+      );
+      statusBox.replaceChildren(stat);
+      const rv = await api("/api/tts/breeze/voices");
+      voices = rv.voices || [];
+      await refreshStoreVoices();
+    } catch { /* ignore */ }
+  };
+
+  const statusBox = el("div");
+  const resetBtn = el("button", { class: "btn btn-ghost btn-sm", title: "Restaurer les presets par défaut", onclick: async () => {
+    if (busy) return;
+    if (!await confirmModal({ title: "Réinitialiser", message: "Restaurer les voix Breeze par défaut ? Tes modifications seront perdues.", confirmLabel: "Réinitialiser" })) return;
+    busy = true;
+    try {
+      const r = await api("/api/tts/breeze/voices/reset", { method: "POST" });
+      voices = r.voices || [];
+      await refreshStoreVoices();
+    } catch (e) { toast(e.message, "err"); }
+    busy = false;
+  } }, "↺ Réinitialiser");
+
+  const cardDetails = el("details", { class: "breeze-collapse" },
+    el("summary", {}, "🎙️ Voix Breeze (éditeur)"),
+    el("div", { style: { marginTop: "12px" } },
+      statusBox,
+      el("div", { class: "breeze-list-wrap" },
+        listBox,
+        el("div", { class: "breeze-editor" },
+          el("div", { class: "row" }, nameInput, langSel),
+          instrTa,
+          el("div", { class: "row", style: { marginTop: "10px", justifyContent: "space-between" } },
+            saveBtn,
+            resetBtn,
+          ),
+        ),
+      ),
+      el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "12px" } },
+        "Chaque voix Breeze est une consigne de voix : décris le timbre, le débit, le tempérament en une phrase. Modifier la description change la voix et invalide le cache.",
+      ),
+    ),
+  );
+  card.append(cardDetails);
+
+  const sync = () => {
+    const isBreeze = engineField.input.value === "breeze";
+    card.style.display = isBreeze ? "" : "none";
+  };
+  engineField.input.addEventListener("change", sync);
+  sync();
+  load();
+  return card;
 }
 
 // ─── new game wizard ──────────────────────────────────────────────────────────

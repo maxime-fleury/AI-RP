@@ -1,12 +1,13 @@
-import { api, apiFetch, readSseStream } from "./api.js?v=30";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=30";
-import { store, refreshAll, navigate, applyTheme } from "./app.js?v=30";
+import { api, apiFetch, readSseStream } from "./api.js?v=36";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=36";
+import { store, refreshAll, navigate, applyTheme } from "./app.js?v=36";
 
 let currentConversation = null;
 let currentCtx = null;
 let busy = false;
 let streamGeneration = 0;
 let abortController = null;
+let beforeUnloadHandler = null; // installed when streaming starts
 let chipsRowRef = null;
 let sceneRefreshHook = null; // set by renderChat; fired after each completed turn
 let lastAutoValidateAt = 0; // per-session throttle for the auto coherence check
@@ -195,7 +196,7 @@ export async function renderChat(convIdRaw) {
   if (convIdRaw === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=30");
+    const { newGameWizard } = await import("./app.js?v=36");
     newGameWizard(pre);
     return;
   }
@@ -286,8 +287,11 @@ export async function renderChat(convIdRaw) {
       a.click();
       URL.revokeObjectURL(a.href);
       toast(branchMode === "canon" ? "Export canon ✓" : "Export Markdown ✓");
-    } catch (e) { toast(e.message, "err"); }
-    finally { mdBtn.disabled = false; }
+    } catch (e) {
+      toast(e.message, "err");
+    } finally {
+      mdBtn.disabled = false;
+    }
   } }, "📄");
   const exportBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Exporter la partie (ZIP : texte + audio + images)", onclick: exportZip }, "⬇");
   const galleryBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Galerie d'illustrations", onclick: openGallery }, "🖼");
@@ -429,7 +433,7 @@ export async function renderChat(convIdRaw) {
   async function deleteConversation() {
     if (!(await confirmModal({ title: "Archiver la partie", message: `Déplacer « ${conv.title || "Partie"} » dans la corbeille ? Tu pourras la restaurer depuis l'accueil. (La suppression définitive se fait dans la corbeille.)`, confirmLabel: "Archiver" }))) return;
     await api(`/api/conversations/${convId}`, { method: "DELETE" });
-    await refreshAll();
+    await refreshConversations();
     navigate("#/");
     toast("Partie archivée — corbeille dans l'accueil.");
   }
@@ -602,8 +606,10 @@ export async function renderChat(convIdRaw) {
       toast("Génération arrêtée.", "ok", 2500);
       // the server commits whatever the model already wrote → show the real state
       setTimeout(async () => {
-        await refreshAll();
-        if (currentConversation?.id) await renderChat(String(currentConversation.id));
+        if (currentConversation?.id) {
+          await refreshConversation(currentConversation.id);
+          await renderChat(String(currentConversation.id));
+        }
       }, 900);
     }
   }
@@ -752,7 +758,7 @@ export async function renderChat(convIdRaw) {
   async function toggleGroup() {
     const next = !currentConversation.group_mode;
     await api(`/api/conversations/${convId}`, { method: "PATCH", body: { group_mode: next } });
-    await refreshAll();
+    await refreshConversation(convId);
     renderChat(convIdRaw);
     toast(next ? "Mode groupe activé — tous les personnages parlent." : "Mode solo activé.", "ok");
   }
@@ -847,14 +853,17 @@ export async function renderChat(convIdRaw) {
     const ttsOn = field("TTS", convSettings.tts_enabled ?? store.settings.tts_enabled !== false, { type: "select", options: [["1", "Activé"], ["0", "Désactivé"]] });
     const autoplay = field("Lecture auto", convSettings.tts_autoplay ?? store.settings.tts_autoplay !== false, { type: "select", options: [["1", "Oui"], ["0", "Non"]] });
     const langSel = field("Langue des voix", convSettings.tts_language || store.settings.tts_language || "fr", { type: "select", options: [["fr", "Français"], ["en", "English"]] });
-    const narratorSel = field("Voix du narrateur", convSettings.tts_voice_narrateur || store.settings.tts_voice_narrateur || "jean", { type: "select", options: voiceOpts(convSettings.tts_language || store.settings.tts_language || "fr") });
-    const defCharSel = field("Voix des personnages", convSettings.tts_voice_default || store.settings.tts_voice_default || "cosette", { type: "select", options: voiceOpts(convSettings.tts_language || store.settings.tts_language || "fr") });
-    langSel.input.addEventListener("change", () => {
+    const engineSel = field("Moteur de voix", convSettings.tts_engine || store.settings.tts_engine || "pocket", { type: "select", options: [["pocket", "Pocket-TTS"], ["breeze", "Breeze-TTS-2"]] });
+    const narratorSel = field("Voix du narrateur", convSettings.tts_voice_narrateur || store.settings.tts_voice_narrateur || "jean", { type: "select", options: voiceOpts(convSettings.tts_language || store.settings.tts_language || "fr", convSettings.tts_engine || store.settings.tts_engine || "pocket") });
+    const defCharSel = field("Voix des personnages", convSettings.tts_voice_default || store.settings.tts_voice_default || "cosette", { type: "select", options: voiceOpts(convSettings.tts_language || store.settings.tts_language || "fr", convSettings.tts_engine || store.settings.tts_engine || "pocket") });
+    langSel.input.addEventListener("change", () => refreshSelOptions());
+    engineSel.input.addEventListener("change", () => refreshSelOptions());
+    function refreshSelOptions() {
       for (const sel of [narratorSel.input, defCharSel.input]) {
         const cur = sel.value;
-        sel.replaceChildren(...voiceOpts(langSel.input.value).map(([v, l]) => el("option", { value: v, ...(v === cur ? { selected: "" } : {}) }, l)));
+        sel.replaceChildren(...voiceOpts(langSel.input.value, engineSel.input.value).map(([v, l]) => el("option", { value: v, ...(v === cur ? { selected: "" } : {}) }, l)));
       }
-    });
+    }
 
     const body = el("div", { class: "conv-settings" },
       el("div", { class: "modal-section" }, "Modèle & génération"),
@@ -872,7 +881,7 @@ export async function renderChat(convIdRaw) {
       castBox,
       el("div", { class: "modal-section" }, "Voix (TTS)"),
       el("div", { class: "row" }, ttsOn.wrap, autoplay.wrap),
-      el("div", { class: "row3" }, langSel.wrap, narratorSel.wrap, defCharSel.wrap),
+      el("div", { class: "row3" }, langSel.wrap, engineSel.wrap, narratorSel.wrap, defCharSel.wrap),
       el("div", { class: "vol-grid" },
         el("div", { class: "vol-head" }, "🎚 Volume par voix (cette partie)"),
         ...distinctVoices.map((voice) => {
@@ -915,6 +924,7 @@ export async function renderChat(convIdRaw) {
           tts_enabled: ttsOn.input.value === "1",
           tts_autoplay: autoplay.input.value === "1",
           tts_language: langSel.input.value,
+          tts_engine: engineSel.input.value,
           tts_voice_narrateur: narratorSel.input.value,
           tts_voice_default: defCharSel.input.value,
         };
@@ -932,11 +942,12 @@ export async function renderChat(convIdRaw) {
     const used = cards.filter((c) => ids.has(c.id)).length;
     return used ? `${used} en scène` : "aucun";
   }
-  function voiceOpts(lang) {
+  function voiceOpts(lang, engine) {
     const seen = new Set();
     const out = [];
     for (const v of store.voices || []) {
       if (v.lang !== lang || seen.has(v.name)) continue;
+      if (engine && v.engine && v.engine !== engine) continue;
       seen.add(v.name);
       out.push([v.name, v.label]);
     }
@@ -978,6 +989,19 @@ async function doStream(content, opts = {}) {
   bodyEl.append(thinkEl);
   const thinkStart = Date.now();
   const baseTitle = document.title;
+
+  // beforeunload: prevent navigating away / closing the tab while streaming
+  if (!beforeUnloadHandler) {
+    beforeUnloadHandler = (e) => {
+      if (busy) {
+        e.preventDefault();
+        e.returnValue = "";
+        return "Une génération est en cours. Confirmer quitte la partie.";
+      }
+    };
+    window.addEventListener("beforeunload", beforeUnloadHandler);
+  }
+
   const thinkTimer = setInterval(() => {
     thinkEl.textContent = `⏱ ${Math.round((Date.now() - thinkStart) / 1000)}s`;
     // live progress in the tab title while the tab is hidden
@@ -1023,12 +1047,19 @@ async function doStream(content, opts = {}) {
     requestAnimationFrame(renderDelta);
   };
   try {
-    const res = await apiFetch(`/api/conversations/${currentConversation.id}/stream`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content, directive: opts.directive || "", prompt: opts.prompt || "" }),
-      signal: abortController.signal,
-    });
+    // Connection blips are retried with backoff, but only while nothing has
+    // been written yet — once the stream produces content (or completes), the
+    // exchange is committed server-side and re-posting would duplicate it.
+    const MAX_SSE_RETRIES = 2;
+    for (let sseAttempts = 0; sseAttempts <= MAX_SSE_RETRIES; sseAttempts++) {
+      if (abortController?.signal.aborted) return;
+      try {
+        const res = await apiFetch(`/api/conversations/${currentConversation.id}/stream`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content, directive: opts.directive || "", prompt: opts.prompt || "" }),
+          signal: abortController.signal,
+        });
     await readSseStream(res, async (event, data) => {
       if (event === "delta") {
         full += data.text || "";
@@ -1076,26 +1107,40 @@ async function doStream(content, opts = {}) {
         throw new Error(data.message || "Erreur inconnue");
       }
     });
-    await refreshAll();
-  } catch (e) {
-    if (e.name !== "AbortError") {
-      if (document.hidden) notify("⚠️ Erreur", String(e.message || "Échec"));
-      pendingNode.remove();
-      const errNode = el("div", { class: "msg me" },
-        el("div", { class: "bubble", style: { borderColor: "var(--danger)", color: "var(--danger)" } },
-          el("div", { style: { fontWeight: 700 } }, "⚠️ " + esc(e.message)),
-          el("button", { class: "mini-btn", style: { marginTop: "8px" }, onclick: () => doStream(content) }, "↻ Réessayer"),
-        ),
-      );
-      scroll.append(errNode);
-      scrollToBottom(scroll);
+        await refreshAll();
+        break; // stream finished cleanly — never re-post
+      } catch (e) {
+        if (e.name === "AbortError" || abortController?.signal.aborted) return;
+        // transient network failure before any content → retry with backoff;
+        // once tokens flowed the server already committed the exchange
+        if (!full && sseAttempts < MAX_SSE_RETRIES && /fetch|network|ECONN|socket|timeout/i.test(String(e?.message ?? e))) {
+          toast(`Connexion au modèle perdue — nouvelle tentative (${sseAttempts + 1}/${MAX_SSE_RETRIES})…`, "warn");
+          await new Promise((r) => setTimeout(r, 2000 * (sseAttempts + 1)));
+          continue;
+        }
+        if (document.hidden) notify("⚠️ Erreur", String(e.message || "Échec"));
+        pendingNode.remove();
+        const errNode = el("div", { class: "msg me" },
+          el("div", { class: "bubble", style: { borderColor: "var(--danger)", color: "var(--danger)" } },
+            el("div", { style: { fontWeight: 700 } }, "⚠️ " + esc(e.message)),
+            el("button", { class: "mini-btn", style: { marginTop: "8px" }, onclick: () => doStream(content) }, "↻ Réessayer"),
+          ),
+        );
+        scroll.append(errNode);
+        scrollToBottom(scroll);
+        break;
+      }
     }
   } finally {
     clearInterval(thinkTimer);
     document.title = baseTitle;
+
+    // restore beforeunload handler
     busy = false;
     if (sendBtn) sendBtn.disabled = false;
     if (stopBtn) stopBtn.hidden = true;
+    window.removeEventListener("beforeunload", beforeUnloadHandler);
+    beforeUnloadHandler = null;
     textarea?.focus();
   }
 }
@@ -1894,7 +1939,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal, field } from "./ui.js?v=30";
+import { openModal, field } from "./ui.js?v=36";
 void applyTheme;
 void fmtTime;
 void currentConversation;
