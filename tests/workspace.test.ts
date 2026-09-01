@@ -37,6 +37,8 @@ describe("presets, scene state & service tests", async () => {
     expect(r2.updatedAt).toBe(1234);
   });
 
+  // first-time ONNX bundle load + a dead LM Studio probe can exceed the 5 s
+  // default under load — give the service test a realistic budget
   test("POST /api/test probes provider, tts and image without crashing", async () => {
     const res = await api(routes, "POST", "/api/test");
     expect(res.status).toBe(200);
@@ -47,7 +49,7 @@ describe("presets, scene state & service tests", async () => {
     expect(typeof r.tts.ok).toBe("boolean");
     expect(typeof r.image).toBe("object");
     expect("running" in r.image || "ready" in r.image).toBe(true);
-  });
+  }, 60000);
 });
 
 describe("branches, backups & coherence check", async () => {

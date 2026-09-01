@@ -2686,9 +2686,9 @@ export function newGameWizard(pre) {
       scenSel.input.append(el("option", { value: "draft", selected: "" }, s.name));
       scenSel.input.dataset.draftName = s.name;
       scenSel.input.dataset.draftIntro = s.intro;
-      scenSel.input.dataset.draftName = s.name;
-      scenSel.input.dataset.draftIntro = s.intro;
-      scenSel.input.value = String(s.id);
+      // the /generate endpoint returns a draft (no id) — select the "draft"
+      // option so the opening is persisted via settings.draft_intro
+      scenSel.input.value = "draft";
       scenPreview.hidden = false;
       scenPreview.replaceChildren(
         el("div", { class: "gen-preview-head" }, "📜 " + esc(s.name)),

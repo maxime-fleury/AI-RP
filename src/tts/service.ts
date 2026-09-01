@@ -110,7 +110,11 @@ export { ttsMutex };
 export async function getVoiceSample(name: string, lang: TtsLang, engine: TtsEngine = "pocket"): Promise<string> {
   fs.mkdirSync(SAMPLES_DIR, { recursive: true });
   // names are user-editable (Breeze presets) — keep the file inside SAMPLES_DIR
-  const safeName = name.replace(/[^\p{L}\p{N}_-]+/gu, "_");
+  // and ASCII-only so the percent-encoded URL always matches the file on disk
+  const safeName = name
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^A-Za-z0-9_-]+/gu, "_");
   const fileName = `${engine}-${lang}-${safeName}.wav`;
   const file = path.join(SAMPLES_DIR, fileName);
   if (fs.existsSync(file)) return `/samples/${fileName}`;

@@ -34,6 +34,16 @@ const MIME: Record<string, string> = {
   ".md": "text/markdown; charset=utf-8",
 };
 
+/** Decode a percent-encoded request path (browsers encode non-ASCII names
+ * like "adèle" → "ad%C3%A8le"); falls back to the raw string on garbage. */
+function decodeRel(rel: string): string {
+  try {
+    return decodeURIComponent(rel);
+  } catch {
+    return rel;
+  }
+}
+
 function serveFile(filePath: string, rootDir?: string): Response | null {
   let resolved: string;
   try {
@@ -64,29 +74,29 @@ function handler(req: Request): Response {
 
   // static data dirs
   if (p.startsWith("/audio/")) {
-    const file = serveFile(path.join(AUDIO_DIR, p.slice("/audio/".length)), AUDIO_DIR);
+    const file = serveFile(path.join(AUDIO_DIR, decodeRel(p.slice("/audio/".length))), AUDIO_DIR);
     if (file) return file;
     return new Response("not found", { status: 404 });
   }
   if (p.startsWith("/images/")) {
-    const file = serveFile(path.join(IMAGES_DIR, p.slice("/images/".length)), IMAGES_DIR);
+    const file = serveFile(path.join(IMAGES_DIR, decodeRel(p.slice("/images/".length))), IMAGES_DIR);
     if (file) return file;
     return new Response("not found", { status: 404 });
   }
   if (p.startsWith("/samples/")) {
-    const file = serveFile(path.join(SAMPLES_DIR, p.slice("/samples/".length)), SAMPLES_DIR);
+    const file = serveFile(path.join(SAMPLES_DIR, decodeRel(p.slice("/samples/".length))), SAMPLES_DIR);
     if (file) return file;
     return new Response("not found", { status: 404 });
   }
   if (p.startsWith("/uploads/")) {
-    const file = serveFile(path.join(UPLOADS_DIR, p.slice("/uploads/".length)), UPLOADS_DIR);
+    const file = serveFile(path.join(UPLOADS_DIR, decodeRel(p.slice("/uploads/".length))), UPLOADS_DIR);
     if (file) return file;
     return new Response("not found", { status: 404 });
   }
 
   // static app files
   if (p !== "/") {
-    const rel = p.replace(/^\/+/, "");
+    const rel = decodeRel(p.replace(/^\/+/, ""));
     const file = serveFile(path.join(PUBLIC_DIR, rel), PUBLIC_DIR);
     if (file) return file;
   }
