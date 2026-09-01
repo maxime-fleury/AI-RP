@@ -44,14 +44,14 @@ describe("zip export", () => {
   test("zipFiles round-trips entries with correct content", () => {
     const zip = zipFiles([
       { path: "conversation.md", data: "# L'invocation\n\n> **Alba** : *test*" },
-      { path: "audio/23-0.wav", data: new Uint8Array([1, 2, 3, 4, 5]) },
+      { path: "images/scene.png", data: new Uint8Array([1, 2, 3, 4, 5]) },
       { path: "images/pic.png", data: new Uint8Array(100).fill(7) },
     ]);
     expect(zip[0]).toBe(0x50); // PK magic
     const md = readZipEntry(zip, "conversation.md");
     expect(new TextDecoder().decode(md)).toContain("L'invocation");
-    const wav = readZipEntry(zip, "audio/23-0.wav");
-    expect([...wav!]).toEqual([1, 2, 3, 4, 5]);
+    const scene = readZipEntry(zip, "images/scene.png");
+    expect([...scene!]).toEqual([1, 2, 3, 4, 5]);
     expect(readZipEntry(zip, "images/pic.png")!.length).toBe(100);
     expect(readZipEntry(zip, "missing.txt")).toBeNull();
   });

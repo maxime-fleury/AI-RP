@@ -10,7 +10,7 @@ describe("features: storage / backup / context budget / img2img request", async 
     const before = await api(routes, "GET", "/api/storage");
     expect(before.status).toBe(200);
     const b0 = await before.json();
-    expect(typeof b0.audioMB).toBe("number");
+    expect(typeof b0.imagesMB).toBe("number");
     expect(Array.isArray(b0.backups)).toBe(true);
 
     const created = await api(routes, "POST", "/api/backup", {});

@@ -37,16 +37,13 @@ describe("presets, scene state & service tests", async () => {
     expect(r2.updatedAt).toBe(1234);
   });
 
-  // first-time ONNX bundle load + a dead LM Studio probe can exceed the 5 s
-  // default under load — give the service test a realistic budget
-  test("POST /api/test probes provider, tts and image without crashing", async () => {
+  test("POST /api/test probes provider and image without crashing", async () => {
     const res = await api(routes, "POST", "/api/test");
     expect(res.status).toBe(200);
     const r = (await res.json()) as any;
     expect(typeof r.provider.provider).toBe("string");
     expect(typeof r.provider.ok).toBe("boolean");
     expect(typeof r.provider.ms).toBe("number");
-    expect(typeof r.tts.ok).toBe("boolean");
     expect(typeof r.image).toBe("object");
     expect("running" in r.image || "ready" in r.image).toBe(true);
   }, 60000);
@@ -111,11 +108,10 @@ describe("branches, backups & coherence check", async () => {
 describe("message meta: favoris & notes privées", async () => {
   const { db, routes } = await loadApp();
 
-  test("meta-only PATCH (bookmark/note) never touches content or audio", async () => {
+  test("meta-only PATCH (bookmark/note) never touches content or segments", async () => {
     const conv = db.createConversation({ title: "Meta" });
     const m = db.createMessage({
       conversation_id: conv.id, role: "assistant", name: "Narrateur", content: "*Texte d'origine.*",
-      audio: JSON.stringify([{ path: `/audio/${conv.id}/1-a.wav` }]),
       meta: JSON.stringify({ suggestions: ["a"] }),
     });
     const res = await api(routes, "PATCH", `/api/conversations/${conv.id}/messages/${m.id}`, { meta: { bookmark: 1, note: "Le joueur ignore le pacte" } });
@@ -123,9 +119,9 @@ describe("message meta: favoris & notes privées", async () => {
     const updated = (await res.json()) as any;
     expect(updated.meta.bookmark).toBe(1);
     expect(updated.meta.note).toBe("Le joueur ignore le pacte");
-    // content + audio untouched, suggestions kept (meta-only update)
+    // content + segments untouched, suggestions kept (meta-only update)
     expect(updated.content).toBe("*Texte d'origine.*");
-    expect(updated.audio).toHaveLength(1);
+    expect(updated.segments).toHaveLength(0);
     expect(updated.meta.suggestions).toEqual(["a"]);
 
     // toggle bookmark off
@@ -225,7 +221,7 @@ describe("world workspace: locations / lorebook / relations / timeline / jobs", 
   });
 
   test("jobs: GET /api/jobs lists persisted jobs with status", async () => {
-    db.createJob({ type: "tts", status: "running", progress: 40, payload: JSON.stringify({ marker: "ws-tts" }) });
+    db.createJob({ type: "summary", status: "running", progress: 40, payload: JSON.stringify({ marker: "ws-sum" }) });
     db.createJob({ type: "image", status: "failed", error: "CUDA OOM", payload: JSON.stringify({ marker: "ws-img" }) });
     const res = await api(routes, "GET", "/api/jobs");
     expect(res.status).toBe(200);
@@ -235,13 +231,13 @@ describe("world workspace: locations / lorebook / relations / timeline / jobs", 
       try { return JSON.parse(j.payload || "{}").marker; } catch { return false; }
     });
     expect(mine.length).toBe(2);
-    expect(mine.map((j: any) => j.type).sort()).toEqual(["image", "tts"]);
+    expect(mine.map((j: any) => j.type).sort()).toEqual(["image", "summary"]);
     const failed = mine.find((j: any) => j.type === "image");
     expect(failed.status).toBe("failed");
     expect(failed.error).toContain("CUDA");
     // status filter returns at least our running job
     const running = (await (await api(routes, "GET", "/api/jobs?status=running")).json()).jobs;
-    expect(running.some((j: any) => j.type === "tts" && j.progress === 40)).toBe(true);
+    expect(running.some((j: any) => j.type === "summary" && j.progress === 40)).toBe(true);
   });
 });
 
@@ -515,15 +511,11 @@ describe("structured memory & provider health", async () => {
     expect(text.indexOf("La route s'ouvre")).toBeLessThan(text.indexOf("Le pacte est scellé")); // chronological
   });
 
-  test("cache endpoints report sizes and purge the audio cache", async () => {
-    const info = await (await api(routes, "GET", "/api/cache")).json();
-    expect(typeof info.audio.files).toBe("number");
-    expect(typeof info.audio.mb).toBe("number");
-    expect(typeof info.imageOrphans.files).toBe("number");
-    const purge = await api(routes, "POST", "/api/cache/purge", { audio: true });
-    expect(purge.status).toBe(200);
-    const r = (await purge.json()) as any;
-    expect(r.ok).toBe(true);
-    expect(typeof r.removed).toBe("number");
+  test("orphan analysis reports image orphans only (no audio cache)", async () => {
+    const res = await api(routes, "POST", "/api/storage/analyze");
+    expect(res.status).toBe(200);
+    const r = (await res.json()) as any;
+    expect(typeof r.orphanCount).toBe("number");
+    expect(r.orphans.every((o: any) => o.kind === "image" || o.kind === "upload")).toBe(true);
   });
 });

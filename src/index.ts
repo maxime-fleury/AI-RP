@@ -1,8 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { handleApi } from "./server/routes";
-import { PUBLIC_DIR, AUDIO_DIR, IMAGES_DIR, UPLOADS_DIR, DATA_DIR, SAMPLES_DIR } from "./server/paths";
-import { warmupTts } from "./tts/service";
+import { PUBLIC_DIR, IMAGES_DIR, UPLOADS_DIR, DATA_DIR } from "./server/paths";
 import { ensureImageServer } from "./server/image";
 import { getSetting, cleanupStaleJobs } from "./server/db";
 import { scheduleDailyBackup } from "./server/backup";
@@ -24,9 +23,6 @@ const MIME: Record<string, string> = {
   ".gif": "image/gif",
   ".svg": "image/svg+xml",
   ".webp": "image/webp",
-  ".wav": "audio/wav",
-  ".mp3": "audio/mpeg",
-  ".ogg": "audio/ogg",
   ".wasm": "application/wasm",
   ".ico": "image/x-icon",
   ".woff2": "font/woff2",
@@ -73,18 +69,8 @@ function handler(req: Request): Response {
   if (p.startsWith("/api/")) return handleApi(req, url);
 
   // static data dirs
-  if (p.startsWith("/audio/")) {
-    const file = serveFile(path.join(AUDIO_DIR, decodeRel(p.slice("/audio/".length))), AUDIO_DIR);
-    if (file) return file;
-    return new Response("not found", { status: 404 });
-  }
   if (p.startsWith("/images/")) {
     const file = serveFile(path.join(IMAGES_DIR, decodeRel(p.slice("/images/".length))), IMAGES_DIR);
-    if (file) return file;
-    return new Response("not found", { status: 404 });
-  }
-  if (p.startsWith("/samples/")) {
-    const file = serveFile(path.join(SAMPLES_DIR, decodeRel(p.slice("/samples/".length))), SAMPLES_DIR);
     if (file) return file;
     return new Response("not found", { status: 404 });
   }
@@ -130,9 +116,6 @@ if (!server) {
 }
 const port = server.port;
 console.log(`🟤 ${NAME} running → http://localhost:${port}`);
-
-// Warm up the TTS in the background so the first voice is ready quickly.
-warmupTts().catch((e) => console.warn("[tts] warmup failed:", e));
 
 // Optional: pre-spawn the Python image sidecar so the first illustration is fast.
 if (getSetting("image_preload", false)) {

@@ -1,6 +1,6 @@
-import { api, apiFetch, readSseStream } from "./api.js?v=36";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=36";
-import { store, refreshAll, navigate, applyTheme } from "./app.js?v=36";
+import { api, apiFetch, readSseStream } from "./api.js?v=37";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=37";
+import { store, refreshAll, navigate, applyTheme } from "./app.js?v=37";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -59,33 +59,6 @@ function paintSelectionBar() {
     closeBtn,
   );
 }
-const audioPrepared = new Set();
-
-// ─── audio queue ──────────────────────────────────────────────────────────────
-// ── global TTS playback queue (pause/resume, volume per voice, current voice) ──
-// items are { url, voice }; volume = global slider × role slider (localStorage)
-const roleVolumeKey = (convId, voice) => `ai-rp-role-vol-${convId}-${voice}`;
-const roleVolume = (convId, voice) => {
-  try {
-    const raw = localStorage.getItem(roleVolumeKey(convId, voice));
-    if (raw != null) { const v = Number(raw); if (v >= 0 && v <= 1) return v; }
-  } catch { /* ignore */ }
-  return 1;
-};
-export function setRoleVolume(convId, voice, v) {
-  try { localStorage.setItem(roleVolumeKey(convId, voice), String(Math.max(0, Math.min(1, v)))); } catch { /* ignore */ }
-}
-export function globalVolume() {
-  try {
-    const raw = localStorage.getItem("ai-rp-global-vol");
-    if (raw != null) { const v = Number(raw); if (v >= 0 && v <= 1) return v; }
-  } catch { /* ignore */ }
-  return 1;
-}
-// UI hook: renderChat wires the floating audio bar here
-let audioUI = { playing: false, paused: false, voice: null, convId: null };
-export function setAudioUI(hook) { audioUI = hook; }
-
 // ── game-master mode (10.A): directives for the next turn only ───────────────
 const DM_RYTHME = ["normal", "rapide", "lent"];
 const DM_STYLES = ["", "Horreur", "Drame", "Action", "Léger & humoristique", "Héroïque", "Émotionnel"];
@@ -105,98 +78,13 @@ async function dmSave(convId, dm, pending) {
   await api(`/api/conversations/${convId}`, { method: "PATCH", body: { settings: cs } });
   conv.settings = JSON.stringify(cs);
 }
-const audioQueue = {
-  items: [],
-  playing: false,
-  paused: false,
-  current: null,
-  currentVoice: null,
-  resolveCurrent: null,
-  gen: 0,
-  async play(urls, convId) {
-    for (const u of urls) this.items.push(u);
-    this.convId = convId;
-    if (!this.playing) await this.pump();
-  },
-  async waitWhilePaused() {
-    while (this.paused && !this.current) await new Promise((r) => setTimeout(r, 150));
-  },
-  async pump() {
-    this.playing = true;
-    audioUI.playing = true;
-    audioUI.paused = false;
-    audioUI.convId = this.convId;
-    audioUI.onchange?.();
-    const myGen = this.gen;
-    while (this.items.length) {
-      await this.waitWhilePaused();
-      if (myGen !== this.gen) break;
-      const item = this.items.shift();
-      const voice = item?.voice ?? null;
-      await new Promise((resolve) => {
-        this.resolveCurrent = resolve;
-        this.currentVoice = voice;
-        audioUI.voice = voice;
-        audioUI.onchange?.();
-        const a = new Audio(item.url);
-        this.current = a;
-        a.volume = globalVolume() * (voice ? roleVolume(this.convId, voice) : 1);
-        const done = () => { if (this.resolveCurrent === resolve) this.resolveCurrent = null; resolve(); };
-        a.onended = done;
-        a.onerror = done;
-        a.play().catch(done);
-      });
-      this.currentVoice = null;
-      if (myGen !== this.gen) break; // stopped mid-play → abandon this pump
-    }
-    if (myGen === this.gen) {
-      this.playing = false;
-      this.current = null;
-      this.currentVoice = null;
-      audioUI.playing = false;
-      audioUI.paused = false;
-      audioUI.voice = null;
-      audioUI.onchange?.();
-    }
-  },
-  pause() {
-    if (!this.playing) return;
-    this.paused = true;
-    audioUI.paused = true;
-    audioUI.onchange?.();
-    if (this.current) { try { this.current.pause(); } catch { /* ignore */ } }
-  },
-  resume() {
-    this.paused = false;
-    audioUI.paused = false;
-    audioUI.onchange?.();
-    if (this.current && this.playing) { this.current.volume = globalVolume() * (this.currentVoice ? roleVolume(this.convId, this.currentVoice) : 1); this.current.play().catch(() => {}); }
-  },
-  togglePause() {
-    if (this.paused) this.resume(); else this.pause();
-  },
-  stop() {
-    this.items = [];
-    this.gen++;
-    this.playing = false;
-    this.paused = false;
-    this.currentVoice = null;
-    if (this.resolveCurrent) { const r = this.resolveCurrent; this.resolveCurrent = null; r(); }
-    if (this.current) { try { this.current.pause(); } catch { /* ignore */ } }
-    audioUI.playing = false;
-    audioUI.paused = false;
-    audioUI.voice = null;
-    audioUI.onchange?.();
-  },
-};
-
 // ─── render ───────────────────────────────────────────────────────────────────
 export async function renderChat(convIdRaw) {
   // support #/chat/new?world=&scenario=
   if (convIdRaw === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=36");
+    const { newGameWizard } = await import("./app.js?v=37");
     newGameWizard(pre);
     return;
   }
@@ -293,7 +181,7 @@ export async function renderChat(convIdRaw) {
       mdBtn.disabled = false;
     }
   } }, "📄");
-  const exportBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Exporter la partie (ZIP : texte + audio + images)", onclick: exportZip }, "⬇");
+  const exportBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Exporter la partie (ZIP : texte + images)", onclick: exportZip }, "⬇");
   const galleryBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Galerie d'illustrations", onclick: openGallery }, "🖼");
   const delBtn = el("button", { class: "btn btn-ghost btn-icon", style: { color: "var(--danger)" }, title: "Archiver cette partie", onclick: deleteConversation }, "🗑");
 
@@ -409,7 +297,32 @@ export async function renderChat(convIdRaw) {
     }
   }
 
-  const header = el("div", { class: "chat-header" }, backBtn, titleBlock, castStrip, groupBtn, sceneBtn, memoryBtn, dmBtn, branchesBtn, validateBtn, bookmarkFilterBtn, selectBtn, copyThreadBtn, mdBtn, searchBtn, galleryBtn, exportBtn, delBtn, settingsBtn);
+  // ── header overflow menu: secondary actions grouped by category ⇣ ──────────
+  // the header keeps only the essentials; everything else lives in a dropdown
+  const menu = el("div", { class: "header-menu", hidden: true, role: "menu" });
+  const closeHeaderMenu = () => { menu.hidden = true; };
+  const menuSection = (title, pairs) => {
+    const items = pairs.map(([b, label]) => {
+      if (!b) return null;
+      const icon = (b.textContent || "›").trim().split(/\s/)[0] || "›";
+      return el("button", { class: "menu-item", role: "menuitem", onclick: (e) => { e.stopPropagation(); closeHeaderMenu(); b.click(); } },
+        el("span", { class: "menu-ico" }, icon),
+        el("span", { class: "menu-lbl" }, label),
+      );
+    }).filter(Boolean);
+    return items.length ? [el("div", { class: "menu-cat" }, title), ...items] : [];
+  };
+  const menuBtn = el("button", { class: "btn btn-ghost btn-icon header-more-btn", title: "Plus d'options", "aria-label": "Plus d'options", onclick: (e) => {
+    e.stopPropagation();
+    menu.hidden = !menu.hidden;
+  } }, "⋮");
+  menu.append(
+    ...menuSection("🎬 Scène & mémoire", [[sceneBtn, "État de la scène"], [memoryBtn, "Mémoire structurée"], [dmBtn, "Directives du maître de jeu"], [branchesBtn, "Variantes"], [validateBtn, "Vérifier la cohérence"]]),
+    ...menuSection("🔎 Fil & sélection", [[searchBtn, "Rechercher"], [bookmarkFilterBtn, "Favoris seulement"], [selectBtn, "Sélectionner plusieurs messages"]]),
+    ...menuSection("📤 Export", [[mdBtn, "Exporter en Markdown"], [copyThreadBtn, "Copier le fil"], [galleryBtn, "Galerie d'illustrations"], [exportBtn, "Exporter en ZIP"]]),
+    ...menuSection("🛠 Partie", [[settingsBtn, "Réglages de la partie"], [delBtn, "Archiver la partie"]]),
+  );
+  const header = el("div", { class: "chat-header" }, backBtn, titleBlock, castStrip, groupBtn, menuBtn, menu);
 
   async function exportZip() {
     exportBtn.disabled = true;
@@ -619,10 +532,6 @@ export async function renderChat(convIdRaw) {
     el("button", { class: "speak-btn", onclick: () => askToSpeak("narrateur") }, "🎙 Narrateur"),
     ...cards.map((c) => el("button", { class: "speak-btn", onclick: () => askToSpeak(c.name) }, "🎙 " + esc(c.name))),
   );
-  const ttsBar = el("div", { class: "tts-bar", hidden: true },
-    el("span", { class: "spinner" }),
-    el("span", {}, "🔊 Préparation des voix en cours…"),
-  );
   // ── auto-validate: non-blocking coherence banner after a turn (opt-in) ──
   let lastFindings = [];
   const coherenceBanner = el("div", { class: "coherence-banner", hidden: true });
@@ -658,36 +567,8 @@ export async function renderChat(convIdRaw) {
   const selectionBar = el("div", { class: "selection-bar", hidden: true });
   selectionBarRef = selectionBar;
 
-  // ── global audio control bar (visible while the TTS queue plays) ──
-  const abVoice = el("span", { class: "ab-voice" });
-  const abPause = el("button", { class: "ab-btn", title: "Pause / Reprendre", "aria-label": "Pause / Reprendre la lecture" }, "⏸");
-  const abVol = el("input", { class: "ab-vol", type: "range", min: 0, max: 1, step: 0.05, value: globalVolume(), title: "Volume", "aria-label": "Volume global" });
-  const abStop = el("button", { class: "ab-btn", title: "Arrêter la lecture", "aria-label": "Arrêter la lecture" }, "⏹");
-  const audioBar = el("div", { class: "audio-bar", hidden: true }, abVoice, abPause, abVol, abStop);
-  abPause.addEventListener("click", () => audioQueue.togglePause());
-  abStop.addEventListener("click", () => { audioQueue.stop(); audioBar.hidden = true; });
-  abVol.addEventListener("input", () => {
-    const v = Number(abVol.value);
-    try { localStorage.setItem("ai-rp-global-vol", String(v)); } catch { /* ignore */ }
-    if (audioQueue.current && audioQueue.playing) {
-      audioQueue.current.volume = v * (audioQueue.currentVoice ? roleVolume(convId, audioQueue.currentVoice) : 1);
-    }
-  });
-  setAudioUI({
-    playing: false,
-    paused: false,
-    voice: null,
-    convId,
-    onchange: () => {
-      if (!audioUI.playing && !audioUI.paused) { audioBar.hidden = true; return; }
-      audioBar.hidden = false;
-      abVoice.textContent = audioUI.voice ? "🔊 " + (audioUI.voice || "…") : "🔊 …";
-      abPause.textContent = audioUI.paused ? "▶" : "⏸";
-      abPause.title = audioUI.paused ? "Reprendre" : "Pause";
-    },
-  });
   selectionExitRef = selectBtn;
-  const composerWrap = el("div", { class: "composer-wrap" }, selectionBar, coherenceBanner, audioBar, ttsBar, slashMenu, speakRow, chipsRow, composer);
+  const composerWrap = el("div", { class: "composer-wrap" }, selectionBar, coherenceBanner, slashMenu, speakRow, chipsRow, composer);
 
   chipsRowRef = chipsRow;
 
@@ -717,29 +598,10 @@ export async function renderChat(convIdRaw) {
   setTimeout(() => textarea.focus(), 80);
 
   currentCtx = { scroll, textarea, sendBtn, stopBtn };
-
-  // background: pre-generate the audio of recent messages so it's ready to listen
-  if (store.settings.tts_enabled !== false && !audioPrepared.has(convId)) {
-    const needAudio = (conv.messages || []).some((m) => m.role === "assistant" && !(m.audio || []).length);
-    if (needAudio) {
-      audioPrepared.add(convId);
-      ttsBar.hidden = false;
-      api(`/api/conversations/${convId}/prepare-audio`, { method: "POST", body: {} })
-        .then((res) => {
-          if (res?.busy) {
-            // another job is already synthesizing — keep the indicator on and
-            // re-sync once it finishes
-            audioPrepared.delete(convId);
-            setTimeout(() => { if (currentConversation?.id === convId && !busy) renderChat(convId); }, 25000);
-            return;
-          }
-          ttsBar.hidden = true;
-          // never re-render mid-stream: it would detach the composer state (stop/busy)
-          if (res?.generated > 0 && currentConversation?.id === convId && !busy) renderChat(convId);
-        })
-        .catch(() => { ttsBar.hidden = true; });
-    }
-  }
+  // close the header menu when clicking anywhere else in the chat
+  chatMain.addEventListener("click", (e) => {
+    if (!e.target.closest(".header-menu, .header-more-btn")) closeHeaderMenu();
+  });
 
   async function send() {
     const raw = textarea.value.trim();
@@ -816,54 +678,58 @@ export async function renderChat(convIdRaw) {
     };
     paintSeg();
 
-    // ── Personnages présents ──
+    // ── Personnages présents (casting de la partie) ──
     let castIds = new Set();
     try { castIds = new Set((JSON.parse(currentConversation.cast || "[]") || []).map(Number)); } catch { /* ignore */ }
-    const castList = el("div", { class: "cast-list" });
-    const paintCast = () => {
-      castList.replaceChildren(...store.cards.map((c) => {
-        const cb = el("input", { type: "checkbox", ...(castIds.has(c.id) ? { checked: "" } : {}) });
-        cb.addEventListener("change", () => {
-          if (cb.checked) castIds.add(c.id); else castIds.delete(c.id);
-          paintCast();
-        });
-        return el("label", { class: "cast-row", title: c.description || undefined },
-          cb,
-          c.avatar ? el("img", { src: c.avatar, class: "avatar avatar-sm" }) : el("div", { class: "avatar avatar-sm", style: { display: "grid", placeItems: "center", fontSize: "12px" } }, "🎭"),
-          el("span", {}, esc(c.name)),
-          cb.checked ? el("small", { class: "on-chip" }, "en scène") : null,
-        );
-      }));
+    const castFilter = el("input", { type: "search", class: "cast-filter", placeholder: "Filtrer…", "aria-label": "Filtrer les personnages" });
+    const castList = el("div", { class: "cast-list" + (store.cards.length > 5 ? " many" : "") });
+    const castCount = el("span", { class: "cast-count" });
+    const paintCastCount = () => {
+      const used = store.cards.filter((c) => castIds.has(c.id)).length;
+      castCount.textContent = used ? `${used} en scène` : "aucun en scène";
     };
+    const paintCast = () => {
+      const q = castFilter.value.trim().toLowerCase();
+      castList.replaceChildren(...store.cards
+        .filter((c) => !q || (c.name || "").toLowerCase().includes(q) || (c.description || "").toLowerCase().includes(q))
+        .map((c) => {
+          const cb = el("input", { type: "checkbox", "aria-label": "En scène : " + c.name, ...(castIds.has(c.id) ? { checked: "" } : {}) });
+          cb.addEventListener("change", () => {
+            if (cb.checked) castIds.add(c.id); else castIds.delete(c.id);
+            paintCastCount();
+            paintCast();
+          });
+          const hue = nameHue(c.name || "?");
+          const avatar = c.avatar
+            ? el("img", { src: c.avatar, class: "avatar avatar-sm", alt: "" })
+            : el("div", { class: "avatar avatar-sm cast-avatar", style: { background: `linear-gradient(135deg, hsl(${hue} 65% 45%), hsl(${(hue + 50) % 360} 75% 26%))` } }, (c.name || "?").charAt(0).toUpperCase());
+          return el("label", { class: "cast-row" + (castIds.has(c.id) ? " on" : ""), title: c.description || c.personality || undefined },
+            cb,
+            avatar,
+            el("span", { class: "cast-main" },
+              el("span", { class: "cast-name" }, esc(c.name)),
+              c.description ? el("small", { class: "cast-sub" }, esc(c.description.length > 64 ? c.description.slice(0, 64) + "…" : c.description)) : null,
+            ),
+          );
+        }));
+    };
+    paintCastCount();
     paintCast();
-    const allBtn = el("button", { class: "chip-btn slim", onclick: () => { castIds = new Set(store.cards.map((c) => c.id)); paintCast(); } }, "Tout");
-    const noneBtn = el("button", { class: "chip-btn slim", onclick: () => { castIds = new Set(); paintCast(); } }, "Aucun");
+    castFilter.addEventListener("input", paintCast);
+    const allBtn = el("button", { class: "chip-btn slim", onclick: () => { castIds = new Set(store.cards.map((c) => c.id)); paintCastCount(); paintCast(); } }, "Tout");
+    const noneBtn = el("button", { class: "chip-btn slim", onclick: () => { castIds = new Set(); paintCastCount(); paintCast(); } }, "Aucun");
     const castBox = el("div", { class: "cast-box" },
       el("div", { class: "cast-head" },
-        el("span", {}, "Personnages en scène"),
-        el("span", { class: "cast-count" }, idText(store.cards, castIds)),
+        el("span", { class: "cast-title" }, "Personnages en scène"),
+        castCount,
       ),
       store.cards.length === 0
-        ? el("p", { style: { color: "var(--text-dim)", fontSize: "12.5px" } }, "Aucune carte — importe des cartes dans l'onglet Cartes.")
-        : el("div", {}, el("div", { class: "cast-tools" }, allBtn, noneBtn), castList),
+        ? el("p", { class: "cast-empty" }, "Aucune carte — importe des cartes dans l'onglet Cartes.")
+        : el("div", { class: "cast-body" },
+            el("div", { class: "cast-tools" }, castFilter, el("div", { class: "cast-tools-btns" }, allBtn, noneBtn)),
+            castList,
+          ),
     );
-
-    // ── Voix (TTS) ──
-    const distinctVoices = [...new Set((currentConversation.messages || []).flatMap((m) => (m.audio || []).map((a) => a.voice).filter(Boolean)))].filter(Boolean);
-    const ttsOn = field("TTS", convSettings.tts_enabled ?? store.settings.tts_enabled !== false, { type: "select", options: [["1", "Activé"], ["0", "Désactivé"]] });
-    const autoplay = field("Lecture auto", convSettings.tts_autoplay ?? store.settings.tts_autoplay !== false, { type: "select", options: [["1", "Oui"], ["0", "Non"]] });
-    const langSel = field("Langue des voix", convSettings.tts_language || store.settings.tts_language || "fr", { type: "select", options: [["fr", "Français"], ["en", "English"]] });
-    const engineSel = field("Moteur de voix", convSettings.tts_engine || store.settings.tts_engine || "pocket", { type: "select", options: [["pocket", "Pocket-TTS"], ["breeze", "Breeze-TTS-2"]] });
-    const narratorSel = field("Voix du narrateur", convSettings.tts_voice_narrateur || store.settings.tts_voice_narrateur || "jean", { type: "select", options: voiceOpts(convSettings.tts_language || store.settings.tts_language || "fr", convSettings.tts_engine || store.settings.tts_engine || "pocket") });
-    const defCharSel = field("Voix des personnages", convSettings.tts_voice_default || store.settings.tts_voice_default || "cosette", { type: "select", options: voiceOpts(convSettings.tts_language || store.settings.tts_language || "fr", convSettings.tts_engine || store.settings.tts_engine || "pocket") });
-    langSel.input.addEventListener("change", () => refreshSelOptions());
-    engineSel.input.addEventListener("change", () => refreshSelOptions());
-    function refreshSelOptions() {
-      for (const sel of [narratorSel.input, defCharSel.input]) {
-        const cur = sel.value;
-        sel.replaceChildren(...voiceOpts(langSel.input.value, engineSel.input.value).map(([v, l]) => el("option", { value: v, ...(v === cur ? { selected: "" } : {}) }, l)));
-      }
-    }
 
     const body = el("div", { class: "conv-settings" },
       el("div", { class: "modal-section" }, "Modèle & génération"),
@@ -879,25 +745,7 @@ export async function renderChat(convIdRaw) {
       )),
       el("div", { class: "modal-section" }, "Personnages en scène"),
       castBox,
-      el("div", { class: "modal-section" }, "Voix (TTS)"),
-      el("div", { class: "row" }, ttsOn.wrap, autoplay.wrap),
-      el("div", { class: "row3" }, langSel.wrap, engineSel.wrap, narratorSel.wrap, defCharSel.wrap),
-      el("div", { class: "vol-grid" },
-        el("div", { class: "vol-head" }, "🎚 Volume par voix (cette partie)"),
-        ...distinctVoices.map((voice) => {
-          const slider = el("input", { type: "range", min: 0, max: 1, step: 0.05, value: roleVolume(convId, voice), title: voice, "aria-label": `Volume ${voice}` });
-          slider.addEventListener("input", () => {
-            setRoleVolume(convId, voice, Number(slider.value));
-            if (audioQueue.currentVoice === voice && audioQueue.current) audioQueue.current.volume = globalVolume() * Number(slider.value);
-          });
-          return el("label", { class: "vol-row" },
-            el("span", { class: "vol-name" }, esc(voice)),
-            slider,
-            el("span", { class: "vol-pct" }, Math.round(Number(slider.value) * 100) + "%"),
-          );
-        }),
-      ),
-      el("p", { class: "modal-note" }, "Ces réglages ne valent que pour cette partie. Les voix du narrateur et des personnages peuvent être redéfinies par carte. L'historique au-delà de la mémoire est résumé automatiquement par le modèle."),
+      el("p", { class: "modal-note" }, "Ces réglages ne valent que pour cette partie. L'historique au-delà de la mémoire est résumé automatiquement par le modèle."),
     );
 
     const cancelBtn = el("button", { class: "btn btn-ghost" }, "Annuler");
@@ -921,12 +769,6 @@ export async function renderChat(convIdRaw) {
           max_tokens: Number(maxTok.input.value),
           context_max_messages: Number(ctxMax.input.value),
           validate_auto: autoValCb.querySelector("input").checked,
-          tts_enabled: ttsOn.input.value === "1",
-          tts_autoplay: autoplay.input.value === "1",
-          tts_language: langSel.input.value,
-          tts_engine: engineSel.input.value,
-          tts_voice_narrateur: narratorSel.input.value,
-          tts_voice_default: defCharSel.input.value,
         };
         await api(`/api/conversations/${convId}`, { method: "PATCH", body: { settings, cast: [...castIds], group_mode: groupMode } });
         store.settings.provider = provider.input.value;
@@ -938,21 +780,6 @@ export async function renderChat(convIdRaw) {
     });
   }
 
-  function idText(cards, ids) {
-    const used = cards.filter((c) => ids.has(c.id)).length;
-    return used ? `${used} en scène` : "aucun";
-  }
-  function voiceOpts(lang, engine) {
-    const seen = new Set();
-    const out = [];
-    for (const v of store.voices || []) {
-      if (v.lang !== lang || seen.has(v.name)) continue;
-      if (engine && v.engine && v.engine !== engine) continue;
-      seen.add(v.name);
-      out.push([v.name, v.label]);
-    }
-    return out;
-  }
 }
 
 // ─── streaming a turn ─────────────────────────────────────────────────────────
@@ -969,16 +796,12 @@ async function doStream(content, opts = {}) {
   // animated dice roll on /dice messages (must be set before renderMessage)
   const userMsg = {
     id: `tmp-${Date.now()}`, role: "user", name: currentConversation.persona?.name || "Moi",
-    content: displayText, segments: [], audio: [], meta: {}, created_at: Date.now(),
+    content: displayText, segments: [], meta: {}, created_at: Date.now(),
     bubbleClass: displayText.startsWith("🎲 ") ? "dice-roll" : undefined,
   };
   scroll.append(renderMessage(userMsg));
 
-  let csTts = {};
-  try { csTts = JSON.parse(currentConversation.settings || "{}"); } catch { /* ignore */ }
-  const ttsEnabled = (csTts.tts_enabled ?? store.settings.tts_enabled !== false) !== false;
-  const autoplay = (csTts.tts_autoplay ?? store.settings.tts_autoplay !== false) !== false;
-  const pending = { id: `pending-${Date.now()}`, role: "assistant", name: "…", content: "", segments: [], audio: [], meta: {}, created_at: Date.now() };
+  const pending = { id: `pending-${Date.now()}`, role: "assistant", name: "…", content: "", segments: [], meta: {}, created_at: Date.now() };
   const pendingNode = renderMessage(pending);
   pendingNode.dataset.pending = "1";
   const bodyEl = pendingNode.querySelector(".body");
@@ -1013,7 +836,6 @@ async function doStream(content, opts = {}) {
 
   abortController = new AbortController();
   let full = "";
-  let lastDoneId = null;
   // throttled incremental rendering: deltas only mark dirty state, a rAF pass
   // (≤ 1 per frame) diffs against what's already on screen and touches only
   // the last block — no full DOM rebuild per delta (long replies stay smooth)
@@ -1068,7 +890,6 @@ async function doStream(content, opts = {}) {
         sfx("chime");
         if (document.hidden) notify("Réponse prête ✨", (currentConversation?.title || "Partie") + " — " + (data.message?.content || "").slice(0, 80));
         const m = data.message;
-        lastDoneId = m.id;
         bodyEl.replaceChildren();
         const segs = m.segments?.length ? m.segments : [];
         for (const s of segs) {
@@ -1076,29 +897,14 @@ async function doStream(content, opts = {}) {
         }
         if (segs.length === 0) bodyEl.append(el("div", {}, formatBody({ type: "text", text: full })));
         pendingNode.dataset.mid = m.id;
-        // replace pending with final markup (keeps audio buttons wiring)
+        // replace pending with final markup
         const node = renderMessage({ ...m, segments: segs });
         pendingNode.replaceWith(node);
         scrollToBottom(scroll);
-        if (autoplay && ttsEnabled) playMessageAudio(m.id);
         // keep the scene-state panel fresh (throttled server-side)
         sceneRefreshHook?.();
         // optional auto-coherence check (opt-in in the party settings, throttled)
         maybeAutoValidate();
-      } else if (event === "tts-status") {
-        // visible "voice being generated" state on the just-finished message
-        const node = lastDoneId ? document.querySelector(`[data-mid="${lastDoneId}"]`) : null;
-        const act = node?.querySelector(".msg-actions");
-        if (act) act.replaceChildren(el("span", { class: "tts-note" }, "🔊 génération de la voix…"));
-      } else if (event === "tts-done") {
-        const { messageId, audio } = data;
-        if (document.hidden) notify("🎙 Voix prête", "L'audio de la réponse est généré.");
-        const node = document.querySelector(`[data-mid="${messageId}"]`);
-        if (node) {
-          const act = node.querySelector(".msg-actions");
-          if (act) act.replaceChildren(messageActions(messageId, audio || []));
-          if (autoplay && ttsEnabled && audio?.length) playMessageAudio(messageId);
-        }
       } else if (event === "suggestions") {
         const { messageId, suggestions } = data;
         if (suggestions?.length) renderChips(suggestions);
@@ -1392,7 +1198,7 @@ async function branchesModal() {
     });
     const openBtn = el("button", { class: "mini-btn", title: "Ouvrir cette branche", onclick: () => { close(); navigate(`#/chat/${b.id}`); } }, ICONS.play);
     const delBtn = el("button", { class: "mini-btn", style: { color: "var(--danger)" }, title: "Supprimer définitivement", onclick: async () => {
-      if (!(await confirmModal({ title: "Supprimer la variante", message: `Supprimer définitivement « ${b.title} » ainsi que ses audio et images ?` }))) return;
+      if (!(await confirmModal({ title: "Supprimer la variante", message: `Supprimer définitivement « ${b.title} » ainsi que ses illustrations ?` }))) return;
       try {
         await api(`/api/conversations/${b.id}/permanent`, { method: "DELETE" });
         data.branches = data.branches.filter((x) => x.id !== b.id);
@@ -1538,9 +1344,7 @@ function renderMessage(m) {
     body.append(el("div", {}, esc(m.content)));
   } else if (segs.length) {
     for (let i = 0; i < segs.length; i++) {
-      const row = el("div", { class: `seg seg-${i}`, title: "Clique pour écouter ce segment" }, formatSegment(segs[i]));
-      row.addEventListener("click", () => playSegment(m, i, row));
-      body.append(row);
+      body.append(el("div", { class: `seg seg-${i}` }, formatSegment(segs[i])));
     }
   } else if (m.content) {
     for (const b of splitBlocks(m.content)) body.append(el("div", {}, formatBody(b)));
@@ -1577,7 +1381,7 @@ function renderMessage(m) {
     bubble.append(illu);
   }
   if (!isMe && m.id && !String(m.id).startsWith("pending")) {
-    bubble.append(el("div", { class: "msg-actions" }, ...messageActions(m.id, m.audio || [])));
+    bubble.append(el("div", { class: "msg-actions" }, ...messageActions(m.id)));
   }
   // private note (visible only to the player, never sent to the model)
   if (m.meta?.note && !String(m.id).startsWith("pending")) {
@@ -1706,10 +1510,8 @@ async function copyText(text, label) {
   toast((label || "Message") + " copié ✓");
 }
 
-function messageActions(messageId, audio) {
-  const real = (audio || []).filter((a) => a.path).length;
+function messageActions(messageId) {
   const m = (currentConversation?.messages || []).find((x) => x.id === messageId) || {};
-  const playBtn = el("button", { class: "mini-btn", onclick: () => playMessageAudio(messageId, playBtn) }, ICONS.voice, real ? `Voix (${real})` : "Voix");
   const favBtn = el("button", { class: "mini-btn" + (m.meta?.bookmark ? " on" : ""), title: m.meta?.bookmark ? "Retirer des favoris" : "Ajouter aux favoris", onclick: async () => {
     try {
       const updated = await api(`/api/conversations/${currentConversation.id}/messages/${messageId}`, { method: "PATCH", body: { meta: { bookmark: m.meta?.bookmark ? 0 : 1 } } });
@@ -1742,14 +1544,8 @@ function messageActions(messageId, audio) {
     } catch (err) { toast(err.message, "err"); }
     finally { illuSel.disabled = false; }
   });
-  const rateSel = el("select", { class: "rate-select", title: "Vitesse de lecture des segments" },
-    el("option", { value: "0.75" }, "0.75×"),
-    el("option", { value: "1", selected: "" }, "1×"),
-    el("option", { value: "1.25" }, "1.25×"),
-  );
-  rateSel.addEventListener("change", () => { segRate = Number(rateSel.value); });
   const retryBtn = el("button", { class: "mini-btn regen-btn", onclick: () => regenerate(messageId) }, ICONS.retry, "Régénérer");
-  return [playBtn, favBtn, noteBtn, copyBtn, illuSel, rateSel, retryBtn];
+  return [favBtn, noteBtn, copyBtn, illuSel, retryBtn];
 }
 
 // private note on a message (stored in meta.note, never sent to the model)
@@ -1774,44 +1570,6 @@ async function noteModal(m) {
   clearBtn.addEventListener("click", () => save(""));
 }
 
-// ─── mini segment player: click one segment to hear it ───────────────────────
-let segRate = 1;
-let segPlaying = null; // { audio, el }
-function stopSeg() {
-  if (segPlaying) {
-    try { segPlaying.audio.pause(); } catch { /* ignore */ }
-    segPlaying.el.classList.remove("playing");
-    segPlaying = null;
-  }
-}
-async function playSegment(m, idx, rowEl) {
-  if (segPlaying && segPlaying.el === rowEl) { stopSeg(); return; }
-  const audio = (m.audio || [])[idx];
-  if (!audio?.path) {
-    // not synthesized yet → generate, swap the message in place, then play
-    toast("Génération de la voix du segment…", "ok", 6000);
-    await api(`/api/conversations/${currentConversation.id}/messages/${m.id}/tts`, { body: {} });
-    const fresh = await api(`/api/conversations/${currentConversation.id}`);
-    const nm = fresh.messages.find((x) => x.id === m.id);
-    if (!nm) return;
-    const i = currentConversation.messages.findIndex((x) => x.id === m.id);
-    if (i >= 0) currentConversation.messages[i] = nm;
-    const node = document.querySelector(`[data-mid="${m.id}"]`);
-    node?.replaceWith(renderMessage(nm));
-    const segEl = document.querySelector(`[data-mid="${m.id}"] .seg-${idx}`);
-    if (segEl && nm.audio?.[idx]?.path) playSegment(nm, idx, segEl);
-    return;
-  }
-  stopSeg();
-  const a = new Audio(audio.path);
-  a.playbackRate = segRate;
-  segPlaying = { audio: a, el: rowEl };
-  rowEl.classList.add("playing");
-  a.onended = () => { rowEl.classList.remove("playing"); if (segPlaying?.audio === a) segPlaying = null; };
-  a.onerror = () => { rowEl.classList.remove("playing"); if (segPlaying?.audio === a) segPlaying = null; };
-  await a.play().catch(() => {});
-}
-
 // keyboard shortcuts from within the chat (see app.js global handler)
 export function chatShortcut(key) {
   if (key === "r") {
@@ -1823,38 +1581,6 @@ export function chatShortcut(key) {
     const ta = document.querySelector(".composer textarea");
     if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
   }
-}
-
-async function playMessageAudio(messageId, btn) {
-  // fetch fresh message (audio may not be cached)
-  const conv = await api(`/api/conversations/${currentConversation.id}`);
-  const msg = conv.messages.find((m) => m.id === messageId);
-  if (!msg) return;
-  let audio = msg.audio || [];
-  let real = audio.filter((a) => a.path);
-  // placeholders only (segments capped by tts_max_segments) → synthesize everything now
-  if ((audio.length && !real.length || !audio.length) && msg.content) {
-    toast("Génération de la voix…", "ok", 6000);
-    const res = await api(`/api/conversations/${currentConversation.id}/messages/${messageId}/tts`, { body: {} });
-    audio = res.audio || [];
-    real = audio.filter((a) => a.path);
-    await refreshAll();
-  }
-  if (!real.length) return toast("Pas de segments vocaux pour ce message.", "err");
-  if (btn) {
-    // toggle: same handler plays and stops (a second listener on the button
-    // would fire both and restart the playback)
-    if (btn.classList.contains("playing")) {
-      audioQueue.stop();
-      btn.classList.remove("playing");
-      btn.textContent = ICONS.voice + ` Voix (${real.length})`;
-      return;
-    }
-    btn.classList.add("playing");
-    btn.textContent = "⏹ Arrêter";
-  }
-  await audioQueue.play(real.map((a) => ({ url: a.path, voice: a.voice || null })), currentConversation.id);
-  if (btn) { btn.classList.remove("playing"); btn.textContent = ICONS.voice + ` Voix (${real.length})`; }
 }
 
 async function regenerate(messageId) {
@@ -1939,7 +1665,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal, field } from "./ui.js?v=36";
+import { openModal, field } from "./ui.js?v=37";
 void applyTheme;
 void fmtTime;
 void currentConversation;

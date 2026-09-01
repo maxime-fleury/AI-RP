@@ -1,6 +1,6 @@
 /**
  * SillyTavern-inspired prompt assembly for roleplay, plus parsing of assistant
- * output into segments (narration / character dialogue) used by the TTS.
+ * output into segments (narration / character dialogue) for display.
  */
 import type { CardRow, ConversationRow, LorebookRow, MessageRow, PersonaRow, ScenarioRow, WorldRow } from "../server/db";
 import { getSetting, activeLorebook } from "../server/db";
@@ -326,7 +326,7 @@ export function estimateTokens(text: string): number {
   return Math.ceil((text.length || 1) / 4);
 }
 
-// ─── Segment parsing (for TTS routing) ────────────────────────────────────────
+// ─── Segment parsing (narration / dialogue split) ─────────────────────────────
 export type SegmentType = "narration" | "dialogue" | "action";
 
 export interface Segment {

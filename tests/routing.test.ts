@@ -90,7 +90,7 @@ describe("routing", async () => {
     expect(db.getConversation(conv.id)!.title).toBe("Avant");
   });
 
-  test("unknown deep routes 404 (image/tts sub-resources don't hit root handlers)", async () => {
+  test("unknown deep routes 404 (removed sub-resources don't hit root handlers)", async () => {
     const conv = db.createConversation({ title: "X" });
     const m = db.createMessage({ conversation_id: conv.id, role: "assistant", content: "*Ok.*" });
     const res = await api(routes, "GET", `/api/conversations/${conv.id}/messages/${m.id}/tts`);

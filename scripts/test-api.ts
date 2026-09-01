@@ -96,9 +96,4 @@ const conv2 = await api(`/api/conversations/${conv.id}`);
 log("messages:", conv2.messages.length);
 log("segments of last msg:", JSON.stringify(conv2.messages[conv2.messages.length - 1].segments?.slice(0, 2)));
 
-// 9. TTS on the last assistant message
-log("synth TTS for last message (this can take a while)…");
-const tts = await api(`/api/conversations/${conv.id}/messages/${conv2.messages[conv2.messages.length - 1].id}/tts`, { body: {} });
-log("tts segments:", tts.audio?.length, tts.audio?.[0]?.voice, tts.audio?.[0]?.lang);
-
 log("✅ API integration test passed");

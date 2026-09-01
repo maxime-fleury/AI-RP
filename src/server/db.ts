@@ -1,8 +1,8 @@
 import { Database } from "bun:sqlite";
 import fs from "node:fs";
-import { DB_PATH, DATA_DIR, AUDIO_DIR, IMAGES_DIR, UPLOADS_DIR } from "./paths";
+import { DB_PATH, DATA_DIR, IMAGES_DIR, UPLOADS_DIR } from "./paths";
 
-for (const d of [DATA_DIR, AUDIO_DIR, IMAGES_DIR, UPLOADS_DIR]) {
+for (const d of [DATA_DIR, IMAGES_DIR, UPLOADS_DIR]) {
   fs.mkdirSync(d, { recursive: true });
 }
 

@@ -10,10 +10,8 @@ dist
 # local data (SQLite DB, audio, images, samples) — generated at runtime
 data/
 
-# models: Koji (4 GB+) and Pocket-TTS weights — not uploaded
+# models: Koji (4 GB+) — not uploaded
 models/
-# …except the Breeze sidecar's models/ — Python source, not weights
-!python/breeze_server/models/
 python/image_server/.venv/
 python/image_server/__pycache__/
 

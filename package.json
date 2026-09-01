@@ -12,8 +12,5 @@
   "devDependencies": {
     "@types/bun": "latest"
   },
-  "dependencies": {
-    "onnxruntime-node": "^1.29.0",
-    "onnxruntime-web": "^1.29.0"
-  }
+  "dependencies": {}
 }

@@ -1,6 +1,6 @@
 /**
  * API router: worlds, scenarios, cards, personas, conversations, chat
- * streaming (SSE), TTS, images and settings.
+ * streaming (SSE), images and settings.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -24,18 +24,12 @@ import { importFile, scanDirectory, sizeLimitFor, type ImportResult } from "./im
 import { getProvider, defaultModelFor, type ChatMessage } from "../llm/providers";
 import { buildMessages, buildSystemPrompt, estimateTokens, parseSegments, fallbackSpeaker, summarizeSystem, presetFromKey, parseMemory, memoryToText, type Segment, type CastContext, type MemoryState } from "../llm/prompt";
 import type { ConversationRow, MessageRow } from "./db";
-import { synthSegments, buildTtsContext, listVoices, warmupTts, warmupSelectedEngine, getVoiceSample } from "../tts/service";
-import { ensureTtsLoaded, synthesize, wavBytes } from "../tts/engine";
-import { synthesizeBreeze, probeBreezeStatus, breezeModelPresent } from "../tts/breeze";
-import { breezeVoiceList, saveBreezeVoices, defaultBreezeVoices } from "../tts/breezeVoices";
 import { generateAndSave, probeImageStatus, ensureImageServer } from "./image";
-import { storageInfo, runBackup, analyzeOrphans, purgeOrphans, cacheInfo, purgeAudioCache } from "./backup";
+import { storageInfo, runBackup, analyzeOrphans, purgeOrphans } from "./backup";
 import { zipFiles } from "./zip";
 import { providerHealth } from "./health";
-import { AUDIO_DIR, IMAGES_DIR, UPLOADS_DIR } from "./paths";
+import { IMAGES_DIR, UPLOADS_DIR } from "./paths";
 import { withCharaChunk, placeholderPng } from "./cardExport";
-
-const preparingAudio = new Set<number>();
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 async function readJson(req: Request): Promise<any> {
@@ -219,7 +213,8 @@ function conversationView(id: number) {
 
 function messageView(m: any) {
   try { m.segments = JSON.parse(m.segments || "[]"); } catch { m.segments = []; }
-  try { m.audio = JSON.parse(m.audio || "[]"); } catch { m.audio = []; }
+  // TTS has been removed — audio data is no longer served
+  delete m.audio;
   try { m.meta = JSON.parse(m.meta || "{}"); } catch { m.meta = {}; }
   return m;
 }
@@ -255,12 +250,10 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     if (method === "GET" && p === "/api/health") {
       return json({
         ok: true,
-        tts: { fr: await ensureTtsLoaded("fr").catch(() => false), en: await ensureTtsLoaded("en").catch(() => false) },
-        breeze: await probeBreezeStatus(),
         image: await probeImageStatus(),
       });
     }
-    // test all services at once (LLM provider, TTS, image sidecar) with latencies
+    // test all services at once (LLM provider, image sidecar) with latencies
     if (p === "/api/test" && method === "POST") {
       const results: Record<string, any> = {};
       const t0 = Date.now();
@@ -272,9 +265,6 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         ms: Date.now() - t0,
         models: Array.isArray(models) ? models.slice(0, 3) : [],
       };
-      const t1 = Date.now();
-      const ttsOk = await ensureTtsLoaded("fr").catch(() => false);
-      results.tts = { ok: ttsOk, ms: Date.now() - t1 };
       results.image = await probeImageStatus();
       return json(results);
     }
@@ -295,18 +285,6 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     // storage / backups
     if (p === "/api/storage" && method === "GET") {
       return json(storageInfo());
-    }
-    // cache: regenerable audio + orphan images, with one-click purge
-    if (p === "/api/cache" && method === "GET") {
-      return json(cacheInfo());
-    }
-    if (p === "/api/cache/purge" && method === "POST") {
-      const body = await readJson(req);
-      if (body.audio) {
-        const r = purgeAudioCache();
-        return json({ ok: true, removed: r.removed, bytes: r.bytes });
-      }
-      return json({ ok: true, removed: 0, bytes: 0 });
     }
     // orphan file analysis (simulation — nothing deleted) + purge
     if (p === "/api/storage/analyze" && method === "POST") {
@@ -336,91 +314,19 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         if (typeof v === "number" || (typeof v === "string" && /^[\d.]+$/.test(v))) {
           const num = Number(v);
           if (k === "context_max_messages" && (num < 2 || num > 200)) continue;
-          if ((k === "tts_lsd_steps" || k === "image_steps") && (num < 1 || num > 50)) continue;
-          if (k === "tts_max_segments" && (num < 1 || num > 50)) continue;
+          if (k === "image_steps" && (num < 1 || num > 50)) continue;
           if (k === "temperature" && (num < 0 || num > 2)) continue;
           if (k === "max_tokens" && (num < 64 || num > 16384)) continue;
           if (k === "image_cfg" && (num < 1 || num > 20)) continue;
         }
-        if (k === "tts_engine" && v !== "pocket" && v !== "breeze") continue;
         setSetting(k, v);
       }
       return json(publicSettings());
-    }
-    if (p === "/api/voices" && method === "GET") {
-      return json({ voices: listVoices() });
-    }
-    // generate (and cache) a short preview clip for a voice; first call is slow
-    if (p === "/api/voices/sample" && method === "GET") {
-      const name = (url.searchParams.get("name") || "").trim();
-      const lang = (url.searchParams.get("lang") === "en" ? "en" : "fr") as "fr" | "en";
-      const engine = url.searchParams.get("engine") === "breeze" ? "breeze" : "pocket";
-      if (!name) return json({ error: "name required" }, 400);
-      const pathUrl = await getVoiceSample(name, lang, engine);
-      return json({ path: pathUrl });
-    }
-    if (p === "/api/tts/warmup" && method === "POST") {
-      const body = await readJson(req).catch(() => ({}));
-      const eng = body.engine === "breeze" || body.engine === "pocket" ? body.engine : undefined;
-      const targetIsBreeze = eng === "breeze" || (eng === undefined && getSetting("tts_engine", "pocket") === "breeze");
-      if (targetIsBreeze) {
-        try {
-          await warmupSelectedEngine();
-        } catch (e) {
-          return json({ ok: false, error: String(e) }, 400);
-        }
-        return json({ ok: true });
-      }
-      await warmupTts();
-      return json({ ok: true });
     }
     // warm up the Python image sidecar (optional, first generation is slow)
     if (p === "/api/images/preload" && method === "POST") {
       const ok = await ensureImageServer();
       return json({ ok });
-    }
-    if (p === "/api/tts/test" && method === "POST") {
-      const body = await readJson(req);
-      const lang = body.lang === "en" ? "en" : "fr";
-      const engine = body.engine === "breeze" ? "breeze" : "pocket";
-      const file = path.join(AUDIO_DIR, `test-${Date.now()}.wav`);
-      if (engine === "breeze") {
-        const text = body.text || "Bonjour, je suis une voix de test pour cette aventure.";
-        const instruction =
-          body.instruction ||
-          (lang === "fr"
-            ? "Une voix claire, chaleureuse et naturelle, au débit posé et agréable."
-            : "A clear, warm, natural voice with a pleasant, calm delivery.");
-        const res = await synthesizeBreeze({ text, instruction, seed: 42 });
-        fs.writeFileSync(file, wavBytes(res.pcm, res.sampleRate));
-        return json({ url: `/audio/${path.basename(file)}`, durationMs: res.durationMs, voice: body.voice, lang, engine });
-      }
-      await ensureTtsLoaded(lang);
-      const res = await synthesize({
-        text: body.text || "Bonjour, je suis une voix de test pour cette aventure.",
-        voice: body.voice || "jean",
-        lang,
-        lsdSteps: Number(body.lsdSteps ?? getSetting("tts_lsd_steps", 4)),
-      });
-      fs.writeFileSync(file, wavBytes(res.pcm, res.sampleRate));
-      return json({ url: `/audio/${path.basename(file)}`, durationMs: res.durationMs, voice: body.voice, lang, engine });
-    }
-
-    // Breeze TTS 2 — sidecar status + editable voice presets
-    if (p === "/api/tts/breeze/status" && method === "GET") {
-      const [modelPresent, status] = await Promise.all([breezeModelPresent(), probeBreezeStatus()]);
-      return json({ modelPresent, ...status });
-    }
-    if (p === "/api/tts/breeze/voices" && method === "GET") {
-      return json({ voices: breezeVoiceList() });
-    }
-    if (p === "/api/tts/breeze/voices" && method === "POST") {
-      const body = await readJson(req);
-      const voices = Array.isArray(body.voices) ? saveBreezeVoices(body.voices) : breezeVoiceList();
-      return json({ voices });
-    }
-    if (p === "/api/tts/breeze/voices/reset" && method === "POST") {
-      return json({ voices: defaultBreezeVoices() });
     }
 
     // import cards — per-file report (importé / doublon / invalide) + limits
@@ -656,7 +562,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       return json(result);
     }
 
-    // async background tasks (TTS / images / summaries): status + history
+    // async background tasks (images / summaries / captions): status + history
     if (p === "/api/jobs" && method === "GET") {
       const status = url.searchParams.get("status") || undefined;
       return json({ jobs: listJobs(status) });
@@ -753,6 +659,17 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         return json(updateCard(card.id, { avatar: `/uploads/avatars/${file}` }), 201);
       }
       return json(createCard(body), 201);
+    }
+    // AI-assisted card creation: idea → chips per field (see cardModal "✨ Aide IA")
+    if (p === "/api/cards/assist" && method === "POST") {
+      const body = await readJson(req);
+      const idea = String(body.idea || "").trim().slice(0, 1500);
+      if (!idea) return json({ error: "Décris d'abord ton idée de personnage." }, 400);
+      console.log(`[cards/assist] ✨ idée : ${idea.replace(/\s+/g, " ").slice(0, 90)}…`);
+      const fields = await generateCardAssist(idea);
+      const hasAny = CARD_ASSIST_FIELDS.some((k) => fields[k].length);
+      if (!hasAny) return json({ error: "Le modèle n'a rien proposé — réessaie ou vérifie ta connexion IA." }, 502);
+      return json({ fields });
     }
     if (parts[1] === "cards" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
@@ -885,18 +802,6 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       }
       const view = conversationView(conv.id);
       // background: pre-generate response suggestions for the opening message
-      let cs: Record<string, unknown> = {};
-      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
-      const ttsOn = Boolean(cs.tts_enabled ?? getSetting("tts_enabled", true));
-      if (opening?.id && ttsOn) {
-        const ctx = buildTtsContext(conv);
-        const segs = parseSegmentsFor(conv, opening.content);
-        if (segs.length) {
-          synthSegments(conv.id, opening.id, segs, ctx).then((audio) => {
-            if (audio.length) updateMessage(opening.id, { audio: JSON.stringify(audio) });
-          }).catch(() => {});
-        }
-      }
       if (opening?.id) {
         generateSuggestions(
           { world: view.world, persona: view.persona, cards: view.cards, scenario: view.scenario, conversation: conv },
@@ -947,17 +852,15 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       updateConversation(conv.id, { archived: 1 });
       return json({ ok: true, archived: true });
     }
-    // permanent delete (trash screen) — drops rows + audio + images
+    // permanent delete (trash screen) — drops rows + images
     if (parts[1] === "conversations" && parts[2] && parts[3] === "permanent" && method === "DELETE") {
       const convId = Number(parts[2]);
       deleteConversation(convId);
-      for (const dir of [path.join(AUDIO_DIR, String(convId)), path.join(IMAGES_DIR, "conversations", String(convId))]) {
-        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
-      }
+      try { fs.rmSync(path.join(IMAGES_DIR, "conversations", String(convId)), { recursive: true, force: true }); } catch { /* ignore */ }
       return json({ ok: true });
     }
     // fork a conversation up to a message — branching: regenerate in a copy,
-    // the original stays intact (audio + images are copied with remapped ids)
+    // the original stays intact (images are copied with remapped ids)
     if (parts[1] === "conversations" && parts[2] && parts[3] === "fork" && method === "POST") {
       const body = await readJson(req);
       const src = getConversation(Number(parts[2]));
@@ -979,36 +882,15 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         parent_id: src.id,
         branch_kind: "alternative",
       });
-      const audioSrcDir = path.join(AUDIO_DIR, String(src.id));
-      const audioDstDir = path.join(AUDIO_DIR, String(fork.id));
       const imgSrcDir = path.join(IMAGES_DIR, "conversations", String(src.id));
       const imgDstDir = path.join(IMAGES_DIR, "conversations", String(fork.id));
       for (const m of srcMsgs) {
         const view = messageView({ ...m });
-        const audio = view.audio as any[];
         const meta = view.meta as any;
         const newMid = createMessage({
           conversation_id: fork.id, role: m.role, name: m.name, content: m.content,
-          segments: m.segments, audio: "[]", meta: "{}",
+          segments: m.segments, meta: "{}",
         }).id;
-        // copy each real wav with a remapped filename (old mid → new mid)
-        const segMap = new Map<string, string>();
-        const newAudio = audio.map((a: any) => {
-          if (!a.path) return a;
-          const file = path.basename(a.path);
-          let dest = segMap.get(file);
-          if (!dest) {
-            dest = `${newMid}-${file.split("-").slice(1).join("-")}`;
-            const srcFile = path.join(audioSrcDir, file);
-            if (fs.existsSync(srcFile)) {
-              fs.mkdirSync(audioDstDir, { recursive: true });
-              fs.copyFileSync(srcFile, path.join(audioDstDir, dest));
-            }
-            segMap.set(file, dest);
-          }
-          return { ...a, path: `/audio/${fork.id}/${dest}` };
-        });
-        updateMessage(newMid, { audio: JSON.stringify(newAudio) });
         // copy the illustration
         if (meta.image) {
           const file = path.basename(meta.image);
@@ -1115,7 +997,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         capSource,
       });
     }
-    // full export of a conversation: markdown + JSON + audio + images, as a ZIP
+    // full export of a conversation: markdown + JSON + images, as a ZIP
     if (parts[1] === "conversations" && parts[2] && parts[3] === "export" && method === "GET") {
       const conv = getConversation(Number(parts[2]));
       if (!conv) return json({ error: "not found" }, 404);
@@ -1136,17 +1018,9 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
           }, null, 2),
         },
       ];
-      const audioDir = path.join(AUDIO_DIR, String(conv.id));
       const imgDir = path.join(IMAGES_DIR, "conversations", String(conv.id));
-      const seenAudio = new Set<string>();
       const seenImg = new Set<string>();
       for (const m of msgs as any[]) {
-        for (const a of m.audio || []) {
-          if (!a.path || seenAudio.has(a.path)) continue;
-          seenAudio.add(a.path);
-          const full = path.join(audioDir, path.basename(a.path));
-          if (fs.existsSync(full)) files.push({ path: `audio/${m.id}-${path.basename(a.path)}`, data: new Uint8Array(fs.readFileSync(full)) });
-        }
         if (m.meta?.image && !seenImg.has(m.meta.image)) {
           seenImg.add(m.meta.image);
           const full = path.join(imgDir, path.basename(m.meta.image));
@@ -1340,7 +1214,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const conv = getConversation(convId);
       if (!conv || !m) return json({ error: "not found" }, 404);
       const meta = JSON.parse(m.meta || "{}");
-      // meta-only updates (favoris, notes privées…) never touch content/audio
+      // meta-only updates (favoris, notes privées…) never touch content
       if (body.meta && typeof body.meta === "object" && !Array.isArray(body.meta)) {
         Object.assign(meta, body.meta);
         updateMessage(mid, { meta: JSON.stringify(meta) });
@@ -1354,8 +1228,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       if (m.role === "assistant") {
         updates.segments = JSON.stringify(parseSegmentsFor(conv, content));
       }
-      // content changed → the old audio + response suggestions no longer match
-      updates.audio = "[]";
+      // content changed → the old response suggestions no longer match
       delete meta.suggestions;
       updates.meta = JSON.stringify(meta);
       updateMessage(mid, updates);
@@ -1369,13 +1242,6 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const idx = msgs.findIndex((m) => m.id === mid);
       if (idx < 0) return json({ error: "message not found" }, 404);
       for (const m of msgs.slice(idx)) {
-        // also drop the synthesized audio files from disk
-        try {
-          const dir = path.join(AUDIO_DIR, String(convId));
-          for (const f of fs.readdirSync(dir)) {
-            if (f.startsWith(`${m.id}-`) && f.endsWith(".wav")) fs.rmSync(path.join(dir, f), { force: true });
-          }
-        } catch { /* no audio dir */ }
         deleteMessage(m.id);
       }
       const last = lastMessageOf(convId);
@@ -1390,13 +1256,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const body = await readJson(req);
       const ids = Array.isArray(body.ids) ? body.ids.map(Number).filter(Boolean) : [];
       if (!ids.length) return json({ error: "aucun message sélectionné" }, 400);
-      const dir = path.join(AUDIO_DIR, String(convId));
       for (const mid of ids) {
-        try {
-          for (const f of fs.readdirSync(dir)) {
-            if (f.startsWith(`${mid}-`) && f.endsWith(".wav")) fs.rmSync(path.join(dir, f), { force: true });
-          }
-        } catch { /* no audio dir */ }
         deleteMessage(mid);
       }
       const last = lastMessageOf(convId);
@@ -1422,40 +1282,6 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     // stream a chat turn
     if (parts[1] === "conversations" && parts[2] && parts[3] === "stream" && method === "POST") {
       return handleStream(req, Number(parts[2]));
-    }
-    // TTS for a conversation (all missing segments) or one message
-    if (parts[1] === "conversations" && parts[2] && parts[3] === "tts" && method === "POST") {
-      const convId = Number(parts[2]);
-      const conv = getConversation(convId);
-      if (!conv) return json({ error: "not found" }, 404);
-      let cs: Record<string, unknown> = {};
-      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
-      const ttsEnabled = Boolean(cs.tts_enabled ?? getSetting("tts_enabled", true));
-      if (!ttsEnabled) return json({ error: "TTS désactivé" }, 400);
-      const ctx = buildTtsContext(conv);
-      const results: Record<number, any[]> = {};
-      for (const m of listMessages(convId)) {
-        if (m.role === "user") continue;
-        const segs = parseSegmentsFor(conv, m.content);
-        if (!segs.length) continue;
-        const existing = messageView(m).audio;
-        const audio = await synthSegments(convId, m.id, segs, ctx, existing);
-        updateMessage(m.id, { audio: JSON.stringify(audio) });
-        results[m.id] = audio;
-      }
-      return json({ audio: results });
-    }
-    if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] && parts[5] === "tts" && method === "POST") {
-      const convId = Number(parts[2]);
-      const mid = Number(parts[4]);
-      const conv = getConversation(convId);
-      const m = getMessage(mid);
-      if (!conv || !m) return json({ error: "not found" }, 404);
-      const ctx = buildTtsContext(conv);
-      const segs = parseSegmentsFor(conv, m.content);
-      const audio = await synthSegments(convId, mid, segs, ctx, messageView(m).audio, { forceAll: true });
-      updateMessage(mid, { audio: JSON.stringify(audio) });
-      return json({ audio });
     }
     // scene illustration for a message (kind: auto | landscape | portrait)
     if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] && parts[5] === "image" && method === "POST") {
@@ -1521,41 +1347,6 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const meta = { ...messageView(m).meta, image: res.url, image_seed: res.seed, image_kind: kind, image_char: char?.name ?? undefined };
       updateMessage(mid, { meta: JSON.stringify(meta) });
       return json({ image: res.url, seed: res.seed, kind, character: char?.name ?? null });
-    }
-
-    // pre-generate missing TTS audio for the recent assistant messages
-    if (parts[1] === "conversations" && parts[2] && parts[3] === "prepare-audio" && method === "POST") {
-      const conv = getConversation(Number(parts[2]));
-      if (!conv) return json({ error: "not found" }, 404);
-      if (preparingAudio.has(conv.id)) return json({ busy: true, generated: 0, remaining: 0 });
-      preparingAudio.add(conv.id);
-      const job = createJob({ type: "tts", status: "running", progress: 0, conversation_id: conv.id, payload: JSON.stringify({ kind: "prepare-audio" }) });
-      try {
-        const msgs = listMessages(conv.id).filter((m) => {
-          if (m.role !== "assistant") return false;
-          try { return (JSON.parse(m.audio || "[]") as unknown[]).length === 0; } catch { return true; }
-        });
-        const recent = msgs.slice(-8);
-        const ctx = buildTtsContext(conv);
-        let generated = 0;
-        for (const m of recent) {
-          const segs = parseSegmentsFor(conv, m.content);
-          if (!segs.length) continue;
-          const audio = await synthSegments(conv.id, m.id, segs, ctx);
-          if (audio.length) {
-            updateMessage(m.id, { audio: JSON.stringify(audio) });
-            generated++;
-          }
-          updateJob(job.id, { progress: recent.length ? Math.round((generated / recent.length) * 100) : 100 });
-        }
-        updateJob(job.id, { status: "done", progress: 100, completed_at: Date.now() });
-        return json({ generated, remaining: Math.max(0, msgs.length - recent.length) });
-      } catch (e: any) {
-        updateJob(job.id, { status: "failed", error: String(e?.message ?? e).slice(0, 300), completed_at: Date.now() });
-        return json({ error: String(e?.message ?? e) }, 500);
-      } finally {
-        preparingAudio.delete(conv.id);
-      }
     }
 
     // (re)generate response suggestions for the last assistant message
@@ -1636,7 +1427,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
           createMessage({
             conversation_id: conv.id, role: m.role ?? "assistant", name: m.name ?? "",
             content: m.content ?? "", segments: JSON.stringify(m.segments ?? "[]"),
-            audio: "[]", meta: JSON.stringify(m.meta ?? {}),
+            meta: JSON.stringify(m.meta ?? {}),
           });
         }
         conversations++;
@@ -1829,6 +1620,98 @@ function parseSuggestions(text: string): string[] {
     if (out.length >= 5) break;
   }
   return out;
+}
+
+// ─── AI-assisted card creation ────────────────────────────────────────────────
+// The player describes a character idea in plain words; the model proposes
+// several chips per field (name, description…) so the player picks favorites.
+const CARD_ASSIST_FIELDS = ["name", "description", "personality", "scenario", "first_mes", "mes_example", "tags"] as const;
+type CardAssistFields = Record<(typeof CARD_ASSIST_FIELDS)[number], string[]>;
+
+async function generateCardAssist(idea: string): Promise<CardAssistFields> {
+  const empty = Object.fromEntries(CARD_ASSIST_FIELDS.map((k) => [k, []])) as CardAssistFields;
+  const provider = getProvider();
+  let model = defaultModelFor(provider.id);
+  if (!model) {
+    const models = await provider.models();
+    model = models[0] ?? "";
+  }
+  const fmt = JSON.stringify(Object.fromEntries(CARD_ASSIST_FIELDS.map((k) => [k, []])));
+  const sys = [
+    "Tu aides à créer des cartes de personnages de roleplay.",
+    "L'utilisateur décrit une idée brute — propose des alternatives (chips) pour chaque champ de la carte.",
+    `Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : ${fmt}.`,
+    "Contraintes : name → 3 noms courts ; description → 2 phrases autonomes ; personality → 2 blocs de traits ; scenario → 2 situations de départ ; first_mes → 2 premiers messages courts, à la première personne ; mes_example → 1 ou 2 exemples de dialogue au format « Nom : réplique » ; tags → 4 ou 5 tags sans # (une liste d'un seul élément = une chaîne). Tout en français, cohérent avec l'idée. JSON complet, non tronqué.",
+  ].join(" ");
+  let text = "";
+  try {
+    text = await provider.complete({
+      messages: [{ role: "system", content: sys }, { role: "user", content: `Idée du joueur : ${idea}` }],
+      model,
+      temperature: 1.0,
+      maxTokens: 2400,
+      noThinking: true,
+      signal: AbortSignal.timeout(180_000),
+    });
+  } catch (e) {
+    console.warn("[cards/assist] complete failed:", String(e?.message ?? e).slice(0, 200));
+    return empty;
+  }
+  const out = { ...empty };
+  try {
+    const parsed = parseCardAssistJson(text || "");
+    if (!parsed) return empty;
+    for (const k of CARD_ASSIST_FIELDS) {
+      const v = parsed[k];
+      const items = (Array.isArray(v) ? v : [v])
+        .map((x) => String(x ?? "").replace(/^["'«\s]+|["'»\s]+$/g, "").trim())
+        .filter((s) => s.length >= 2 && s.length <= 900);
+      out[k] = items.slice(0, k === "tags" ? 6 : 4);
+    }
+  } catch (e) {
+    console.warn("[cards/assist] JSON invalide:", String(e?.message ?? e).slice(0, 120));
+  }
+  return out;
+}
+
+/** Extract + parse the first balanced JSON object — robust to prose around it,
+ * braces inside strings and raw newlines in string values (models cheat). */
+function parseCardAssistJson(text: string): Record<string, unknown> | null {
+  const raw = String(text).replace(/```[a-zA-Z]*\n?/g, "");
+  try {
+    // fast path: whole text is valid JSON
+    return JSON.parse(raw);
+  } catch { /* fall through */ }
+  // find the outermost balanced {...} block, ignoring braces inside strings
+  let start = -1;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === "{") { if (start < 0) start = i; depth++; }
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        const block = raw.slice(start, i + 1);
+        try { return JSON.parse(block); } catch { /* try lenient below */ }
+        try {
+          // sanitize: collapse raw newlines inside string values, drop trailing commas
+          const cleaned = block.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"/gs, (m, inner) => '"' + inner.replace(/[\r\n\t]+/g, " ") + '"').replace(/,([\s]*[}\]])/g, "$1");
+          return JSON.parse(cleaned);
+        } catch { /* not JSON */ }
+        return null;
+      }
+    }
+  }
+  return null;
 }
 
 // ─── context window management ────────────────────────────────────────────────
@@ -2135,7 +2018,13 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
   const model = (settings.model as string) || defaultModelFor(provider.id);
   const temperature = Number(settings.temperature ?? preset?.temperature ?? getSetting("temperature", 0.9));
   const maxTokens = Number(settings.max_tokens ?? preset?.maxTokens ?? getSetting("max_tokens", 2048));
-  const ttsEnabled = Boolean(settings.tts_enabled ?? getSetting("tts_enabled", true));
+
+  // server-side trace of every generation (see the console while playing)
+  const genLabel = (userText || directive || content || "").replace(/\s+/g, " ").trim().slice(0, 90);
+  const genStart = Date.now();
+  console.log(`\n[chat] ▶  Génération lancée — partie #${convId} « ${conv.title || "sans titre"} »`);
+  console.log(`[chat]    message : ${genLabel || "(directive)"}`);
+  console.log(`[chat]    modèle : ${provider.id} / ${model || "défaut"} · temp ${temperature} · max ${maxTokens} tokens`);
 
   // hard timeout: a stuck model must not leave the UI on "…" forever
   const timeoutSec = Math.max(20, Number(getSetting("llm_timeout", 150)));
@@ -2175,6 +2064,8 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
         }
       }
       clearTimeout(llmTimer);
+      const genSecs = ((Date.now() - genStart) / 1000).toFixed(1);
+      console.log(`[chat] ✔  Réponse générée en ${genSecs}s — ${full.trim().length} caractères, ${Math.max(1, Math.round(estimateTokens(full) / 100) * 100)} tokens ≈`);
       if (!full.trim()) {
         // try to get the model list for a nicer error
         const models = await provider.models().catch(() => []);
@@ -2204,26 +2095,13 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
         updateConversation(convId, { settings: JSON.stringify({ ...settings, dm_pending: false }) });
       }
       send("done", { message: messageView(assistant) });
-      // suggestions run in parallel with the (slow) TTS synthesis — the local
-      // model accepts concurrent requests
+      console.log(`[chat] 📨  Réponse #${assistant.id} envoyée au client — suggestions en arrière-plan…`);
+      // suggestions run in the background — the local model accepts concurrent
+      // requests
       const suggPromise = generateSuggestions(
         { world, persona, cards, scenario, conversation: conv },
         listMessages(convId),
       );
-      if (ttsEnabled) {
-        send("tts-status", { status: "generating" });
-        const ctx = buildTtsContext(conv);
-        // keep the SSE connection alive while the (slow) synthesis runs — Bun's
-        // idleTimeout would otherwise kill the stream mid-synthesis
-        const keepAlive = setInterval(() => send("keepalive", { t: Date.now() }), 25000);
-        try {
-          const audio = await synthSegments(convId, assistant.id, segments, ctx);
-          updateMessage(assistant.id, { audio: JSON.stringify(audio) });
-          send("tts-done", { messageId: assistant.id, audio });
-        } finally {
-          clearInterval(keepAlive);
-        }
-      }
       const sugg = await suggPromise;
       if (sugg.length) {
         const m2 = getMessage(assistant.id)!;
@@ -2234,15 +2112,10 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
     } catch (e: any) {
       const aborted = e?.name === "AbortError" || e?.name === "TimeoutError" || /abort/i.test(String(e));
       if (assistantCreated) {
-        // the reply was already committed — a post-done failure (TTS synthesis
-        // or suggestions on a stream the client already closed) must NOT
-        // remove the user turn: the exchange is complete
+        // the reply was already committed — a post-done failure (suggestions on
+        // a stream the client already closed) must NOT remove the user turn
         try {
-          send("error", {
-            message: aborted
-              ? `La réponse est là mais l'audio n'a pas pu être généré (${timeoutSec} s).`
-              : String(e?.message ?? e),
-          });
+          send("error", { message: String(e?.message ?? e) });
         } catch { /* stream already closed */ }
       } else if (aborted && clientStopped) {
         // user pressed Stop: commit whatever the model already wrote, then
@@ -2260,6 +2133,7 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
           deleteMessage(userMsg.id);
         }
       } else {
+        console.log(`[chat] ✖  Échec après ${((Date.now() - genStart) / 1000).toFixed(1)}s — ${String(e?.message ?? e).slice(0, 160)}`);
         send("error", {
           message: aborted
             ? `Le modèle n'a pas répondu dans le délai de ${timeoutSec} s (il est peut-être en train de charger). Réessaie, ou augmente le timeout dans les réglages.`

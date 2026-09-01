@@ -7,7 +7,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { DATA_DIR, AUDIO_DIR, IMAGES_DIR, UPLOADS_DIR, DB_PATH } from "./paths";
+import { DATA_DIR, IMAGES_DIR, UPLOADS_DIR, DB_PATH } from "./paths";
 import { db, listConversations, listMessages, listWorlds, listCards, listPersonas } from "./db";
 
 const BACKUPS_DIR = path.join(DATA_DIR, "backups");
@@ -38,7 +38,6 @@ export function storageInfo() {
     })
     .sort((a, b) => b.date.localeCompare(a.date));
   return {
-    audioMB: +(dirSize(AUDIO_DIR) / 1e6).toFixed(1),
     imagesMB: +(dirSize(IMAGES_DIR) / 1e6).toFixed(1),
     uploadsMB: +(dirSize(UPLOADS_DIR) / 1e6).toFixed(1),
     dbMB: +(dirSize(DB_PATH) / 1e6).toFixed(1),
@@ -48,15 +47,15 @@ export function storageInfo() {
 
 // ─── orphan file analysis & purge (Réglages → Stockage) ─────────────────────
 export interface OrphanFile {
-  path: string; // URL-style path (/audio/…, /images/…, /uploads/…)
+  path: string; // URL-style path (/images/…, /uploads/…)
   file: string;
   size: number;
-  kind: "audio" | "image" | "upload";
+  kind: "image" | "upload";
 }
 
 /**
  * Scan the media dirs for files not referenced by any row in the DB
- * (deleted messages, replaced avatars, regenerated audio, test clips…).
+ * (deleted messages, replaced avatars, test clips…).
  * Pure analysis — nothing is deleted here (the "simulation" step).
  */
 export function analyzeOrphans(): { orphans: OrphanFile[]; orphanCount: number; totalMB: number } {
@@ -64,9 +63,6 @@ export function analyzeOrphans(): { orphans: OrphanFile[]; orphanCount: number; 
   const norm = (p: string) => (p.startsWith("/") ? p : "/" + p);
   for (const c of listConversations()) {
     for (const m of listMessages(c.id)) {
-      try {
-        for (const a of JSON.parse(m.audio || "[]") as any[]) if (a?.path) referenced.add(norm(String(a.path)));
-      } catch { /* ignore */ }
       try {
         const meta = JSON.parse(m.meta || "{}") as any;
         if (meta?.image) referenced.add(norm(String(meta.image)));
@@ -98,7 +94,6 @@ export function analyzeOrphans(): { orphans: OrphanFile[]; orphanCount: number; 
     };
     walk(root);
   };
-  scan(AUDIO_DIR, "/audio/", "audio");
   scan(IMAGES_DIR, "/images/", "image");
   scan(UPLOADS_DIR, "/uploads/", "upload");
   orphans.sort((a, b) => b.size - a.size);
@@ -113,8 +108,7 @@ export function purgeOrphans(files: string[]): { removed: number; bytes: number 
   for (const url of files) {
     let root: string;
     let rel: string;
-    if (url.startsWith("/audio/")) { root = AUDIO_DIR; rel = url.slice("/audio/".length); }
-    else if (url.startsWith("/images/")) { root = IMAGES_DIR; rel = url.slice("/images/".length); }
+    if (url.startsWith("/images/")) { root = IMAGES_DIR; rel = url.slice("/images/".length); }
     else if (url.startsWith("/uploads/")) { root = UPLOADS_DIR; rel = url.slice("/uploads/".length); }
     else continue;
     const resolved = path.resolve(root, rel);
@@ -127,50 +121,6 @@ export function purgeOrphans(files: string[]): { removed: number; bytes: number 
       removed++;
     } catch { /* already gone */ }
   }
-  return { removed, bytes };
-}
-
-// ─── cache analysis & purge (Réglages → Stockage) ────────────────────────────
-// Audio cache = every generated .wav (fully regenerable from message text — safe
-// to delete). Images are NOT regenerable, so only unreferenced ones are offered.
-export function cacheInfo(): { audio: { files: number; mb: number }; imageOrphans: { files: number; mb: number } } {
-  let audioFiles = 0;
-  let audioBytes = 0;
-  if (fs.existsSync(AUDIO_DIR)) {
-    const walk = (dir: string) => {
-      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-        const full = path.join(dir, e.name);
-        if (e.isDirectory()) walk(full);
-        else if (e.isFile() && e.name.endsWith(".wav")) {
-          try { const st = fs.statSync(full); audioFiles++; audioBytes += st.size; } catch { /* ignore */ }
-        }
-      }
-    };
-    walk(AUDIO_DIR);
-  }
-  const imgOrphans = analyzeOrphans().orphans.filter((o) => o.kind === "image");
-  const imgBytes = imgOrphans.reduce((a, o) => a + o.size, 0);
-  return {
-    audio: { files: audioFiles, mb: +(audioBytes / 1e6).toFixed(1) },
-    imageOrphans: { files: imgOrphans.length, mb: +(imgBytes / 1e6).toFixed(1) },
-  };
-}
-
-/** Delete every generated .wav (regenerated on demand from message text). */
-export function purgeAudioCache(): { removed: number; bytes: number } {
-  let removed = 0;
-  let bytes = 0;
-  if (!fs.existsSync(AUDIO_DIR)) return { removed, bytes };
-  const walk = (dir: string) => {
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) walk(full);
-      else if (e.isFile() && e.name.endsWith(".wav")) {
-        try { const st = fs.statSync(full); fs.unlinkSync(full); removed++; bytes += st.size; } catch { /* ignore */ }
-      }
-    }
-  };
-  walk(AUDIO_DIR);
   return { removed, bytes };
 }
 

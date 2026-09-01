@@ -1,6 +1,6 @@
-import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=36";
-import { el, esc, toast, actionToast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=36";
-import { renderChat } from "./chat.js?v=36";
+import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=37";
+import { el, esc, toast, actionToast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=37";
+import { renderChat } from "./chat.js?v=37";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -9,22 +9,20 @@ export const store = {
   cards: [],
   personas: [],
   conversations: [],
-  voices: [],
   loaded: false,
 };
 
 export async function refreshAll() {
-  const [s, w, c, p, conv, v] = await Promise.all([
+  const [s, w, c, p, conv] = await Promise.all([
     api("/api/settings"),
     api("/api/worlds"),
     api("/api/cards"),
     api("/api/personas"),
     api("/api/conversations"),
-    api("/api/voices"),
   ]);
   Object.assign(store, {
     settings: s, worlds: w.worlds || [], cards: c.cards || [],
-    personas: p.personas || [], conversations: conv.conversations || [], voices: v.voices || [],
+    personas: p.personas || [], conversations: conv.conversations || [],
     loaded: true,
   });
   return store;
@@ -46,10 +44,6 @@ export async function refreshCards() {
 export async function refreshPersonas() {
   const p = await api("/api/personas");
   store.personas = p.personas || [];
-}
-export async function refreshVoices() {
-  const v = await api("/api/voices");
-  store.voices = v.voices || [];
 }
 /** Update a single conversation in place (e.g. after PATCH). */
 export async function refreshConversation(id) {
@@ -128,10 +122,6 @@ function renderSidebar(active) {
   );
   const status = el("div", { class: "side-status" },
     el("div", { class: "status-row" },
-      el("span", { class: `dot ${ttsDot()}` }),
-      el("span", {}, "TTS " + (store.settings.tts_enabled === false ? "off" : "on")),
-    ),
-    el("div", { class: "status-row" },
       el("span", { class: `dot ${providerDot()}` }),
       el("span", {}, providerLabel()),
     ),
@@ -167,7 +157,6 @@ function toggleSidebar() {
   renderSidebar(currentSection);
 }
 
-function ttsDot() { return store.settings.tts_enabled === false ? "" : "ok"; }
 function providerDot() {
   const p = store.settings.provider;
   if (p === "openrouter") return store.settings.openrouter_key ? "ok" : "";
@@ -340,7 +329,7 @@ function shortcutsHelp() {
 }
 let shortcutCapturing = false; // set while the settings editor awaits a keypress
 function fireShortcut(k) {
-  import("./chat.js?v=36").then((m) => m.chatShortcut(k)).catch(() => {});
+  import("./chat.js?v=37").then((m) => m.chatShortcut(k)).catch(() => {});
 }
 document.addEventListener("keydown", (e) => {
   if (shortcutCapturing) return; // the settings key-capture owns this press
@@ -478,7 +467,7 @@ function renderDashboard() {
     el("div", { class: "hero" + (banner ? " hero-banner" : ""), style: banner ? { backgroundImage: `url(${banner})` } : null },
       el("div", { class: "hero-inner" },
         el("h2", {}, "Bienvenue, aventurier. ✨"),
-        el("p", {}, "Crée des mondes, importe des personnages (cartes SillyTavern), définis tes scénarios isekai et laisse l'IA raconter l'histoire — avec des voix différentes pour chaque personnage."),
+        el("p", {}, "Crée des mondes, importe des personnages (cartes SillyTavern), définis tes scénarios isekai et laisse l'IA raconter l'histoire à tes côtés."),
         el("div", { class: "cta-row" },
           el("button", { class: "btn btn-primary", onclick: newGameWizard }, ICONS.plus, "Nouvelle partie"),
           el("a", { href: "#/worlds", class: "btn btn-ghost" }, ICONS.worlds, "Explorer les mondes"),
@@ -516,12 +505,12 @@ function onboardingPanel() {
   const check = () => {
     api("/api/health")
       .then((h) => {
-        const ok = h?.tts?.fr || h?.tts?.en;
+        const ok = h?.ok === true;
         modelLine.replaceChildren(
           el("span", { class: "dot", style: { background: ok ? "var(--ok, #2ecc71)" : "var(--warn, #f1c40f)" } }),
           el("span", {}, ok
-            ? "IA locale détectée — le TTS est prêt. Tu peux commencer !"
-            : "TTS en cours de chargement (10-20 s la 1re fois) — ça se passe en arrière-plan."),
+            ? "Service d'images prêt. Tu peux commencer !"
+            : "Le service d'images se charge en arrière-plan — tu peux déjà jouer."),
         );
       })
       .catch((e) => {
@@ -532,7 +521,7 @@ function onboardingPanel() {
         );
       });
     api("/api/storage").then((st) => {
-      imgLine.textContent = `Stockage actuel : ${((st.audioMB || 0) + (st.imagesMB || 0)).toFixed(1)} Mo d'audio/images générés, ${st.backups?.length ?? 0} backup(s) auto.`;
+      imgLine.textContent = `Stockage actuel : ${((st.imagesMB || 0)).toFixed(1)} Mo d'illustrations générées, ${st.backups?.length ?? 0} backup(s) auto.`;
     }).catch(() => {});
   };
   check();
@@ -552,7 +541,7 @@ function onboardingPanel() {
     el("div", { class: "onb-steps" },
       step(1, "L'IA", "LM Studio local ou OpenRouter, configuré dans les Réglages."),
       step(2, "Ton monde", "Un monde = un cadre, son histoire, des scénarios multiples (mystère, romance, PVP…)."),
-      step(3, "Le casting", "Importe des cartes SillyTavern (.png) ou crée tes personnages — chacun avec sa voix TTS."),
+      step(3, "Le casting", "Importe des cartes SillyTavern (.png) ou crée tes personnages — avec l'aide de l'IA si tu veux."),
     ),
     el("div", { class: "onb-status" }, modelLine, imgLine),
     el("div", { class: "onb-cta" },
@@ -583,7 +572,7 @@ function trashCard(c) {
           renderDashboard();
         } }, "↩ Restaurer"),
         el("button", { class: "mini-btn", style: { color: "var(--danger)" }, onclick: async () => {
-          if (await confirmModal({ title: "Supprimer définitivement", message: `Tout sera perdu (messages, audio, images) : « ${c.title} » ?`, confirmLabel: "Supprimer" })) {
+          if (await confirmModal({ title: "Supprimer définitivement", message: `Tout sera perdu (messages, images) : « ${c.title} » ?`, confirmLabel: "Supprimer" })) {
             await api(`/api/conversations/${c.id}/permanent`, { method: "DELETE" });
             await refreshAll();
             renderDashboard();
@@ -1347,7 +1336,7 @@ async function renderBranchGraph(id) {
         el("button", { class: "mini-btn", title: "Ouvrir cette branche", onclick: () => navigate(`#/chat/${b.id}`) }, ICONS.play, "Ouvrir"),
         kindSel(b),
         el("button", { class: "mini-btn", style: { color: "var(--danger)" }, title: "Supprimer définitivement", "aria-label": "Supprimer", onclick: async () => {
-          if (!(await confirmModal({ title: "Supprimer la variante", message: `Supprimer définitivement « ${b.title} » ainsi que ses audio et images ?` }))) return;
+          if (!(await confirmModal({ title: "Supprimer la variante", message: `Supprimer définitivement « ${b.title} » ainsi que ses illustrations ?` }))) return;
           try {
             await api(`/api/conversations/${b.id}/permanent`, { method: "DELETE" });
             toast("Branche supprimée ✓");
@@ -1499,7 +1488,7 @@ async function renderCards() {
     el("div", { class: "page-head" },
       el("div", {},
         el("h2", {}, "🎭 Cartes"),
-        el("div", { class: "sub" }, "Tes personnages importés (cartes SillyTavern V1/V2) ou créés à la main, avec leur propre voix et langue."),
+        el("div", { class: "sub" }, "Tes personnages importés (cartes SillyTavern V1/V2) ou créés à la main — avec l'aide de l'IA si tu veux."),
       ),
       newBtn,
       scanBtn,
@@ -1582,10 +1571,6 @@ function cardTile(card) {
       card.avatar ? el("img", { src: card.avatar, class: "avatar avatar-lg" }) : el("div", { class: "avatar avatar-lg", style: { display: "grid", placeItems: "center", fontSize: "22px" } }, "🎭"),
       el("div", { style: { minWidth: 0 } },
         el("h3", { style: { fontSize: "16px" } }, esc(card.name)),
-        el("div", { style: { display: "flex", gap: "6px", marginTop: "4px", flexWrap: "wrap" } },
-          card.voice ? el("span", { class: "chip" }, ICONS.voice, esc(card.voice)) : null,
-          card.language ? el("span", { class: "chip" }, card.language.toUpperCase()) : null,
-        ),
       ),
     ),      el("div", { class: "card-body" },
       el("div", { class: "card-tags" }, ...parseTags(card.tags).map((tag) => el("span", { class: "chip" }, "#" + tag))),
@@ -1617,25 +1602,82 @@ function cardModal(existing) {
   const avatarBox = el("div", { class: "avatar-editor" }, avatarPreview, avatarInput);
   let avatarData = null;
   avatarInput.addEventListener("change", () => { const file = avatarInput.files?.[0]; if (!file || file.size > 5 * 1024 * 1024) return toast("Avatar limité à 5 Mo", "err"); const reader = new FileReader(); reader.onload = () => { avatarData = String(reader.result); avatarPreview.replaceWith(el("img", { src: avatarData, class: "avatar avatar-lg" })); }; reader.readAsDataURL(file); });
-  const lang = field("Langue de la voix", f(existing?.language), { type: "select", options: [["", "Par défaut"], ["fr", "Français"], ["en", "English"]] });
-  // voices filtered by the chosen language (empty = toutes)
-  const voiceOptsFor = () => {
-    const l = lang.input.value;
-    const seen = new Set();
-    const out = [["", "Par défaut"]];
-    for (const v of store.voices || []) {
-      if (l && v.lang !== l) continue;
-      if (seen.has(v.name)) continue;
-      seen.add(v.name);
-      out.push([v.name, v.label]);
+  // ── ✨ Aide IA : tu décris ton idée, le modèle propose des chips par champ ──
+  // et tu choisis tes préférées d'un clic (chaque chip remplit son champ).
+  const ASSIST_FIELDS = [
+    { key: "name", id: "name", label: "Nom" },
+    { key: "tags", id: "tags", label: "Tags" },
+    { key: "description", id: "desc", label: "Description" },
+    { key: "personality", id: "perso", label: "Personnalité" },
+    { key: "scenario", id: "scenario", label: "Situation" },
+    { key: "first_mes", id: "firstMes", label: "Premier message" },
+    { key: "mes_example", id: "example", label: "Exemple de dialogue" },
+  ];
+  const fieldOf = { name, tags, desc, perso, scenario, firstMes, example };
+  const assistChips = new Map();
+  for (const af of ASSIST_FIELDS) assistChips.set(af.key, el("div", { class: "assist-chips", hidden: true }));
+  const assistTa = el("textarea", { class: "assist-ta", rows: 2, placeholder: "Décris ton idée en quelques mots — ex : « elfe rousse, marchande ambulante, sarcastique, connaît tous les secrets du port »" });
+  const assistBtn = el("button", { class: "btn btn-primary btn-sm", onclick: runAssist }, ICONS.sparkles, "Proposer");
+  const assistRegen = el("button", { class: "mini-btn", hidden: true, onclick: runAssist }, "↻ Régénérer");
+  const assistStatus = el("div", { class: "assist-status", hidden: true });
+  let assistBusy = false;
+  async function runAssist() {
+    const idea = assistTa.value.trim();
+    if (!idea) return toast("Décris d'abord ton idée de personnage.", "err");
+    if (assistBusy) return;
+    assistBusy = true;
+    assistBtn.disabled = true;
+    assistRegen.hidden = true;
+    assistStatus.hidden = false;
+    assistStatus.textContent = "✨ L'IA réfléchit… (quelques secondes)";
+    try {
+      const r = await api("/api/cards/assist", { body: { idea } });
+      const fields = r.fields || {};
+      let any = false;
+      for (const af of ASSIST_FIELDS) {
+        const values = (fields[af.key] || []).map((x) => String(x).trim()).filter(Boolean);
+        const box = assistChips.get(af.key);
+        if (!values.length) { box.hidden = true; box.replaceChildren(); continue; }
+        any = true;
+        box.hidden = false;
+        box.replaceChildren(
+          el("span", { class: "assist-label" }, "💡 " + af.label + " :"),
+          ...values.map((v) => {
+            const chip = el("button", { type: "button", class: "assist-chip", title: v, onclick: () => {
+              const input = fieldOf[af.id].input;
+              if (af.key === "tags") {
+                input.value = v.replace(/#+/g, "").split(/[,;]/).map((t) => t.trim()).filter(Boolean).join(", ");
+              } else {
+                input.value = v;
+              }
+              box.querySelectorAll(".assist-chip").forEach((c) => c.classList.remove("selected"));
+              chip.classList.add("selected");
+              input.dispatchEvent(new Event("input"));
+              input.focus();
+            } }, v.length > 96 ? v.slice(0, 96) + "…" : v);
+            return chip;
+          }),
+        );
+      }
+      assistStatus.textContent = any ? "Choisis ta préférée dans chaque champ ✨" : "Le modèle n'a rien proposé — réessaie ou vérifie la connexion IA.";
+      assistRegen.hidden = !any;
+      if (any) toast("Propositions générées ✓", "ok");
+    } catch (e) {
+      assistStatus.hidden = true;
+      toast(String(e?.message || e), "err");
+    } finally {
+      assistBusy = false;
+      assistBtn.disabled = false;
     }
-    return out;
-  };
-  const voice = field("Voix TTS", f(existing?.voice), { type: "select", options: voiceOptsFor() });
-  lang.input.addEventListener("change", () => {
-    const cur = voice.input.value;
-    voice.input.replaceChildren(...voiceOptsFor().map(([v, l2]) => el("option", { value: v, ...(v === cur ? { selected: "" } : {}) }, l2)));
-  });
+  }
+  const assistPanel = el("details", { class: "assist-panel" },
+    el("summary", {}, ICONS.sparkles + " Aide IA — générer des propositions"),
+    el("div", { class: "assist-body" },
+      assistTa,
+      el("div", { class: "assist-actions" }, assistBtn, assistRegen, assistStatus),
+    ),
+  );
+  assistTa.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); runAssist(); } });
   // ── live preview (SillyTavern-style character sheet) ──
   const preview = el("div", { class: "card-preview" }, el("div", { class: "card-preview-empty" }, "Aperçu en direct…"));
   const updatePreview = () => {
@@ -1645,38 +1687,38 @@ function cardModal(existing) {
     const sc = scenario.input.value.trim();
     const fm = firstMes.input.value.trim();
     const ex = example.input.value.trim();
-    const v = voice.input.value;
-    const voiceLabel = (store.voices || []).find((x) => x.name === v)?.label ?? (v || "par défaut");
+    const secs = [];
+    if (p) secs.push(el("div", { class: "preview-sec" }, el("strong", {}, "Personnalité"), el("p", {}, esc(p))));
+    if (sc) secs.push(el("div", { class: "preview-sec" }, el("strong", {}, "Situation"), el("p", {}, esc(sc))));
+    if (fm) secs.push(el("div", { class: "preview-sec preview-greet" }, el("strong", {}, "Premier message"), el("blockquote", {}, esc(fm))));
+    if (ex) secs.push(el("div", { class: "preview-sec preview-greet" }, el("strong", {}, "Exemple de dialogue"), el("blockquote", {}, esc(ex))));
     preview.replaceChildren(
       el("div", { class: "preview-avatar", style: { background: `linear-gradient(135deg, hsl(${(n.length * 59) % 360} 70% 55%), hsl(${(n.length * 59 + 60) % 360} 80% 40%))` } },
         n ? n[0].toUpperCase() : "?"),
       el("h3", {}, esc(n || "Nouvelle carte")),
-      el("div", { class: "preview-tags" },
-        v ? el("span", { class: "preview-tag" }, "🔊 " + esc(voiceLabel)) : null,
-        lang.input.value ? el("span", { class: "preview-tag" }, "🌍 " + (lang.input.value === "en" ? "EN" : "FR")) : null,
-      ),
       el("div", { class: "preview-sec" },
         el("strong", {}, "Description"),
         el("p", {}, esc(d || "—")),
       ),
-      p ? el("div", { class: "preview-sec" }, el("strong", {}, "Personnalité"), el("p", {}, esc(p))) : null,
-      sc ? el("div", { class: "preview-sec" }, el("strong", {}, "Situation"), el("p", {}, esc(sc))) : null,
-      fm ? el("div", { class: "preview-sec preview-greet" },
-        el("strong", {}, "Premier message"),
-        el("blockquote", {}, esc(fm)),
-      ) : null,
-      ex ? el("div", { class: "preview-sec preview-greet" },
-        el("strong", {}, "Exemple de dialogue"),
-        el("blockquote", {}, esc(ex)),
-      ) : null,
+      ...secs,
     );
   };
-  for (const inp of [name.input, desc.input, perso.input, scenario.input, firstMes.input, example.input, sys.input, voice.input, lang.input]) {
+  for (const inp of [name.input, desc.input, perso.input, scenario.input, firstMes.input, example.input, sys.input, tags.input]) {
     inp.addEventListener("input", updatePreview);
     inp.addEventListener("change", updatePreview);
   }
   updatePreview();
-  const formCol = el("div", { class: "card-form-col" }, avatarBox, name.wrap, el("div", { class: "row" }, lang.wrap, voice.wrap), tags.wrap, desc.wrap, perso.wrap, scenario.wrap, firstMes.wrap, example.wrap, sys.wrap);
+  const formCol = el("div", { class: "card-form-col" },
+    avatarBox, assistPanel,
+    name.wrap, assistChips.get("name"),
+    tags.wrap, assistChips.get("tags"),
+    desc.wrap, assistChips.get("description"),
+    perso.wrap, assistChips.get("personality"),
+    scenario.wrap, assistChips.get("scenario"),
+    firstMes.wrap, assistChips.get("first_mes"),
+    example.wrap, assistChips.get("mes_example"),
+    sys.wrap,
+  );
   const body = el("div", { class: "card-modal-grid" }, formCol, preview);
   const { close } = openModal({
     title: existing ? `Éditer ${existing.name}` : "Nouvelle carte",
@@ -1689,7 +1731,7 @@ function cardModal(existing) {
           description: desc.input.value.trim(), personality: perso.input.value.trim(),
           scenario: scenario.input.value.trim(), first_mes: firstMes.input.value.trim(),
           mes_example: example.input.value.trim(), system_prompt: sys.input.value.trim(),
-          voice: voice.input.value, language: lang.input.value, tags: JSON.stringify(tags.input.value.split(",").map((x) => x.trim()).filter(Boolean)), ...(avatarData ? { avatar: avatarData } : {}),
+          tags: JSON.stringify(tags.input.value.split(",").map((x) => x.trim()).filter(Boolean)), ...(avatarData ? { avatar: avatarData } : {}),
         };
         try {
           if (existing) await api(`/api/cards/${existing.id}`, { method: "PATCH", body: payload });
@@ -1775,7 +1817,7 @@ async function renderSettings() {
     el("div", { class: "page-head" },
       el("div", {},
         el("h2", {}, "⚙️ Réglages"),
-        el("div", { class: "sub" }, "Fournisseur d'IA, voix, langue et génération d'images."),
+        el("div", { class: "sub" }, "Fournisseur d'IA, narrateurs et génération d'images."),
       ),
     ),
   );
@@ -1787,7 +1829,6 @@ async function renderSettings() {
   container.append(el("div", { class: "settings-toc" },
     tocItem("ia", "🤖 IA"),
     tocItem("narr", "🎭 Narrateurs"),
-    tocItem("tts", "🔊 Voix"),
     tocItem("img", "🖼 Images"),
     tocItem("app", "🎨 Apparence"),
     tocItem("sc", "⌨️ Raccourcis"),
@@ -1953,80 +1994,6 @@ async function renderSettings() {
     ),
   ));
 
-  // ── TTS ──
-  container.append(el("div", { class: "section-title", id: "sec-tts" }, "Voix (TTS)"));
-  const ttsOn = checkbox("tts_enabled", s.tts_enabled !== false, "Activer la synthèse vocale");
-  const ttsLang = field("Langue des voix", s.tts_language || "fr", { type: "select", options: [["fr", "Français"], ["en", "English"]] });
-  const ttsEngine = field("Moteur de voix", s.tts_engine || "pocket", { type: "select", options: [["pocket", "Pocket-TTS (rapide, intégré)"], ["breeze", "Breeze-TTS-2 (haute qualité, GPU)"]] });
-  const narrator = field("Voix du narrateur", s.tts_voice_narrateur || "jean", { type: "select", options: voicesOptions(ttsLang.input.value, ttsEngine.input.value) });
-  const defChar = field("Voix par défaut des personnages", s.tts_voice_default || "cosette", { type: "select", options: voicesOptions(ttsLang.input.value, ttsEngine.input.value) });
-  const lsd = field("Qualité (pas de décodage)", s.tts_lsd_steps || 4, { type: "number", min: 1, max: 10, step: 1 });
-  const maxSeg = field("Segments vocaux par réponse", s.tts_max_segments ?? 5, { type: "number", min: 1, max: 20, step: 1 });
-  const autoplay = checkbox("tts_autoplay", s.tts_autoplay !== false, "Lecture auto des réponses");
-  // ▶ buttons: play a sample of the currently selected voice
-  const narratorPlay = samplePlayBtn(() => narrator.input.value, () => ttsLang.input.value, () => ttsEngine.input.value);
-  const defCharPlay = samplePlayBtn(() => defChar.input.value, () => ttsLang.input.value, () => ttsEngine.input.value);
-  narrator.wrap.append(narratorPlay);
-  defChar.wrap.append(defCharPlay);
-  // samples strip: every voice, playable
-  const stripBox = el("div", { class: "voice-samples" });
-  const renderStrip = () => {
-    stripBox.replaceChildren(el("div", { class: "chips-label" }, "🎧 Aperçu des voix — clique pour écouter"));
-    for (const lang of ["fr", "en"]) {
-      const voices = store.voices.filter((v) => v.lang === lang && v.engine === ttsEngine.input.value);
-      if (!voices.length) continue;
-      const uniq = [...new Map(voices.map((v) => [v.name, v])).values()];
-      stripBox.append(el("div", { class: "voice-group" },
-        el("span", { class: "voice-lang" }, lang === "fr" ? "Français" : "English"),
-        el("div", { class: "voice-chips" },
-          uniq.map((v) => {
-            const chip = el("button", { class: "voice-chip", onclick: () => playSample(v.name, v.lang, chip, v.engine) }, "▶ " + esc(v.label));
-            return chip;
-          }),
-        ),
-      ));
-    }
-  };
-  renderStrip();
-  ttsLang.input.addEventListener("change", () => {
-    const lang = ttsLang.input.value;
-    refreshVoiceSelects(narrator, defChar);
-    renderStrip();
-  });
-  ttsEngine.input.addEventListener("change", () => {
-    refreshVoiceSelects(narrator, defChar);
-    renderStrip();
-  });
-  function refreshVoiceSelects(...sels) {
-    const lang = ttsLang.input.value;
-    const engine = ttsEngine.input.value;
-    const opts = voicesOptions(lang, engine);
-    for (const sel of sels) {
-      const cur = sel.input.value;
-      const still = opts.find(([v]) => v === cur);
-      sel.input.replaceChildren(...opts.map(([v, l]) => el("option", { value: v, ...(v === still?.[0] ? { selected: "" } : {}) }, l)));
-    }
-  }
-  container.append(el("div", { class: "card", style: { padding: "18px 22px" } },
-    el("div", { class: "row" }, ttsOn.wrap, autoplay.wrap),
-    el("div", { class: "row" }, ttsLang.wrap, ttsEngine.wrap, lsd.wrap, maxSeg.wrap),
-    el("div", { class: "row" }, narrator.wrap, defChar.wrap),
-    el("details", { class: "voice-collapse" },
-      el("summary", {}, "🎧 Écouter toutes les voix"),
-      stripBox,
-    ),
-    el("div", { style: { marginTop: "14px" } },
-      el("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
-        try {
-          toast("Warm-up du TTS… (la 1re génération est lente)", "ok", 10000);
-          await api("/api/tts/warmup", { body: {} });
-          toast("TTS prêt ✓");
-        } catch (e) { toast(e.message, "err"); }
-      } }, ICONS.voice, "Précharger le TTS"),
-    ),
-    breezePresetsCard(ttsEngine, () => { refreshVoiceSelects(narrator, defChar); renderStrip(); }),
-  ));
-
   // ── Images ──
   container.append(el("div", { class: "section-title", id: "sec-img" }, "Images (Koji)"));
   const imgSteps = field("Étapes de génération", s.image_steps || 28, { type: "number", min: 8, max: 60, step: 1 });
@@ -2170,47 +2137,23 @@ async function renderSettings() {
       fileInput,
     ),
     el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "12px" } },
-      "La sauvegarde contient tes mondes, scénarios, cartes, personas et conversations (texte + réglages) ; les fichiers audio et images générés ne sont pas inclus — tu peux copier le dossier data/ pour tout conserver.",
+      "La sauvegarde contient tes mondes, scénarios, cartes, personas et conversations (texte + réglages) ; les illustrations générées ne sont pas incluses — tu peux copier le dossier data/ pour tout conserver.",
     ),
   ));
 
   // ── Stockage & backups auto ──
   container.append(el("div", { class: "section-title", id: "sec-storage" }, "Stockage & sauvegardes auto"));
   const storageCard = el("div", { class: "card", style: { padding: "18px 22px" } }, el("div", { class: "storage-line" }, "⏳ lecture du disque…"));
-  const cacheBtn = el("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
-    cacheBtn.disabled = true;
-    try {
-      const ok = await confirmModal({
-        title: "🗑 Purger le cache audio",
-        message: "Tous les clips audio générés seront supprimés du disque. Ils seront régénérés automatiquement (et lentement) au prochain clic sur le bouton 🔊 d'un message. Les fichiers orphelins ne sont pas touchés ici — passe par l'analyse dédiée.",
-        confirmLabel: "Purger le cache",
-      });
-      if (!ok) { cacheBtn.disabled = false; return; }
-      const r = await api("/api/cache/purge", { body: { audio: true } });
-      toast(`${r.removed} clip${r.removed > 1 ? "s" : ""} purgé${r.removed > 1 ? "s" : ""} (≈ ${((r.bytes || 0) / 1e6).toFixed(1)} Mo) ✓`);
-      renderStorage();
-    } catch (e) { toast(e.message, "err"); }
-    cacheBtn.disabled = false;
-  } }, "🗑 Vider le cache audio");
-  const cacheSummary = el("span", { class: "cache-summary" }, "⏳ cache…");
   const renderStorage = async () => {
     try {
       const st = await api("/api/storage");
       const mb = (v) => `${Math.max(0, v).toFixed(1)} Mo`;
-      let cacheLine = "";
-      try {
-        const c = await api("/api/cache");
-        cacheLine = `🎙 Cache audio (régénérable) : ${c.audio.files} fichier${c.audio.files > 1 ? "s" : ""} · ${c.audio.mb} Mo — 🖼 ${c.imageOrphans.files} image${c.imageOrphans.files > 1 ? "s" : ""} orpheline${c.imageOrphans.files > 1 ? "s" : ""} (${c.imageOrphans.mb} Mo)`;
-      } catch { /* cache indisponible → laisse le placeholder */ }
-      cacheSummary.textContent = cacheLine;
       storageCard.replaceChildren(
         el("div", { class: "storage-grid" },
-          el("div", { class: "storage-tile" }, el("strong", {}, mb(st.audioMB)), el("span", {}, "🎙 Audio généré")),
           el("div", { class: "storage-tile" }, el("strong", {}, mb(st.imagesMB)), el("span", {}, "🖼 Illustrations")),
           el("div", { class: "storage-tile" }, el("strong", {}, mb(st.uploadsMB)), el("span", {}, "📎 Avatars & uploads")),
           el("div", { class: "storage-tile" }, el("strong", {}, mb(st.dbMB)), el("span", {}, "🗄 Base de données")),
         ),
-        el("div", { class: "storage-cache" }, cacheSummary, cacheBtn),
         el("div", { class: "row", style: { marginTop: "14px" } },
           el("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
             try {
@@ -2241,7 +2184,7 @@ async function renderSettings() {
   container.append(el("div", { class: "section-title", id: "sec-jobs" }, "Tâches en arrière-plan"));
   const jobsCard = el("div", { class: "card", style: { padding: "18px 22px" } });
   const jobsRefresh = el("button", { class: "chip-btn slim", style: { marginLeft: "auto" }, title: "Actualiser", onclick: () => paintJobs() }, "↻");
-  const jobsHead = el("div", { class: "jobs-head" }, el("span", { style: { fontSize: "13px", color: "var(--text-dim)" } }, "TTS, images, résumés et légendes s'enregistrent ici (file persistante, reprise après redémarrage)."), jobsRefresh);
+  const jobsHead = el("div", { class: "jobs-head" }, el("span", { style: { fontSize: "13px", color: "var(--text-dim)" } }, "Images, résumés et légendes s'enregistrent ici (file persistante, reprise après redémarrage)."), jobsRefresh);
   container.append(jobsHead, jobsCard);
   const statusLabel = { pending: "en attente", running: "en cours", done: "terminé", failed: "échec" };
   let jobsTimer = null;
@@ -2284,14 +2227,6 @@ async function renderSettings() {
             narrator_presets: Object.fromEntries(
               Object.entries(narrMap).map(([k, v]) => [k, { label: v.label, prompt: v.prompt }]),
             ),
-            tts_enabled: ttsOn.input.checked,
-            tts_language: ttsLang.input.value,
-            tts_engine: ttsEngine.input.value,
-            tts_voice_narrateur: narrator.input.value,
-            tts_voice_default: defChar.input.value,
-            tts_lsd_steps: Number(lsd.input.value),
-            tts_max_segments: Number(maxSeg.input.value),
-            tts_autoplay: autoplay.input.checked,
             image_steps: Number(imgSteps.input.value),
             image_cfg: Number(imgCfg.input.value),
             image_ref_strength: Number(imgRef.input.value),
@@ -2316,7 +2251,7 @@ async function renderSettings() {
   loadProviderHealth();
 }
 
-// Réglages → IA : vérifie d'un coup le modèle, le TTS et le service d'images
+// Réglages → IA : vérifie d'un coup le modèle et le service d'images
 async function testServices() {
   const box = document.getElementById("services-test");
   if (!box) return;
@@ -2333,7 +2268,6 @@ async function testServices() {
     const im = r.image || {};
     box.replaceChildren(
       row("provider", "Modèle " + (p.provider || ""), p.ok, p.ok ? (p.models || []).join(", ") : "aucun modèle détecté — LM Studio démarré ?"),
-      row("tts", "Synthèse vocale (fr)", !!r.tts?.ok, r.tts?.ok ? "voix prêtes" : "modèle TTS non chargé"),
       row("image", "Service d'images", !im.error && im.ready, im.error || (im.loading ? "chargement du modèle…" : im.ready ? "prêt" : "non démarré")),
     );
   } catch (e) {
@@ -2382,7 +2316,7 @@ async function orphanModal() {
   try {
     analysis = await api("/api/storage/analyze", { body: {} });
   } catch (e) { return toast(e.message, "err"); }
-  const kindIcon = { audio: "🎙", image: "🖼", upload: "📎" };
+  const kindIcon = { image: "🖼", upload: "📎" };
   const rows = (analysis.orphans || []).map((o) => {
     const cb = el("input", { type: "checkbox", checked: "" });
     return el("label", { class: "orphan-row" },
@@ -2405,7 +2339,7 @@ async function orphanModal() {
   const { close } = openModal({
     title: "🧹 Fichiers orphelins",
     sub: analysis.orphanCount
-      ? `${analysis.orphanCount} fichier${analysis.orphanCount > 1 ? "s" : ""} inutilisé${analysis.orphanCount > 1 ? "s" : ""} (≈ ${analysis.totalMB} Mo) — audio d'anciens messages, avatars remplacés, illustrations de messages supprimés, clips de test…`
+      ? `${analysis.orphanCount} fichier${analysis.orphanCount > 1 ? "s" : ""} inutilisé${analysis.orphanCount > 1 ? "s" : ""} (≈ ${analysis.totalMB} Mo) — avatars remplacés, illustrations de messages supprimés, uploads orphelins…`
       : "Aucun fichier orphelin : tout ce qui est sur le disque est encore référencé.",
     body: analysis.orphanCount ? list : el("div", { class: "empty" }, el("div", { class: "big" }, "✨"), el("h3", {}, "Rien à nettoyer")),
     footer: [cancelBtn, deleteBtn],
@@ -2433,216 +2367,6 @@ function checkbox(key, checked, labelText) {
     ),
   );
   return { wrap, input: wrap.querySelector("input") };
-}
-
-function voicesOptions(lang, engine) {
-  const voices = store.voices.filter((v) => (v.lang === lang || !lang) && (!engine || v.engine === engine));
-  const unique = [...new Map(voices.map((v) => [v.name, v])).values()];
-  return unique.map((v) => [v.name, v.label]);
-}
-
-// ─── voice sample preview (settings) ─────────────────────────────────────────
-let sampleHandler = null; // { audio, btn }
-function stopSample() {
-  if (sampleHandler) {
-    try { sampleHandler.audio.pause(); } catch { /* ignore */ }
-    const idle = sampleHandler.btn.dataset.idle ?? "▶";
-    sampleHandler.btn.textContent = idle;
-    sampleHandler.btn.classList.remove("playing", "busy");
-    sampleHandler = null;
-  }
-}
-async function playSample(name, lang, btn, engine) {
-  if (sampleHandler && sampleHandler.btn === btn) { stopSample(); return; }
-  stopSample();
-  if (!name) return;
-  btn.dataset.idle = btn.textContent;
-  btn.textContent = "⏳";
-  btn.classList.add("busy");
-  try {
-    // server synthesizes (and caches) the clip on first request
-    const res = await api(`/api/voices/sample?name=${encodeURIComponent(name)}&lang=${lang || "fr"}${engine ? "&engine=" + engine : ""}`);
-    const a = new Audio(res.path);
-    a.onended = () => {
-      if (sampleHandler?.audio === a) sampleHandler = null;
-      btn.textContent = btn.dataset.idle ?? "▶";
-      btn.classList.remove("playing", "busy");
-    };
-    await a.play();
-    sampleHandler = { audio: a, btn };
-    btn.textContent = "⏹";
-    btn.classList.remove("busy");
-    btn.classList.add("playing");
-  } catch (e) {
-    btn.textContent = btn.dataset.idle ?? "▶";
-    btn.classList.remove("busy");
-    toast(String(e?.message ?? e), "err");
-  }
-}
-function samplePlayBtn(getVoice, getLang, getEngine) {
-  const b = el("button", { class: "mini-btn play-voice", style: { marginTop: "8px" }, onclick: () => playSample(getVoice(), getLang ? getLang() : "fr", b, getEngine ? getEngine() : "pocket") }, "▶ Écouter");
-  return b;
-}
-
-// ─── Breeze-TTS-2 voice presets editor ─────────────────────────────────────
-// Breeze voices are design instructions (describe the speaker in words), so
-// users can edit the descriptions and create new presets here. Saving persists
-// the whole list to the server settings (breeze_voices).
-function breezePresetsCard(engineField, onVoicesChanged) {
-  const card = el("div", { class: "card breeze-card", style: { padding: "18px 22px", marginTop: "14px" } });
-  let voices = [];
-  let editIndex = -1;
-  let busy = false;
-
-  const listBox = el("div", { class: "breeze-list" });
-
-  const nameInput = el("input", { class: "fl-field-input", placeholder: "Nom (ex : adèle)" });
-  const langSel = el("select", {},
-    el("option", { value: "fr", selected: "" }, "Français"),
-    el("option", { value: "en" }, "English"),
-  );
-  const instrTa = el("textarea", { class: "fl-field-input", rows: 3, placeholder: "Décris la voix en une phrase… (en français pour une voix fr)" });
-  const saveBtn = el("button", { class: "btn btn-primary btn-sm" }, "＋ Ajouter");
-
-  const paint = () => {
-    listBox.replaceChildren();
-    if (!voices.length) {
-      listBox.append(el("p", { style: { color: "var(--text-dim)", fontSize: "13px" } }, "Aucun preset — ajoute ta première voix."));
-      return;
-    }
-    const chips = el("div", { class: "breeze-chips" });
-    for (let i = 0; i < voices.length; i++) {
-      const v = voices[i];
-      const chip = el("div", { class: "voice-chip wrap" },
-        el("span", { class: "breeze-name" }, esc(v.name) + (v.lang === "en" ? " (EN)" : " (FR)")),
-        el("span", { class: "breeze-instr" }, esc(v.instruction)),
-        el("span", { class: "breeze-chip-actions" },
-          el("button", { class: "mini-btn", title: "Écouter", onclick: (ev) => { ev.stopPropagation(); playSample(v.name, v.lang, ev.currentTarget, "breeze"); } }, "▶"),
-          el("button", { class: "mini-btn", title: "Modifier", onclick: (ev) => {
-            ev.stopPropagation();
-            editIndex = i;
-            nameInput.value = v.name;
-            langSel.value = v.lang;
-            instrTa.value = v.instruction;
-            saveBtn.textContent = "💾 Enregistrer la modification";
-          } }, "✎"),
-          el("button", { class: "mini-btn", style: { color: "var(--danger)" }, title: "Supprimer", onclick: async (ev) => {
-            ev.stopPropagation();
-            if (busy) return;
-            if (!await confirmModal({ title: "Supprimer la voix", message: `Supprimer « ${v.name} » ?`, confirmLabel: "Supprimer" })) return;
-            voices.splice(i, 1);
-            await persist();
-          } }, "🗑"),
-        ),
-      );
-      chips.append(chip);
-    }
-    listBox.append(chips);
-  };
-
-  const persist = async () => {
-    busy = true;
-    try {
-      const r = await api("/api/tts/breeze/voices", { method: "POST", body: { voices } });
-      voices = r.voices || [];
-      editIndex = -1;
-      nameInput.value = ""; instrTa.value = "";
-      saveBtn.textContent = "＋ Ajouter";
-      await refreshStoreVoices();
-      toast("Voix Breeze enregistrées ✓");
-      paint();
-    } catch (e) {
-      toast(e.message, "err");
-    } finally {
-      busy = false;
-    }
-  };
-
-  saveBtn.addEventListener("click", async () => {
-    const name = nameInput.value.trim();
-    const instruction = instrTa.value.trim();
-    if (!name || !instruction) { toast("Nom et description requis.", "err"); return; }
-    if (editIndex >= 0) {
-      voices[editIndex] = { name, lang: langSel.value, instruction };
-    } else {
-      if (voices.some((v) => v.name.toLowerCase() === name.toLowerCase())) {
-        toast("Ce nom existe déjà — choisis-en un autre.", "err");
-        return;
-      }
-      voices.push({ name, lang: langSel.value, instruction });
-    }
-    await persist();
-  });
-
-  const refreshStoreVoices = async () => {
-    const fresh = await api("/api/tts/breeze/voices");
-    store.voices = store.voices.filter((v) => v.engine !== "breeze").concat(
-      (fresh.voices || []).map((v) => ({ name: v.name, lang: v.lang, engine: "breeze", predefined: true, label: `${v.name} (Breeze · ${v.lang === "fr" ? "FR" : "EN"})` })),
-    );
-    onVoicesChanged?.();
-    paint();
-  };
-
-  const load = async () => {
-    try {
-      const r = await api("/api/tts/breeze/status");
-      const { modelPresent, running, ready, error } = r;
-      const stat = el("div", { class: "breeze-status" },
-        modelPresent
-          ? el("span", {}, ready ? "✅ Breeze prêt" : (running ? "⏳ Breeze en cours de chargement…" : "📦 Breeze installé, modèle présent"))
-          : el("span", {}, "⚠️ Modèle Breeze absent — lance le téléchargement (voir docs)."),
-        (error ? el("span", { class: "breeze-err" }, esc(error)) : null),
-      );
-      statusBox.replaceChildren(stat);
-      const rv = await api("/api/tts/breeze/voices");
-      voices = rv.voices || [];
-      await refreshStoreVoices();
-    } catch { /* ignore */ }
-  };
-
-  const statusBox = el("div");
-  const resetBtn = el("button", { class: "btn btn-ghost btn-sm", title: "Restaurer les presets par défaut", onclick: async () => {
-    if (busy) return;
-    if (!await confirmModal({ title: "Réinitialiser", message: "Restaurer les voix Breeze par défaut ? Tes modifications seront perdues.", confirmLabel: "Réinitialiser" })) return;
-    busy = true;
-    try {
-      const r = await api("/api/tts/breeze/voices/reset", { method: "POST" });
-      voices = r.voices || [];
-      await refreshStoreVoices();
-    } catch (e) { toast(e.message, "err"); }
-    busy = false;
-  } }, "↺ Réinitialiser");
-
-  const cardDetails = el("details", { class: "breeze-collapse" },
-    el("summary", {}, "🎙️ Voix Breeze (éditeur)"),
-    el("div", { style: { marginTop: "12px" } },
-      statusBox,
-      el("div", { class: "breeze-list-wrap" },
-        listBox,
-        el("div", { class: "breeze-editor" },
-          el("div", { class: "row" }, nameInput, langSel),
-          instrTa,
-          el("div", { class: "row", style: { marginTop: "10px", justifyContent: "space-between" } },
-            saveBtn,
-            resetBtn,
-          ),
-        ),
-      ),
-      el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "12px" } },
-        "Chaque voix Breeze est une consigne de voix : décris le timbre, le débit, le tempérament en une phrase. Modifier la description change la voix et invalide le cache.",
-      ),
-    ),
-  );
-  card.append(cardDetails);
-
-  const sync = () => {
-    const isBreeze = engineField.input.value === "breeze";
-    card.style.display = isBreeze ? "" : "none";
-  };
-  engineField.input.addEventListener("change", sync);
-  sync();
-  load();
-  return card;
 }
 
 // ─── new game wizard ──────────────────────────────────────────────────────────
