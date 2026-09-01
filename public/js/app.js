@@ -1,6 +1,6 @@
-import { api, apiForm, uploadFiles } from "./api.js?v=26";
-import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=26";
-import { renderChat } from "./chat.js?v=26";
+import { api, apiForm, uploadFiles } from "./api.js?v=27";
+import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=27";
+import { renderChat } from "./chat.js?v=27";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -175,7 +175,7 @@ document.addEventListener("keydown", (e) => {
   else if (k === "n") { e.preventDefault(); newGameWizard(); }
   else if (inChat && (k === "r" || k === "g" || k === "/")) {
     e.preventDefault();
-    import("./chat.js?v=26").then((m) => m.chatShortcut(k)).catch(() => {});
+    import("./chat.js?v=27").then((m) => m.chatShortcut(k)).catch(() => {});
   }
 });
 

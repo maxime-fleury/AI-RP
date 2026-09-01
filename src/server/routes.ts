@@ -711,13 +711,17 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       if (!conv || !m) return json({ error: "not found" }, 404);
       const body = await readJson(req);
       const world = conv.world_id ? getWorld(conv.world_id) : null;
-      const kind = body.kind === "landscape" || body.kind === "portrait" ? body.kind : detectSceneKind(m.content);
-      const landscape = kind === "landscape";
-      // character consistency: if the message is a character's line, bake their
-      // look into the prompt and pin the seed so the face stays recognizable
       let cast: any[] = [];
       try { cast = (JSON.parse(conv.cast || "[]") as number[]).map((cid) => getCard(Number(cid))).filter(Boolean); } catch { /* ignore */ }
-      const char = characterForMessage(cast, m.content);
+      // "character" forces a character portrait (first cast card as fallback)
+      const forcedChar = body.kind === "character";
+      const char = forcedChar
+        ? (characterForMessage(cast, m.content) ?? cast[0] ?? null)
+        : characterForMessage(cast, m.content);
+      const kind = forcedChar ? "portrait"
+        : body.kind === "landscape" || body.kind === "portrait" ? body.kind
+        : detectSceneKind(m.content);
+      const landscape = kind === "landscape";
       const prompt = buildIllustrationPrompt(world?.name ?? "", world?.description ?? "", world?.tone ?? "épique", m.content, kind, char);
       const seed =
         typeof body.seed === "number" ? body.seed

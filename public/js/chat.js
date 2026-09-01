@@ -1,6 +1,6 @@
-import { api, readSseStream } from "./api.js?v=26";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=26";
-import { store, refreshAll, navigate, applyTheme } from "./app.js?v=26";
+import { api, readSseStream } from "./api.js?v=27";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=27";
+import { store, refreshAll, navigate, applyTheme } from "./app.js?v=27";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -53,7 +53,7 @@ export async function renderChat(convIdRaw) {
   if (convIdRaw === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=26");
+    const { newGameWizard } = await import("./app.js?v=27");
     newGameWizard(pre);
     return;
   }
@@ -717,30 +717,62 @@ function startEdit(m, body, bubble) {
   ta.addEventListener("blur", () => finish(true));
 }
 
+// deterministic hue per name → each speaker keeps a recognizable color
+function nameHue(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return h % 360;
+}
+
+function initialAvatar(name, glyph) {
+  const hue = nameHue(name || "?");
+  return el("div", {
+    class: "avatar avatar-md init-avatar",
+    style: {
+      background: `linear-gradient(135deg, hsl(${hue} 65% 45%), hsl(${(hue + 50) % 360} 75% 26%))`,
+      display: "grid", placeItems: "center", color: "#fff", fontWeight: 800,
+      fontSize: "15px", textShadow: "0 1px 3px rgba(0,0,0,.35)",
+    },
+  }, glyph || (name || "?").charAt(0).toUpperCase());
+}
+
 function avatarFor(m) {
   if (m.role === "user") {
     const p = currentConversation?.persona;
-    return p?.avatar ? el("img", { src: p.avatar, class: "avatar avatar-md" }) : el("div", { class: "avatar avatar-md", style: { display: "grid", placeItems: "center" } }, "🧝");
+    if (p?.avatar) return el("img", { src: p.avatar, class: "avatar avatar-md" });
+    return initialAvatar(p?.name || "Moi", "🧝");
   }
   const card = (currentConversation?.cards || []).find((c) => c.name.toLowerCase() === (m.name || "").toLowerCase());
   if (card?.avatar) return el("img", { src: card.avatar, class: "avatar avatar-md" });
-  return el("div", { class: "avatar avatar-md", style: { display: "grid", placeItems: "center" } }, "📖");
+  const name = m.name || "Narrateur";
+  const isNarrator = name.toLowerCase() === "narrateur" || (!card && !m.name);
+  return initialAvatar(name, isNarrator ? "🪄" : null);
 }
 
 function messageActions(messageId, audio) {
   const real = (audio || []).filter((a) => a.path).length;
   const playBtn = el("button", { class: "mini-btn", onclick: () => playMessageAudio(messageId, playBtn) }, ICONS.voice, real ? `Voix (${real})` : "Voix");
-  const illuBtn = el("button", { class: "mini-btn", onclick: async (e) => {
-    e.target.disabled = true;
-    e.target.textContent = "🖼 génération…";
+  const illuSel = el("select", { class: "mini-select", title: "Générer une illustration (auto / paysage / personnage)" },
+    el("option", { value: "auto" }, "🖼 Illustrer"),
+    el("option", { value: "landscape" }, "🏞 Paysage"),
+    el("option", { value: "character" }, "🎭 Personnage"),
+  );
+  illuSel.addEventListener("change", async (e) => {
+    const kind = e.target.value;
+    illuSel.value = "auto";
+    if (!kind) return;
+    illuSel.disabled = true;
     try {
-      const res = await api(`/api/conversations/${currentConversation.id}/messages/${messageId}/image`, { body: {} });
-      toast("Illustration générée ✓");
+      await api(`/api/conversations/${currentConversation.id}/messages/${messageId}/image`, {
+        body: kind === "auto" ? {} : { kind },
+      });
+      toast(kind === "landscape" ? "Paysage généré ✓" : kind === "character" ? "Illustration du personnage ✓" : "Illustration générée ✓");
       renderChat(currentConversation.id);
-    } catch (err) { toast(err.message, "err"); e.target.disabled = false; e.target.textContent = "🖼"; }
-  } }, ICONS.image, "Illustrer");
+    } catch (err) { toast(err.message, "err"); }
+    finally { illuSel.disabled = false; }
+  });
   const retryBtn = el("button", { class: "mini-btn regen-btn", onclick: () => regenerate(messageId) }, ICONS.retry, "Régénérer");
-  return [playBtn, illuBtn, retryBtn];
+  return [playBtn, illuSel, retryBtn];
 }
 
 // keyboard shortcuts from within the chat (see app.js global handler)
@@ -870,7 +902,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal, field } from "./ui.js?v=26";
+import { openModal, field } from "./ui.js?v=27";
 void applyTheme;
 void fmtTime;
 void currentConversation;
