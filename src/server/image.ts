@@ -129,6 +129,10 @@ export interface ImageRequest {
   width?: number;
   height?: number;
   seed?: number;
+  /** base64 PNG used as an img2img starting point (character portrait reference). */
+  init_image?: string;
+  /** how much to deviate from init_image (0 = keep, 1 = full redraw). */
+  strength?: number;
 }
 
 export interface ImageResult {

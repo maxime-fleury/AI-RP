@@ -54,6 +54,7 @@ def generate(req: dict):
     if _pipe is None:
         raise RuntimeError("pipeline not ready")
     import torch
+    from PIL import Image
 
     prompt = req.get("prompt", "").strip()
     negative = req.get("negative") or (
@@ -70,6 +71,17 @@ def generate(req: dict):
         seed = int(uuid.uuid4().int % (2**32))
     generator = torch.Generator(device="cpu").manual_seed(seed)
     t0 = time.time()
+    # img2img: an optional base64 init image (character portrait ref) + strength
+    init_b64 = req.get("init_image") or ""
+    strength = float(req.get("strength", 0.6))
+    kwargs = {}
+    if init_b64:
+        try:
+            init_img = Image.open(io.BytesIO(base64.b64decode(init_b64))).convert("RGB")
+            kwargs["image"] = init_img
+            kwargs["strength"] = max(0.05, min(1.0, strength))
+        except Exception as e:
+            print(f"[image] init_image ignored: {e}", flush=True)
     image = _pipe(
         prompt=prompt,
         negative_prompt=negative,
@@ -78,6 +90,7 @@ def generate(req: dict):
         width=width,
         height=height,
         generator=generator,
+        **kwargs,
     ).images[0]
     ms = int((time.time() - t0) * 1000)
     buf = io.BytesIO()

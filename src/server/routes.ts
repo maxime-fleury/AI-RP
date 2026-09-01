@@ -15,13 +15,15 @@ import {
 } from "./db";
 import { importFile, scanDirectory } from "./importCards";
 import { getProvider, defaultModelFor, type ChatMessage } from "../llm/providers";
-import { buildMessages, parseSegments, fallbackSpeaker, summarizeSystem, type Segment, type CastContext } from "../llm/prompt";
+import { buildMessages, buildSystemPrompt, estimateTokens, parseSegments, fallbackSpeaker, summarizeSystem, type Segment, type CastContext } from "../llm/prompt";
 import type { MessageRow } from "./db";
 import { synthSegments, buildTtsContext, listVoices, warmupTts, getVoiceSample } from "../tts/service";
 import { ensureTtsLoaded, synthesize, wavBytes } from "../tts/engine";
 import { generateAndSave, probeImageStatus, ensureImageServer } from "./image";
+import { storageInfo, runBackup } from "./backup";
 import { zipFiles } from "./zip";
-import { AUDIO_DIR, IMAGES_DIR } from "./paths";
+import { AUDIO_DIR, IMAGES_DIR, UPLOADS_DIR } from "./paths";
+import { withCharaChunk, placeholderPng } from "./cardExport";
 
 const preparingAudio = new Set<number>();
 
@@ -43,7 +45,10 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-function sseStream(onStart: (send: (event: string, data: unknown) => void, close: () => void) => Promise<void>): Response {
+function sseStream(
+  onStart: (send: (event: string, data: unknown) => void, close: () => void) => Promise<void>,
+  onCancel?: () => void,
+): Response {
   const encoder = new TextEncoder();
   let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
   const stream = new ReadableStream<Uint8Array>({
@@ -52,6 +57,7 @@ function sseStream(onStart: (send: (event: string, data: unknown) => void, close
     },
     cancel() {
       controller = null;
+      onCancel?.();
     },
   });
   const send = (event: string, data: unknown) => {
@@ -197,6 +203,16 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
   const p = url.pathname;
   const parts = p.split("/").filter(Boolean); // ["api", ...]
 
+  // optional LAN token: when set, every API call must carry it
+  const authToken = getSetting("auth_token", "");
+  if (authToken && p !== "/api/auth") {
+    const presented =
+      url.searchParams.get("token") ||
+      req.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
+      req.headers.get("x-auth-token");
+    if (presented !== authToken) return json({ error: "unauthorized" }, 401);
+  }
+
   try {
     // models list per provider
     if (p === "/api/models" && method === "GET") {
@@ -212,6 +228,28 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         tts: { fr: await ensureTtsLoaded("fr").catch(() => false), en: await ensureTtsLoaded("en").catch(() => false) },
         image: await probeImageStatus(),
       });
+    }
+
+    // LAN auth
+    if (p === "/api/auth" && method === "GET") {
+      const token = getSetting("auth_token", "");
+      const presented = url.searchParams.get("token") || req.headers.get("x-auth-token") || "";
+      return json({ required: Boolean(token), ok: !token || presented === token });
+    }
+    if (p === "/api/auth" && method === "POST") {
+      const body = await readJson(req);
+      const token = getSetting("auth_token", "");
+      if (token && body.token !== token) return json({ error: "token invalide" }, 401);
+      return json({ ok: true });
+    }
+
+    // storage / backups
+    if (p === "/api/storage" && method === "GET") {
+      return json(storageInfo());
+    }
+    if (p === "/api/backup" && method === "POST") {
+      const file = runBackup(true);
+      return json({ ok: Boolean(file), file });
     }
 
     // settings
@@ -332,6 +370,79 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       updateWorld(world.id, { cover: cover.url });
       return json({ cover: cover.url });
     }
+    // world map: generate an illustrated map of the world (landscape)
+    if (parts[1] === "worlds" && parts[2] && parts[3] === "map" && parts[4] === "generate" && method === "POST") {
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
+      const prompt = [
+        `Illustrated fantasy map of the world of "${world.name}".`,
+        `Lore: ${(world.lore || world.description || "").slice(0, 800)}`,
+        "Regions, capitals, forests, mountains, rivers, coastlines. Cartography style, top-down view, parchment texture, muted colors, hand-drawn labels. Landscape format.",
+      ].join("\n");
+      const saved = await generateAndSave(`worlds/${world.id}`, {
+        prompt,
+        negative: NEGATIVE_PROMPT,
+        steps: 24,
+        cfg: 6.5,
+        width: 1216,
+        height: 832,
+      });
+      updateWorld(world.id, { map: saved.url });
+      return json({ map: saved.url });
+    }
+    // world map view + place names cited in this world's conversations
+    if (parts[1] === "worlds" && parts[2] && parts[3] === "map" && method === "GET") {
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
+      const texts: string[] = [];
+      for (const c of listConversations().filter((x: any) => x.world_id === world.id)) {
+        for (const m of listMessages(c.id)) if (m.role === "assistant") texts.push(m.content);
+      }
+      const seen = new Set<string>();
+      const locations: string[] = [];
+      // place names: two+ capitalized words — filter out sentence starters and
+      // common words so narration like "Les échos de ta voix" isn't a "place"
+      const SKIP = new Set(["Les", "Le", "La", "Un", "Une", "Des", "Au", "Aux", "Dans", "Sur", "Sous", "Et", "Mais", "Ou", "Elle", "Il", "Ils", "Elles", "Tu", "Vous", "Je", "Nous", "On", "Ce", "Cette", "Ces", "Son", "Sa", "Ses", "Mon", "Ma", "Mes", "Ton", "Ta", "Tes", "Notre", "Votre", "Leur", "Quand", "Comme", "Alors", "Soudain", "Puis", "Enfin", "Après", "Avant", "Devant", "Derrière", "Vers", "Avec", "Sans", "Pour", "Par", "Seul", "Tout", "Toute"]);
+      const re = /\b([A-ZÀ-ÖØ-öø-ÿ][a-zà-öø-ÿ'’-]{2,24})\s+((?:de|du|des|d'|la|le|les|au|aux|en|l')?\s*[A-ZÀ-ÖØ-öø-ÿ][a-zà-öø-ÿ'’-]{2,24})/g;
+      for (const t of texts) {
+        for (const m of t.matchAll(re)) {
+          const name = `${m[1]} ${m[2]}`.replace(/\s+/g, " ").trim();
+          if (SKIP.has(m[1])) continue;
+          if (SKIP.has(name.split(" ")[0])) continue;
+          if (!seen.has(name)) { seen.add(name); locations.push(name); }
+          if (locations.length >= 10) break;
+        }
+        if (locations.length >= 10) break;
+      }
+      return json({ map: world.map || null, locations });
+    }
+    // export a whole world (scenarios + conversations) as a ZIP
+    if (parts[1] === "worlds" && parts[2] && parts[3] === "export" && method === "GET") {
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
+      const files: { path: string; data: Uint8Array | string }[] = [
+        { path: "world.json", data: JSON.stringify({ name: world.name, description: world.description, lore: world.lore, tone: world.tone, narration_style: world.narration_style, language: world.language, map: world.map, exported_at: new Date().toISOString() }, null, 2) },
+        { path: "scenarios.json", data: JSON.stringify(listScenarios(world.id), null, 2) },
+      ];
+      for (const c of listConversations().filter((x: any) => x.world_id === world.id)) {
+        const msgs = listMessages(c.id).map(messageView);
+        const lines = msgs.map((m: any) => {
+          const who = m.role === "user" ? "Moi" : m.name || "Narrateur";
+          const body = (m.meta?.image ? `![illustration](${m.meta.image})\n` : "") + (m.content || "");
+          return m.role === "user" ? `**${who}** : ${body}` : `> **${who}** : ${body}`;
+        }).join("\n\n");
+        const safe = (c.title || "partie").replace(/[^\p{L}\p{N} _-]+/gu, "").slice(0, 40);
+        files.push({ path: `conversations/${c.id}-${safe}.md`, data: `# ${c.title}\n\n${lines}\n` });
+      }
+      const zip = zipFiles(files);
+      const name = encodeURIComponent(world.name.replace(/[^\p{L}\p{N} _-]+/gu, "").slice(0, 40));
+      return new Response(zip, {
+        headers: {
+          "Content-Type": "application/zip",
+          "Content-Disposition": `attachment; filename*=UTF-8''${name}.zip`,
+        },
+      });
+    }
 
     // scenarios
     if (parts[1] === "worlds" && parts[2] && parts[3] === "scenarios" && method === "GET") {
@@ -392,6 +503,40 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     if (parts[1] === "cards" && parts[2] && !parts[3] && method === "DELETE") {
       deleteCard(Number(parts[2]));
       return json({ ok: true });
+    }
+    // export a card as a SillyTavern-compatible PNG (chara chunk)
+    if (parts[1] === "cards" && parts[2] && parts[3] === "export-st" && method === "GET") {
+      const card = getCard(Number(parts[2]));
+      if (!card) return json({ error: "not found" }, 404);
+      const chara = JSON.stringify({
+        spec: "chara_card_v2",
+        spec_version: "2.0",
+        data: {
+          name: card.name,
+          description: [card.description, card.personality, card.scenario].filter(Boolean).join("\n\n"),
+          personality: card.personality || "",
+          scenario: card.scenario || "",
+          first_mes: card.first_mes || "",
+          mes_example: card.mes_example || "",
+          system_prompt: card.system_prompt || "",
+          post_history_instructions: card.post_history_instructions || "",
+          creator: "Freebuff AI-RP",
+          character_version: "1.0",
+          alternate_greetings: [],
+          tags: [],
+        },
+      });
+      let png: Uint8Array;
+      const avatarFile = card.avatar ? path.join(UPLOADS_DIR, path.basename(card.avatar)) : "";
+      if (avatarFile && fs.existsSync(avatarFile)) png = new Uint8Array(fs.readFileSync(avatarFile));
+      else png = placeholderPng(256, [43, 24, 66]);
+      const out = withCharaChunk(png, chara);
+      return new Response(out, {
+        headers: {
+          "Content-Type": "image/png",
+          "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(card.name)}.png`,
+        },
+      });
     }
 
     // personas
@@ -488,15 +633,24 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       updateConversation(Number(parts[2]), {
         title: body.title,
         group_mode: body.group_mode === undefined ? undefined : body.group_mode ? 1 : 0,
+        pinned: body.pinned === undefined ? undefined : body.pinned ? 1 : 0,
+        archived: body.archived === undefined ? undefined : body.archived ? 1 : 0,
         cast: body.cast ? JSON.stringify(body.cast) : undefined,
         settings: body.settings ? JSON.stringify(body.settings) : undefined,
       });
       return json(conversationView(Number(parts[2])));
     }
     if (parts[1] === "conversations" && parts[2] && !parts[3] && method === "DELETE") {
+      // soft delete: move to the trash (archived=1); restore via PATCH archived:0
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      updateConversation(conv.id, { archived: 1 });
+      return json({ ok: true, archived: true });
+    }
+    // permanent delete (trash screen) — drops rows + audio + images
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "permanent" && method === "DELETE") {
       const convId = Number(parts[2]);
       deleteConversation(convId);
-      // drop generated audio + images of this conversation
       for (const dir of [path.join(AUDIO_DIR, String(convId)), path.join(IMAGES_DIR, "conversations", String(convId))]) {
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
       }
@@ -572,6 +726,41 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       view.messages = listMessages(view.id).map(messageView);
       return json(view, 201);
     }
+    // estimate the tokens the model would receive for this conversation
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "context" && method === "GET") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const view = conversationView(conv.id)!;
+      const msgs = listMessages(conv.id);
+      const { system, messages } = buildMessages(
+        { world: view.world, persona: view.persona, cards: view.cards, scenario: view.scenario, conversation: conv, summary: conv.summary || undefined },
+        msgs,
+      );
+      const tokens = estimateTokens(system) + messages.reduce((acc, m) => acc + estimateTokens(m.content), 0);
+      // context budget: tokens used vs the configured window (conversation or world cap)
+      let cs: Record<string, unknown> = {};
+      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+      let maxMsgs = Number(cs.context_max_messages ?? getSetting("context_max_messages", 20));
+      let capSource = "partie";
+      const world = conv.world_id ? getWorld(conv.world_id) : null;
+      if (world) {
+        let ws: Record<string, unknown> = {};
+        try { ws = JSON.parse(world.settings || "{}"); } catch { /* ignore */ }
+        const worldCap = Number(ws.context_max_messages ?? getSetting("world_context_max_messages", 0));
+        if (worldCap > 0 && worldCap < maxMsgs) { maxMsgs = worldCap; capSource = "monde"; }
+      }
+      const estPerMsg = Math.max(80, Math.round(tokens / Math.max(1, messages.length)));
+      const budgetTokens = maxMsgs * estPerMsg;
+      return json({
+        tokens,
+        systemTokens: estimateTokens(system),
+        messageCount: messages.length,
+        keptMessages: Math.min(messages.length, maxMsgs),
+        budgetTokens,
+        budget: Math.min(100, Math.round((tokens / Math.max(1, budgetTokens)) * 100)),
+        capSource,
+      });
+    }
     // full export of a conversation: markdown + JSON + audio + images, as a ZIP
     if (parts[1] === "conversations" && parts[2] && parts[3] === "export" && method === "GET") {
       const conv = getConversation(Number(parts[2]));
@@ -619,8 +808,67 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         },
       });
     }
+    // gallery: all illustrations of a conversation + AI captions
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "gallery" && method === "GET") {
+      const convId = Number(parts[2]);
+      const conv = getConversation(convId);
+      if (!conv) return json({ error: "not found" }, 404);
+      const msgs = listMessages(convId).map(messageView);
+      const items = msgs.filter((m: any) => m.meta?.image).map((m: any) => ({
+        id: m.id, image: m.meta.image, seed: m.meta.seed ?? null,
+        character: m.meta.character ?? null, message: (m.content || "").slice(0, 200),
+      }));
+      let captions: Record<string, string> = {};
+      try {
+        captions = JSON.parse(fs.readFileSync(path.join(IMAGES_DIR, "conversations", String(convId), "captions.json"), "utf8"));
+      } catch { /* none yet */ }
+      return json({ items, captions });
+    }
+    // generate AI captions for the gallery in one pass (one LLM call)
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "gallery" && parts[4] === "captions" && method === "POST") {
+      const convId = Number(parts[2]);
+      const conv = getConversation(convId);
+      if (!conv) return json({ error: "not found" }, 404);
+      const msgs = listMessages(convId).map(messageView);
+      const items = msgs.filter((m: any) => m.meta?.image);
+      if (!items.length) return json({ captions: {} });
+      let existing: Record<string, string> = {};
+      const capFile = path.join(IMAGES_DIR, "conversations", String(convId), "captions.json");
+      try { existing = JSON.parse(fs.readFileSync(capFile, "utf8")); } catch { /* none */ }
+      const provider = getProvider();
+      let model = defaultModelFor(provider.id);
+      if (!model) { const models = await provider.models(); model = models[0] ?? ""; }
+      const list = items.map((m: any, i: number) => `[${i + 1}] ${(m.content || "").slice(0, 300)}`).join("\n\n");
+      const sys = [
+        "Tu écris des légendes courtes pour la galerie d'illustrations d'une partie de roleplay.",
+        "Pour chaque extrait numéroté, écris une légende d'1-2 phrases qui résume ce qui se passe, comme la voix d'un documentaire.",
+        "Réponds strictement au format : 1: légende, 2: légende… Une ligne par numéro, rien d'autre.",
+      ].join(" ");
+      let text = "";
+      try {
+        for await (const delta of provider.stream({
+          messages: [{ role: "system", content: sys }, { role: "user", content: `Illustrations à légender :\n\n${list}` }],
+          model, temperature: 0.8, maxTokens: 800, noThinking: true,
+          signal: AbortSignal.timeout(120_000),
+        })) { text += delta; }
+      } catch (e) {
+        return json({ captions: existing, error: `Le modèle n'a pas pu écrire les légendes : ${e?.message ?? e}` });
+      }
+      const captions: Record<string, string> = {};
+      for (const line of text.split("\n")) {
+        const m = line.match(/^\s*(\d+)\s*[:.-]\s*(.+)$/);
+        if (m) {
+          const idx = Number(m[1]) - 1;
+          if (items[idx]) captions[String(items[idx].id)] = m[2].trim();
+        }
+      }
+      Object.assign(existing, captions);
+      fs.mkdirSync(path.dirname(capFile), { recursive: true });
+      fs.writeFileSync(capFile, JSON.stringify(existing, null, 2));
+      return json({ captions: existing });
+    }
     // edit a message's content (double-click in the UI)
-    if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] && method === "PATCH") {
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] && !parts[5] && method === "PATCH") {
       const convId = Number(parts[2]);
       const mid = Number(parts[4]);
       const body = await readJson(req);
@@ -644,7 +892,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       return json(messageView(getMessage(mid)!));
     }
     // delete message + everything after (for regenerate/edit)
-    if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] && method === "DELETE") {
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] && !parts[5] && method === "DELETE") {
       const convId = Number(parts[2]);
       const mid = Number(parts[4]);
       const msgs = listMessages(convId);
@@ -663,6 +911,23 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const last = lastMessageOf(convId);
       updateConversation(convId, { last_message: last?.content ?? "" });
       return json({ ok: true });
+    }
+    // emoji reactions on a message (kept in meta.reactions)
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] && parts[5] === "reactions" && (method === "POST" || method === "DELETE")) {
+      const mid = Number(parts[4]);
+      const m = getMessage(mid);
+      if (!m) return json({ error: "not found" }, 404);
+      const body = await readJson(req);
+      const emoji = String(body.emoji || "").trim();
+      if (!emoji) return json({ error: "emoji manquant" }, 400);
+      const meta = JSON.parse(m.meta || "{}");
+      const reactions: string[] = Array.isArray(meta.reactions) ? meta.reactions : [];
+      const idx = reactions.indexOf(emoji);
+      if (method === "POST" && idx < 0) reactions.push(emoji);
+      if (method === "DELETE" && idx >= 0) reactions.splice(idx, 1);
+      meta.reactions = reactions;
+      updateMessage(mid, { meta: JSON.stringify(meta) });
+      return json(messageView(getMessage(mid)!));
     }
     // stream a chat turn
     if (parts[1] === "conversations" && parts[2] && parts[3] === "stream" && method === "POST") {
@@ -728,6 +993,17 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         : body.vary ? undefined
         : char ? charSeed(char.id)
         : undefined;
+      // img2img: use the character's avatar as a visual reference so their
+      // face stays consistent from one illustration to the next
+      let init_image: string | undefined;
+      const fullChar = char ? cast.find((c) => c.id === char.id) ?? null : null;
+      const avatarRel = fullChar?.avatar ?? "";
+      if (avatarRel) {
+        const avatarFile = path.join(UPLOADS_DIR, path.basename(avatarRel));
+        if (fs.existsSync(avatarFile)) {
+          init_image = fs.readFileSync(avatarFile).toString("base64");
+        }
+      }
       const res = await generateAndSave(`conversations/${convId}`, {
         prompt,
         negative: NEGATIVE_PROMPT,
@@ -736,6 +1012,8 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         width: Number(getSetting("image_width", landscape ? 1152 : 768)),
         height: Number(getSetting("image_height", landscape ? 768 : 1152)),
         seed,
+        init_image,
+        strength: Number(getSetting("image_ref_strength", 0.55)),
       });
       const meta = { ...messageView(m).meta, image: res.url, image_seed: res.seed, image_kind: kind, image_char: char?.name ?? undefined };
       updateMessage(mid, { meta: JSON.stringify(meta) });
@@ -1079,7 +1357,16 @@ function applyContextWindow(
 ): { kept: MessageRow[]; summary?: string } {
   let cs: Record<string, unknown> = {};
   try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
-  const maxMsgs = Number(cs.context_max_messages ?? getSetting("context_max_messages", 20));
+  // per-world cap acts as a hard ceiling over the conversation's own value,
+  // so a world with a small model can protect every party in it
+  let maxMsgs = Number(cs.context_max_messages ?? getSetting("context_max_messages", 20));
+  const world = conv.world_id ? getWorld(conv.world_id) : null;
+  if (world) {
+    let ws: Record<string, unknown> = {};
+    try { ws = JSON.parse(world.settings || "{}"); } catch { /* ignore */ }
+    const worldCap = Number(ws.context_max_messages ?? getSetting("world_context_max_messages", 0));
+    if (worldCap > 0) maxMsgs = Math.min(maxMsgs, worldCap);
+  }
   if (history.length <= maxMsgs) return { kept: history, summary: conv.summary || undefined };
   const kept = history.slice(-maxMsgs);
   const firstKeptId = kept[0]?.id ?? 0;
@@ -1162,20 +1449,38 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
   const timeoutSec = Math.max(20, Number(getSetting("llm_timeout", 150)));
   const llmAbort = new AbortController();
   const llmTimer = setTimeout(() => llmAbort.abort(), timeoutSec * 1000);
+  let clientStopped = false;
+  let assistantCreated = false;
 
-  return sseStream(async (send, close) => {
+  return sseStream(
+    async (send, close) => {
     let full = "";
     try {
-      for await (const delta of provider.stream({
-        messages: [{ role: "system", content: system }, ...messages],
-        model,
-        temperature,
-        maxTokens,
-        noThinking: true,
-        signal: llmAbort.signal,
-      })) {
-        full += delta;
-        send("delta", { text: delta });
+      // transient failures (LM Studio loading a model, network blips) are
+      // retried with backoff before surfacing an error
+      const MAX_ATTEMPTS = 3;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          for await (const delta of provider.stream({
+            messages: [{ role: "system", content: system }, ...messages],
+            model,
+            temperature,
+            maxTokens,
+            noThinking: true,
+            signal: llmAbort.signal,
+          })) {
+            full += delta;
+            send("delta", { text: delta });
+          }
+          break; // stream finished
+        } catch (e: any) {
+          const aborted = e?.name === "AbortError" || e?.name === "TimeoutError" || /abort/i.test(String(e));
+          if (aborted || attempt >= MAX_ATTEMPTS) throw e;
+          const wait = 500 * attempt * attempt;
+          send("retry", { attempt, message: `Connexion au modèle instable — nouvelle tentative (${attempt}/${MAX_ATTEMPTS})…` });
+          await new Promise((r) => setTimeout(r, wait));
+          if (clientStopped) throw e;
+        }
       }
       clearTimeout(llmTimer);
       if (!full.trim()) {
@@ -1190,6 +1495,7 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
         conversation_id: convId, role: "assistant",
         name: cards[0]?.name ?? "Narrateur", content: full.trim(),
       });
+      assistantCreated = true;
       const segments = parseSegmentsFor(conv, full);
       updateMessage(assistant.id, { segments: JSON.stringify(segments) });
       touchConversation(convId);
@@ -1230,18 +1536,52 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
       }
       close();
     } catch (e: any) {
-      const timedOut =
-        e?.name === "AbortError" || e?.name === "TimeoutError" || /abort/i.test(String(e));
-      send("error", {
-        message: timedOut
-          ? `Le modèle n'a pas répondu dans le délai de ${timeoutSec} s (il est peut-être en train de charger). Réessaie, ou augmente le timeout dans les réglages.`
-          : String(e?.message ?? e),
-      });
-      // remove the user message on failure so the user can retry cleanly
-      deleteMessage(userMsg.id);
+      const aborted = e?.name === "AbortError" || e?.name === "TimeoutError" || /abort/i.test(String(e));
+      if (assistantCreated) {
+        // the reply was already committed — a post-done failure (TTS synthesis
+        // or suggestions on a stream the client already closed) must NOT
+        // remove the user turn: the exchange is complete
+        try {
+          send("error", {
+            message: aborted
+              ? `La réponse est là mais l'audio n'a pas pu être généré (${timeoutSec} s).`
+              : String(e?.message ?? e),
+          });
+        } catch { /* stream already closed */ }
+      } else if (aborted && clientStopped) {
+        // user pressed Stop: commit whatever the model already wrote, then
+        // drop the orphan user turn only if nothing was produced
+        if (full.trim()) {
+          const partial = createMessage({
+            conversation_id: convId, role: "assistant",
+            name: cards[0]?.name ?? "Narrateur", content: full.trim(),
+          });
+          const segs = parseSegmentsFor(conv, full);
+          updateMessage(partial.id, { segments: JSON.stringify(segs) });
+          touchConversation(convId);
+          updateConversation(convId, { last_message: full.trim().slice(0, 200) });
+        } else {
+          deleteMessage(userMsg.id);
+        }
+      } else {
+        send("error", {
+          message: aborted
+            ? `Le modèle n'a pas répondu dans le délai de ${timeoutSec} s (il est peut-être en train de charger). Réessaie, ou augmente le timeout dans les réglages.`
+            : String(e?.message ?? e),
+        });
+        // remove the user message on failure so the user can retry cleanly
+        deleteMessage(userMsg.id);
+      }
       close();
     } finally {
       clearTimeout(llmTimer);
     }
-  });
+  },
+    () => {
+      // client disconnected (Stop / tab closed): stop the model generation and
+      // clean up the pending exchange
+      clientStopped = true;
+      llmAbort.abort();
+    },
+  );
 }

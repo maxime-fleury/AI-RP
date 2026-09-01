@@ -97,10 +97,18 @@ describe("routing", async () => {
     expect(res.status).toBe(404);
   });
 
-  test("delete conversation removes the conversation", async () => {
+  test("delete conversation archives it (trash), permanent removes it", async () => {
     const conv = db.createConversation({ title: "À supprimer" });
     const res = await api(routes, "DELETE", `/api/conversations/${conv.id}`);
     expect(res.status).toBe(200);
+    expect(db.getConversation(conv.id)?.archived).toBe(1);
+    // restore via PATCH archived:0
+    const restore = await api(routes, "PATCH", `/api/conversations/${conv.id}`, { archived: false });
+    expect(restore.status).toBe(200);
+    expect(db.getConversation(conv.id)?.archived).toBe(0);
+    // permanent delete
+    const perm = await api(routes, "DELETE", `/api/conversations/${conv.id}/permanent`);
+    expect(perm.status).toBe(200);
     expect(db.getConversation(conv.id)).toBeNull();
   });
 

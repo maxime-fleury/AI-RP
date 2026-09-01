@@ -1,10 +1,11 @@
-import { api, readSseStream } from "./api.js?v=27";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=27";
-import { store, refreshAll, navigate, applyTheme } from "./app.js?v=27";
+import { api, readSseStream } from "./api.js?v=30";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=30";
+import { store, refreshAll, navigate, applyTheme } from "./app.js?v=30";
 
 let currentConversation = null;
 let currentCtx = null;
 let busy = false;
+let streamGeneration = 0;
 let abortController = null;
 let chipsRowRef = null;
 const audioPrepared = new Set();
@@ -53,7 +54,7 @@ export async function renderChat(convIdRaw) {
   if (convIdRaw === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=27");
+    const { newGameWizard } = await import("./app.js?v=30");
     newGameWizard(pre);
     return;
   }
@@ -87,7 +88,8 @@ export async function renderChat(convIdRaw) {
   const settingsBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Réglages de la partie", onclick: convSettingsModal }, "⚙️");
   const searchBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Rechercher dans l'historique (Entrée = suivant)", onclick: () => { searchBar.hidden = !searchBar.hidden; if (!searchBar.hidden) searchInput.focus(); } }, "🔍");
   const exportBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Exporter la partie (ZIP : texte + audio + images)", onclick: exportZip }, "⬇");
-  const delBtn = el("button", { class: "btn btn-ghost btn-icon", style: { color: "var(--danger)" }, title: "Supprimer cette partie", onclick: deleteConversation }, "🗑");
+  const galleryBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Galerie d'illustrations", onclick: openGallery }, "🖼");
+  const delBtn = el("button", { class: "btn btn-ghost btn-icon", style: { color: "var(--danger)" }, title: "Archiver cette partie", onclick: deleteConversation }, "🗑");
 
   const searchInput = el("input", { placeholder: "Rechercher dans le fil… (Entrée = suivant)" });
   const searchBar = el("div", { class: "search-bar", hidden: true }, searchInput);
@@ -123,7 +125,7 @@ export async function renderChat(convIdRaw) {
     }
   }
 
-  const header = el("div", { class: "chat-header" }, backBtn, titleBlock, castStrip, groupBtn, searchBtn, exportBtn, delBtn, settingsBtn);
+  const header = el("div", { class: "chat-header" }, backBtn, titleBlock, castStrip, groupBtn, searchBtn, galleryBtn, exportBtn, delBtn, settingsBtn);
 
   async function exportZip() {
     exportBtn.disabled = true;
@@ -145,11 +147,65 @@ export async function renderChat(convIdRaw) {
   }
 
   async function deleteConversation() {
-    if (!(await confirmModal({ title: "Supprimer la partie", message: `Supprimer « ${conv.title || "Partie"} » et tous ses fichiers audio/images ?`, confirmLabel: "Supprimer" }))) return;
+    if (!(await confirmModal({ title: "Archiver la partie", message: `Déplacer « ${conv.title || "Partie"} » dans la corbeille ? Tu pourras la restaurer depuis l'accueil. (La suppression définitive se fait dans la corbeille.)`, confirmLabel: "Archiver" }))) return;
     await api(`/api/conversations/${convId}`, { method: "DELETE" });
     await refreshAll();
     navigate("#/");
-    toast("Partie supprimée.");
+    toast("Partie archivée — corbeille dans l'accueil.");
+  }
+
+  async function openGallery() {
+    const data = await api(`/api/conversations/${convId}/gallery`).catch(() => ({ items: [], captions: {} }));
+    const items = data.items || [];
+    let captions = data.captions || {};
+    const grid = el("div", { class: "gallery-grid" });
+    const paint = () => {
+      grid.replaceChildren(...items.map((it) => {
+        const img = el("img", { src: it.image });
+        img.addEventListener("click", () => {
+          const lb = el("div", { class: "lightbox" },
+            el("img", { src: it.image }),
+            el("div", { class: "lb-meta" },
+              it.character ? el("span", { class: "chip" }, "🎭 " + esc(it.character)) : null,
+              el("span", { class: "chip" }, "seed " + (it.seed ?? "—")),
+            ),
+            el("p", { class: "lb-caption" }, captions[it.id] ? "💬 " + esc(captions[it.id]) : esc(it.message)),
+          );
+          lb.addEventListener("click", () => lb.remove());
+          document.body.append(lb);
+        });
+        return el("div", { class: "gallery-card" },
+          img,
+          el("div", { class: "gallery-cap" }, captions[it.id] ? "💬 " + esc(captions[it.id]) : esc(it.message || "")),
+        );
+      }));
+    };
+    paint();
+    const capBtn = el("button", { class: "btn btn-primary btn-sm", onclick: async () => {
+      capBtn.disabled = true;
+      capBtn.textContent = "✨ L'IA rédige les légendes…";
+      try {
+        const r = await api(`/api/conversations/${convId}/gallery/captions`, { method: "POST", body: {} }).catch(() => ({ captions: captions }));
+        captions = r.captions || {};
+        paint();
+        toast("Légendes générées ✓");
+      } catch (e) { toast(e.message, "err"); }
+      capBtn.disabled = false;
+      capBtn.textContent = "✨ Légendes IA";
+    } }, "✨ Légendes IA");
+    openModal({
+      title: "🖼 Galerie d'illustrations",
+      sub: "Les scènes de la partie — clique pour agrandir",
+      body: el("div", {},
+        el("div", { style: { display: "flex", justifyContent: "flex-end", marginBottom: "10px" } }, capBtn),
+        items.length ? grid : el("div", { class: "empty" },
+          el("div", { class: "big" }, "🖼"),
+          el("h3", {}, "Aucune illustration"),
+          el("p", {}, "Génère des images depuis les messages (bouton « Illustrer »)."),
+        ),
+      ),
+      wide: true,
+    });
   }
 
   // scroll area
@@ -165,11 +221,57 @@ export async function renderChat(convIdRaw) {
 
   // composer
   const textarea = el("textarea", { rows: 1, placeholder: conv.cards?.[0] ? `Écris ta réplique à ${conv.cards[0].name}…` : "Écris ton action ou ta réplique…" });
+  // slash-command autocomplete (Discord-style menu)
+  const SLASH_CMDS = [
+    { cmd: "/dice", desc: "Lancer des dés — ex: /dice 2d6, /dice d20" },
+    { cmd: "/ooc", desc: "Question hors-jeu au modèle" },
+    { cmd: "/narrate", desc: "Forcer le narrateur à raconter la scène" },
+    { cmd: "/card", desc: "État de la partie (lieu, enjeux, objectifs)" },
+  ];
+  let slashIdx = 0;
+  const slashMenu = el("div", { class: "slash-menu", hidden: true });
+  const paintSlash = () => {
+    [...slashMenu.querySelectorAll(".slash-item")].forEach((it, i) => it.classList.toggle("sel", i === slashIdx));
+  };
+  const renderSlash = (query) => {
+    const q = (query || "").toLowerCase();
+    const hits = SLASH_CMDS.filter((c) => c.cmd.startsWith("/" + q));
+    if (!hits.length) { slashMenu.hidden = true; return; }
+    slashIdx = 0;
+    slashMenu.hidden = false;
+    slashMenu.replaceChildren(...hits.map((c, i) =>
+      el("div", { class: `slash-item${i === 0 ? " sel" : ""}`, onclick: () => insertSlash(c.cmd) },
+        el("code", {}, c.cmd), el("span", {}, c.desc)),
+    ));
+  };
+  const insertSlash = (cmd) => {
+    const val = textarea.value;
+    const caret = textarea.selectionStart;
+    const before = val.slice(0, caret);
+    const after = val.slice(caret);
+    const m = before.match(/(\/[\p{L}]*)$/u);
+    const start = m ? before.length - m[1].length : before.length;
+    textarea.value = before.slice(0, start) + cmd + " " + after;
+    const pos = start + cmd.length + 1;
+    textarea.setSelectionRange(pos, pos);
+    slashMenu.hidden = true;
+    textarea.focus();
+  };
   textarea.addEventListener("input", () => {
     textarea.style.height = "auto";
     textarea.style.height = Math.min(textarea.scrollHeight, 140) + "px";
+    const v = textarea.value;
+    if (v.startsWith("/") && !v.includes("\n")) renderSlash(v.slice(1).split(/\s+/)[0]);
+    else slashMenu.hidden = true;
   });
   textarea.addEventListener("keydown", (e) => {
+    if (!slashMenu.hidden) {
+      const items = [...slashMenu.querySelectorAll(".slash-item")];
+      if (e.key === "ArrowDown") { e.preventDefault(); slashIdx = (slashIdx + 1) % items.length; paintSlash(); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); slashIdx = (slashIdx - 1 + items.length) % items.length; paintSlash(); return; }
+      if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); items[slashIdx]?.click(); return; }
+      if (e.key === "Escape") { e.preventDefault(); slashMenu.hidden = true; return; }
+    }
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
     else if (e.key === "Tab") { e.preventDefault(); autocompleteName(); }
   });
@@ -196,8 +298,22 @@ export async function renderChat(convIdRaw) {
     textarea.style.height = Math.min(textarea.scrollHeight, 140) + "px";
   }
   const sendBtn = el("button", { class: "send-btn", onclick: send, title: "Envoyer (Entrée)" }, "➤");
+  const stopBtn = el("button", { class: "send-btn stop-btn", hidden: true, onclick: stopStreaming, title: "Arrêter la génération" }, "⏹");
   const suggestBtn = el("button", { class: "send-btn ghost", onclick: onSuggest, title: "Suggestions de réponses" }, "💡");
-  const composer = el("div", { class: "composer" }, textarea, suggestBtn, sendBtn);
+  const composer = el("div", { class: "composer" }, textarea, suggestBtn, stopBtn, sendBtn);
+  function stopStreaming() {
+    if (abortController) {
+      const ac = abortController;
+      abortController = null;
+      ac.abort();
+      toast("Génération arrêtée.", "ok", 2500);
+      // the server commits whatever the model already wrote → show the real state
+      setTimeout(async () => {
+        await refreshAll();
+        if (currentConversation?.id) await renderChat(String(currentConversation.id));
+      }, 900);
+    }
+  }
   const chipsRow = el("div", { class: "chips-row" });
   const speakRow = el("div", { class: "speak-row" },
     el("span", { class: "chips-label" }, "Faire parler :"),
@@ -208,7 +324,7 @@ export async function renderChat(convIdRaw) {
     el("span", { class: "spinner" }),
     el("span", {}, "🔊 Préparation des voix en cours…"),
   );
-  const composerWrap = el("div", { class: "composer-wrap" }, ttsBar, speakRow, chipsRow, composer);
+  const composerWrap = el("div", { class: "composer-wrap" }, ttsBar, slashMenu, speakRow, chipsRow, composer);
 
   chipsRowRef = chipsRow;
 
@@ -237,7 +353,7 @@ export async function renderChat(convIdRaw) {
   scrollToBottom(scroll, true);
   setTimeout(() => textarea.focus(), 80);
 
-  currentCtx = { scroll, textarea, sendBtn };
+  currentCtx = { scroll, textarea, sendBtn, stopBtn };
 
   // background: pre-generate the audio of recent messages so it's ready to listen
   if (store.settings.tts_enabled !== false && !audioPrepared.has(convId)) {
@@ -251,11 +367,12 @@ export async function renderChat(convIdRaw) {
             // another job is already synthesizing — keep the indicator on and
             // re-sync once it finishes
             audioPrepared.delete(convId);
-            setTimeout(() => { if (currentConversation?.id === convId) renderChat(convId); }, 25000);
+            setTimeout(() => { if (currentConversation?.id === convId && !busy) renderChat(convId); }, 25000);
             return;
           }
           ttsBar.hidden = true;
-          if (res?.generated > 0 && currentConversation?.id === convId) renderChat(convId);
+          // never re-render mid-stream: it would detach the composer state (stop/busy)
+          if (res?.generated > 0 && currentConversation?.id === convId && !busy) renderChat(convId);
         })
         .catch(() => { ttsBar.hidden = true; });
     }
@@ -295,6 +412,12 @@ export async function renderChat(convIdRaw) {
     const temp = field("Température", convSettings.temperature ?? 0.9, { type: "number", min: 0, max: 2, step: 0.1 });
     const maxTok = field("Max tokens", convSettings.max_tokens ?? 2048, { type: "number", min: 64, max: 8192, step: 64 });
     const ctxMax = field("Tours gardés en mémoire", convSettings.context_max_messages ?? store.settings.context_max_messages ?? 20, { type: "number", min: 4, max: 100, step: 1 });
+
+    // ── Contexte (estimation des tokens envoyés au modèle) ──
+    const ctxLine = el("div", { class: "ctx-line" }, "⏳ estimation du contexte…");
+    api(`/api/conversations/${convId}/context`).then((r) => {
+      ctxLine.textContent = `≈ ${r.tokens.toLocaleString("fr-FR")} tokens · ${r.messageCount} messages (dont ${r.systemTokens.toLocaleString("fr-FR")} pour le prompt système)`;
+    }).catch(() => { ctxLine.textContent = "Contexte indisponible."; });
 
     // ── Mode de jeu ──
     let groupMode = Boolean(currentConversation.group_mode);
@@ -356,6 +479,7 @@ export async function renderChat(convIdRaw) {
       el("div", { class: "modal-section" }, "Modèle & génération"),
       el("div", { class: "row" }, provider.wrap, model.wrap),
       el("div", { class: "row3" }, temp.wrap, maxTok.wrap, ctxMax.wrap),
+      ctxLine,
       el("div", { class: "modal-section" }, "Mode de jeu"),
       el("div", { class: "row" }, el("div", { class: "modal-line" },
         el("div", { class: "ml-txt" }, el("strong", {}, "Faire jouer tous les personnages"), el("small", {}, "Groupe : chacun réagit à la scène · Solo : un personnage principal")),
@@ -423,13 +547,20 @@ export async function renderChat(convIdRaw) {
 // ─── streaming a turn ─────────────────────────────────────────────────────────
 async function doStream(content, opts = {}) {
   if (!currentConversation || !currentCtx) return;
-  const { scroll, textarea, sendBtn } = currentCtx;
+  const { scroll, textarea, sendBtn, stopBtn } = currentCtx;
   busy = true;
   sendBtn.disabled = true;
+  if (stopBtn) stopBtn.hidden = false;
+  const streamGen = ++streamGeneration;
 
   // optimistic user bubble (display text may differ from the raw content)
   const displayText = opts.display || content;
-  const userMsg = { id: `tmp-${Date.now()}`, role: "user", name: currentConversation.persona?.name || "Moi", content: displayText, segments: [], audio: [], meta: {}, created_at: Date.now() };
+  // animated dice roll on /dice messages (must be set before renderMessage)
+  const userMsg = {
+    id: `tmp-${Date.now()}`, role: "user", name: currentConversation.persona?.name || "Moi",
+    content: displayText, segments: [], audio: [], meta: {}, created_at: Date.now(),
+    bubbleClass: displayText.startsWith("🎲 ") ? "dice-roll" : undefined,
+  };
   scroll.append(renderMessage(userMsg));
 
   let csTts = {};
@@ -446,11 +577,15 @@ async function doStream(content, opts = {}) {
   const thinkEl = el("div", { class: "think-time" }, "⏱ 0s");
   bodyEl.append(thinkEl);
   const thinkStart = Date.now();
+  const baseTitle = document.title;
   const thinkTimer = setInterval(() => {
     thinkEl.textContent = `⏱ ${Math.round((Date.now() - thinkStart) / 1000)}s`;
+    // live progress in the tab title while the tab is hidden
+    if (document.hidden) document.title = `⏳ ${Math.round((Date.now() - thinkStart) / 1000)}s · ${full.length} c. — ${baseTitle}`;
   }, 1000);
   scroll.append(pendingNode);
   scrollToBottom(scroll);
+  sfx("whoosh");
 
   abortController = new AbortController();
   let full = "";
@@ -472,6 +607,8 @@ async function doStream(content, opts = {}) {
         }
         scrollToBottom(scroll);
       } else if (event === "done") {
+        sfx("chime");
+        if (document.hidden) notify("Réponse prête ✨", (currentConversation?.title || "Partie") + " — " + (data.message?.content || "").slice(0, 80));
         const m = data.message;
         lastDoneId = m.id;
         bodyEl.replaceChildren();
@@ -493,6 +630,7 @@ async function doStream(content, opts = {}) {
         if (act) act.replaceChildren(el("span", { class: "tts-note" }, "🔊 génération de la voix…"));
       } else if (event === "tts-done") {
         const { messageId, audio } = data;
+        if (document.hidden) notify("🎙 Voix prête", "L'audio de la réponse est généré.");
         const node = document.querySelector(`[data-mid="${messageId}"]`);
         if (node) {
           const act = node.querySelector(".msg-actions");
@@ -510,6 +648,7 @@ async function doStream(content, opts = {}) {
     await refreshAll();
   } catch (e) {
     if (e.name !== "AbortError") {
+      if (document.hidden) notify("⚠️ Erreur", String(e.message || "Échec"));
       pendingNode.remove();
       const errNode = el("div", { class: "msg me" },
         el("div", { class: "bubble", style: { borderColor: "var(--danger)", color: "var(--danger)" } },
@@ -522,10 +661,75 @@ async function doStream(content, opts = {}) {
     }
   } finally {
     clearInterval(thinkTimer);
+    document.title = baseTitle;
     busy = false;
     if (sendBtn) sendBtn.disabled = false;
+    if (stopBtn) stopBtn.hidden = true;
     textarea?.focus();
   }
+}
+
+// ─── micro-sfx (synthesized, zero assets) ─────────────────────────────────────
+let _audioCtx = null;
+function sfx(kind) {
+  try {
+    if (window.__aiRpSettings?.sound_effects === false && store?.settings?.sound_effects === false) return;
+    const allowed = store?.settings?.sound_effects !== false;
+    if (!allowed) return;
+    _audioCtx = _audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const ctx = _audioCtx;
+    if (ctx.state === "suspended") ctx.resume();
+    const t = ctx.currentTime;
+    if (kind === "whoosh") {
+      // short filtered noise sweep going up
+      const dur = 0.28;
+      const buf = ctx.createBuffer(1, ctx.sampleRate * dur, ctx.sampleRate);
+      const ch = buf.getChannelData(0);
+      for (let i = 0; i < ch.length; i++) ch[i] = (Math.random() * 2 - 1) * (1 - i / ch.length);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      const filt = ctx.createBiquadFilter();
+      filt.type = "bandpass";
+      filt.frequency.setValueAtTime(300, t);
+      filt.frequency.exponentialRampToValueAtTime(2200, t + dur);
+      filt.Q.value = 1.2;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.12, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+      src.connect(filt).connect(g).connect(ctx.destination);
+      src.start(t);
+    } else if (kind === "chime") {
+      // two soft sine notes (E5→A5)
+      [659.25, 880].forEach((freq, i) => {
+        const osc = ctx.createOscillator();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        const g = ctx.createGain();
+        const start = t + i * 0.14;
+        g.gain.setValueAtTime(0, start);
+        g.gain.linearRampToValueAtTime(0.09, start + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.001, start + 0.6);
+        osc.connect(g).connect(ctx.destination);
+        osc.start(start);
+        osc.stop(start + 0.65);
+      });
+    }
+  } catch { /* sfx is best-effort */ }
+}
+
+// ─── notifications (tab hidden → OS notification + title flash) ───────────────
+function notify(title, body) {
+  try {
+    if ("Notification" in window && Notification.permission === "granted") {
+      new Notification(title, { body });
+    }
+  } catch { /* ignore */ }
+  const orig = document.title;
+  let n = 0;
+  const flash = setInterval(() => {
+    document.title = n++ % 2 ? orig : "🔔 " + title;
+    if (n >= 8) { clearInterval(flash); document.title = orig; }
+  }, 700);
 }
 
 // ─── suggestion chips (module level: called from the SSE handler too) ────────
@@ -633,11 +837,15 @@ function renderMessage(m) {
   if (isMe) {
     body.append(el("div", {}, esc(m.content)));
   } else if (segs.length) {
-    for (const s of segs) body.append(el("div", {}, formatSegment(s)));
+    for (let i = 0; i < segs.length; i++) {
+      const row = el("div", { class: `seg seg-${i}`, title: "Clique pour écouter ce segment" }, formatSegment(segs[i]));
+      row.addEventListener("click", () => playSegment(m, i, row));
+      body.append(row);
+    }
   } else if (m.content) {
     for (const b of splitBlocks(m.content)) body.append(el("div", {}, formatBody(b)));
   }
-  const bubble = el("div", { class: "bubble", title: "Double-clic pour modifier" },
+  const bubble = el("div", { class: "bubble" + (m.bubbleClass ? " " + m.bubbleClass : ""), title: "Double-clic pour modifier" },
     isMe ? null : el("div", { class: "who" }, esc(m.name || "Narrateur")),
     body,
   );
@@ -670,6 +878,30 @@ function renderMessage(m) {
   }
   if (!isMe && m.id && !String(m.id).startsWith("pending")) {
     bubble.append(el("div", { class: "msg-actions" }, ...messageActions(m.id, m.audio || [])));
+  }
+  // emoji reactions (kept server-side in meta.reactions)
+  if (m.id && !String(m.id).startsWith("pending")) {
+    const list = Array.isArray(m.meta?.reactions) ? m.meta.reactions : [];
+    const reacts = el("div", { class: "reactions" });
+    for (const r of ["👍", "❤️", "😂"]) {
+      const on = list.includes(r);
+      const btn = el("button", { class: "reaction" + (on ? " on" : ""), title: on ? "Retirer la réaction" : "Réagir" }, r);
+      btn.addEventListener("click", async () => {
+        try {
+          await api(`/api/conversations/${currentConversation.id}/messages/${m.id}/reactions`, {
+            method: on ? "DELETE" : "POST", body: { emoji: r },
+          });
+          const fresh = await api(`/api/conversations/${currentConversation.id}`);
+          const nm = fresh.messages.find((x) => x.id === m.id) || m;
+          const i = currentConversation.messages.findIndex((x) => x.id === m.id);
+          if (i >= 0) currentConversation.messages[i] = nm;
+          const node = document.querySelector(`[data-mid="${m.id}"]`);
+          node?.replaceWith(renderMessage(nm));
+        } catch (e) { toast(e.message, "err"); }
+      });
+      reacts.append(btn);
+    }
+    bubble.append(reacts);
   }
   const avatar = avatarFor(m);
   return el("div", { class: `msg${isMe ? " me" : ""}`, dataset: { mid: m.id, role: m.role } },
@@ -771,8 +1003,52 @@ function messageActions(messageId, audio) {
     } catch (err) { toast(err.message, "err"); }
     finally { illuSel.disabled = false; }
   });
+  const rateSel = el("select", { class: "rate-select", title: "Vitesse de lecture des segments" },
+    el("option", { value: "0.75" }, "0.75×"),
+    el("option", { value: "1", selected: "" }, "1×"),
+    el("option", { value: "1.25" }, "1.25×"),
+  );
+  rateSel.addEventListener("change", () => { segRate = Number(rateSel.value); });
   const retryBtn = el("button", { class: "mini-btn regen-btn", onclick: () => regenerate(messageId) }, ICONS.retry, "Régénérer");
-  return [playBtn, illuSel, retryBtn];
+  return [playBtn, illuSel, rateSel, retryBtn];
+}
+
+// ─── mini segment player: click one segment to hear it ───────────────────────
+let segRate = 1;
+let segPlaying = null; // { audio, el }
+function stopSeg() {
+  if (segPlaying) {
+    try { segPlaying.audio.pause(); } catch { /* ignore */ }
+    segPlaying.el.classList.remove("playing");
+    segPlaying = null;
+  }
+}
+async function playSegment(m, idx, rowEl) {
+  if (segPlaying && segPlaying.el === rowEl) { stopSeg(); return; }
+  const audio = (m.audio || [])[idx];
+  if (!audio?.path) {
+    // not synthesized yet → generate, swap the message in place, then play
+    toast("Génération de la voix du segment…", "ok", 6000);
+    await api(`/api/conversations/${currentConversation.id}/messages/${m.id}/tts`, { body: {} });
+    const fresh = await api(`/api/conversations/${currentConversation.id}`);
+    const nm = fresh.messages.find((x) => x.id === m.id);
+    if (!nm) return;
+    const i = currentConversation.messages.findIndex((x) => x.id === m.id);
+    if (i >= 0) currentConversation.messages[i] = nm;
+    const node = document.querySelector(`[data-mid="${m.id}"]`);
+    node?.replaceWith(renderMessage(nm));
+    const segEl = document.querySelector(`[data-mid="${m.id}"] .seg-${idx}`);
+    if (segEl && nm.audio?.[idx]?.path) playSegment(nm, idx, segEl);
+    return;
+  }
+  stopSeg();
+  const a = new Audio(audio.path);
+  a.playbackRate = segRate;
+  segPlaying = { audio: a, el: rowEl };
+  rowEl.classList.add("playing");
+  a.onended = () => { rowEl.classList.remove("playing"); if (segPlaying?.audio === a) segPlaying = null; };
+  a.onerror = () => { rowEl.classList.remove("playing"); if (segPlaying?.audio === a) segPlaying = null; };
+  await a.play().catch(() => {});
 }
 
 // keyboard shortcuts from within the chat (see app.js global handler)
@@ -902,7 +1178,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal, field } from "./ui.js?v=27";
+import { openModal, field } from "./ui.js?v=30";
 void applyTheme;
 void fmtTime;
 void currentConversation;

@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS worlds (
   language TEXT NOT NULL DEFAULT '',
   cover TEXT NOT NULL DEFAULT '',
   settings TEXT NOT NULL DEFAULT '{}',
+  map TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS scenarios (
@@ -69,6 +70,8 @@ CREATE TABLE IF NOT EXISTS conversations (
   scenario_id INTEGER REFERENCES scenarios(id) ON DELETE SET NULL,
   cast TEXT NOT NULL DEFAULT '[]',
   group_mode INTEGER NOT NULL DEFAULT 0,
+  pinned INTEGER NOT NULL DEFAULT 0,
+  archived INTEGER NOT NULL DEFAULT 0,
   settings TEXT NOT NULL DEFAULT '{}',
   last_message TEXT NOT NULL DEFAULT '',
   summary TEXT NOT NULL DEFAULT '',
@@ -94,6 +97,10 @@ CREATE TABLE IF NOT EXISTS messages (
   const convCols = new Set((db.query("PRAGMA table_info(conversations)").all() as any[]).map((c) => c.name));
   if (!convCols.has("summary")) db.exec("ALTER TABLE conversations ADD COLUMN summary TEXT NOT NULL DEFAULT ''");
   if (!convCols.has("summary_msg_id")) db.exec("ALTER TABLE conversations ADD COLUMN summary_msg_id INTEGER NOT NULL DEFAULT 0");
+  if (!convCols.has("pinned")) db.exec("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0");
+  if (!convCols.has("archived")) db.exec("ALTER TABLE conversations ADD COLUMN archived INTEGER NOT NULL DEFAULT 0");
+  const worldCols = new Set((db.query("PRAGMA table_info(worlds)").all() as any[]).map((c: any) => c.name));
+  if (!worldCols.has("map")) db.exec("ALTER TABLE worlds ADD COLUMN map TEXT NOT NULL DEFAULT ''");
 }
 
 const now = () => Date.now();
@@ -127,7 +134,7 @@ export function allSettings(): Record<string, unknown> {
 // ─── worlds ───────────────────────────────────────────────────────────────────
 export interface WorldRow {
   id: number; name: string; description: string; lore: string; tone: string;
-  narration_style: string; language: string; cover: string; settings: string; created_at: number;
+  narration_style: string; language: string; cover: string; settings: string; map: string; created_at: number;
 }
 
 export function listWorlds(): WorldRow[] {
@@ -154,10 +161,10 @@ export function updateWorld(id: number, w: Partial<WorldRow>): WorldRow | null {
   if (!cur) return null;
   const merged = { ...cur, ...w, id };
   db.query(
-    `UPDATE worlds SET name=?, description=?, lore=?, tone=?, narration_style=?, language=?, cover=?, settings=? WHERE id=?`,
+    `UPDATE worlds SET name=?, description=?, lore=?, tone=?, narration_style=?, language=?, cover=?, settings=?, map=? WHERE id=?`,
   ).run(
     merged.name, merged.description, merged.lore, merged.tone, merged.narration_style,
-    merged.language, merged.cover, merged.settings, id,
+    merged.language, merged.cover, merged.settings, merged.map, id,
   );
   return getWorld(id);
 }
@@ -290,7 +297,7 @@ export function deletePersona(id: number): void {
 // ─── conversations ────────────────────────────────────────────────────────────
 export interface ConversationRow {
   id: number; title: string; world_id: number | null; persona_id: number | null;
-  scenario_id: number | null; cast: string; group_mode: number; settings: string;
+  scenario_id: number | null; cast: string; group_mode: number; pinned: number; archived: number; settings: string;
   last_message: string; summary: string; summary_msg_id: number; created_at: number; updated_at: number;
 }
 
@@ -321,10 +328,11 @@ export function updateConversation(id: number, c: Partial<ConversationRow>): Con
   for (const [k, v] of Object.entries(c)) if (v !== undefined) clean[k] = v;
   const merged = { ...cur, ...clean, id };
   db.query(
-    `UPDATE conversations SET title=?, world_id=?, persona_id=?, scenario_id=?, cast=?, group_mode=?, settings=?, last_message=?, summary=?, summary_msg_id=?, updated_at=? WHERE id=?`,
+    `UPDATE conversations SET title=?, world_id=?, persona_id=?, scenario_id=?, cast=?, group_mode=?, pinned=?, archived=?, settings=?, last_message=?, summary=?, summary_msg_id=?, updated_at=? WHERE id=?`,
   ).run(
     merged.title, merged.world_id, merged.persona_id, merged.scenario_id, merged.cast,
-    merged.group_mode, merged.settings, merged.last_message, merged.summary, merged.summary_msg_id, now(), id,
+    merged.group_mode, merged.pinned, merged.archived, merged.settings, merged.last_message,
+    merged.summary, merged.summary_msg_id, now(), id,
   );
   return getConversation(id);
 }

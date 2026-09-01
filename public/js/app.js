@@ -1,6 +1,6 @@
-import { api, apiForm, uploadFiles } from "./api.js?v=27";
-import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=27";
-import { renderChat } from "./chat.js?v=27";
+import { api, apiForm, uploadFiles, setToken } from "./api.js?v=30";
+import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=30";
+import { renderChat } from "./chat.js?v=30";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -28,6 +28,21 @@ export async function refreshAll() {
     loaded: true,
   });
   return store;
+}
+
+// personalization: accent color + background image (local to this device)
+export function applyCustom() {
+  const accent = localStorage.getItem("ai-rp-accent");
+  if (accent) document.documentElement.style.setProperty("--accent", accent);
+  else document.documentElement.style.removeProperty("--accent");
+  const bg = localStorage.getItem("ai-rp-bg");
+  if (bg) {
+    document.documentElement.style.setProperty("--app-bg", `url("${bg}")`);
+    document.body.classList.add("custom-bg");
+  } else {
+    document.documentElement.style.removeProperty("--app-bg");
+    document.body.classList.remove("custom-bg");
+  }
 }
 
 export function applyTheme(theme) {
@@ -116,6 +131,17 @@ export function navigate(hash) {
   location.hash = hash;
 }
 
+function doRender(section, parts) {
+  if (section === "" || section === "home") return renderDashboard();
+  if (section === "worlds") return renderWorlds();
+  if (section === "world") return renderWorldDetail(parts[1]);
+  if (section === "cards") return renderCards();
+  if (section === "personas") return renderPersonas();
+  if (section === "settings") return renderSettings();
+  if (section === "chat") return renderChat(parts[1]);
+  return renderDashboard();
+}
+
 async function route() {
   const hash = location.hash || "#/";
   const parts = hash.slice(2).split("/").filter(Boolean);
@@ -124,22 +150,26 @@ async function route() {
   renderSidebar(currentSection);
   document.getElementById("sidebar")?.classList.remove("open"); // close the mobile drawer
   window.scrollTo(0, 0);
-  try {
-    if (section === "" || section === "home") return renderDashboard();
-    if (section === "worlds") return renderWorlds();
-    if (section === "world") return renderWorldDetail(parts[1]);
-    if (section === "cards") return renderCards();
-    if (section === "personas") return renderPersonas();
-    if (section === "settings") return renderSettings();
-    if (section === "chat") return renderChat(parts[1]);
-    return renderDashboard();
-  } catch (e) {
-    main().replaceChildren(el("div", { class: "empty" },
-      el("div", { class: "big" }, "😵"),
-      el("h3", {}, "Oups"),
-      el("p", {}, esc(String(e?.message || e))),
-      el("button", { class: "btn btn-primary", onclick: () => location.reload() }, "Recharger"),
-    ));
+  const run = async () => {
+    try {
+      return doRender(section, parts);
+    } catch (e) {
+      main().replaceChildren(el("div", { class: "empty" },
+        el("div", { class: "big" }, "😵"),
+        el("h3", {}, "Oups"),
+        el("p", {}, esc(String(e?.message || e))),
+        el("button", { class: "btn btn-primary", onclick: () => location.reload() }, "Recharger"),
+      ));
+    }
+  };
+  // View Transitions API: the #main content cross-fades between routes
+  if (document.startViewTransition) {
+    try {
+      const vt = document.startViewTransition(run);
+      await vt.ready;
+    } catch { await run(); }
+  } else {
+    await run();
   }
 }
 
@@ -175,7 +205,7 @@ document.addEventListener("keydown", (e) => {
   else if (k === "n") { e.preventDefault(); newGameWizard(); }
   else if (inChat && (k === "r" || k === "g" || k === "/")) {
     e.preventDefault();
-    import("./chat.js?v=27").then((m) => m.chatShortcut(k)).catch(() => {});
+    import("./chat.js?v=30").then((m) => m.chatShortcut(k)).catch(() => {});
   }
 });
 
@@ -189,33 +219,143 @@ document.getElementById("sidebar")?.addEventListener("click", (e) => {
 });
 
 // ─── dashboard ────────────────────────────────────────────────────────────────
+let trashMode = false;
+
 function renderDashboard() {
-  const recent = store.conversations.slice(0, 6);
+  const all = store.conversations;
+  const archived = all.filter((c) => c.archived);
+  const active = all.filter((c) => !c.archived);
+  const pinned = active.filter((c) => c.pinned);
+  const rest = active.filter((c) => !c.pinned);
   const worldCards = store.worlds.slice(0, 6);
+  const banner = store.worlds[0]?.cover;
+
+  if (trashMode) {
+    main().replaceChildren(...[
+      el("div", { class: "hero" },
+        el("h2", {}, "🗑 Corbeille"),
+        el("p", {}, "Les parties archivées restent ici (texte + audio + images) jusqu'à restauration ou suppression définitive."),
+        el("div", { class: "cta-row" },
+          el("button", { class: "btn btn-ghost", onclick: () => { trashMode = false; renderDashboard(); } }, "← Retour à l'accueil"),
+        ),
+      ),
+      archived.length ? el("div", { class: "grid" }, archived.map(trashCard)) : el("div", { class: "empty" },
+        el("div", { class: "big" }, "🗑"),
+        el("h3", {}, "Corbeille vide"),
+        el("p", {}, "Rien d'archivé pour l'instant."),
+      ),
+    ].filter(Boolean));
+    return;
+  }
+
   main().replaceChildren(...[
-    el("div", { class: "hero" },
-      el("h2", {}, "Bienvenue, aventurier. ✨"),
-      el("p", {}, "Crée des mondes, importe des personnages (cartes SillyTavern), définis tes scénarios isekai et laisse l'IA raconter l'histoire — avec des voix différentes pour chaque personnage."),
-      el("div", { class: "cta-row" },
-        el("button", { class: "btn btn-primary", onclick: newGameWizard }, ICONS.plus, "Nouvelle partie"),
-        el("a", { href: "#/worlds", class: "btn btn-ghost" }, ICONS.worlds, "Explorer les mondes"),
-        el("a", { href: "#/cards", class: "btn btn-ghost" }, ICONS.cards, "Importer des cartes"),
+    el("div", { class: "hero" + (banner ? " hero-banner" : ""), style: banner ? { backgroundImage: `url(${banner})` } : null },
+      el("div", { class: "hero-inner" },
+        el("h2", {}, "Bienvenue, aventurier. ✨"),
+        el("p", {}, "Crée des mondes, importe des personnages (cartes SillyTavern), définis tes scénarios isekai et laisse l'IA raconter l'histoire — avec des voix différentes pour chaque personnage."),
+        el("div", { class: "cta-row" },
+          el("button", { class: "btn btn-primary", onclick: newGameWizard }, ICONS.plus, "Nouvelle partie"),
+          el("a", { href: "#/worlds", class: "btn btn-ghost" }, ICONS.worlds, "Explorer les mondes"),
+          el("a", { href: "#/cards", class: "btn btn-ghost" }, ICONS.cards, "Importer des cartes"),
+        ),
       ),
     ),
-    recent.length ? el("div", { class: "section-title" }, "Continuer une partie") : null,
-    recent.length ? el("div", { class: "grid" }, recent.map(convCard)) : null,
+    archived.length ? el("div", { class: "section-title" }, "Corbeille",
+      el("button", { class: "chip-btn slim", style: { marginLeft: "10px" }, onclick: () => { trashMode = true; renderDashboard(); } }, "🗑 " + archived.length),
+    ) : null,
+    pinned.length ? el("div", { class: "section-title" }, "⭐ Parties épinglées") : null,
+    pinned.length ? el("div", { class: "grid" }, pinned.map(convCard)) : null,
+    rest.length ? el("div", { class: "section-title" }, "Continuer une partie") : null,
+    rest.length ? el("div", { class: "grid" }, rest.map(convCard)) : null,
     worldCards.length ? el("div", { class: "section-title" }, "Mondes récents") : null,
     worldCards.length ? el("div", { class: "grid" }, worldCards.map(worldCard)) : null,
-    !store.worlds.length && !store.cards.length ? el("div", { class: "empty" },
-      el("div", { class: "big" }, "🧭"),
-      el("h3", {}, "Un univers à inventer"),
-      el("p", {}, "Commence par créer un monde (un isekai ?), puis importe des cartes de personnages pour peupler tes scénarios."),
-      el("div", { style: { display: "flex", gap: "10px", justifyContent: "center" } },
-        el("button", { class: "btn btn-primary", onclick: newGameWizard }, "Créer ma première partie"),
-        el("a", { href: "#/settings", class: "btn btn-ghost" }, "Configurer l'IA d'abord"),
-      ),
-    ) : null,
+    !store.worlds.length && !store.cards.length ? onboardingPanel() : null,
   ].filter(Boolean));
+}
+
+// ─── first-run onboarding (no world, no card yet) ────────────────────────────
+function onboardingPanel() {
+  const modelLine = el("div", { class: "onb-line" }, "⏳ vérification de la connexion IA…");
+  const imgLine = el("div", { class: "onb-line" }, "Modèle d'images : au premier usage (chargement long).");
+  const check = () => {
+    api("/api/health")
+      .then((h) => {
+        const ok = h?.tts?.fr || h?.tts?.en;
+        modelLine.replaceChildren(
+          el("span", { class: "dot", style: { background: ok ? "var(--ok, #2ecc71)" : "var(--warn, #f1c40f)" } }),
+          el("span", {}, ok
+            ? "IA locale détectée — le TTS est prêt. Tu peux commencer !"
+            : "TTS en cours de chargement (10-20 s la 1re fois) — ça se passe en arrière-plan."),
+        );
+      })
+      .catch((e) => {
+        modelLine.replaceChildren(
+          el("span", { class: "dot", style: { background: "var(--danger, #e74c3c)" } }),
+          el("span", {}, "Pas de connexion IA détectée : " + esc(e.message) + " → "),
+          el("a", { href: "#/settings", class: "onb-link" }, "ouvrir les Réglages"),
+        );
+      });
+    api("/api/storage").then((st) => {
+      imgLine.textContent = `Stockage actuel : ${((st.audioMB || 0) + (st.imagesMB || 0)).toFixed(1)} Mo d'audio/images générés, ${st.backups?.length ?? 0} backup(s) auto.`;
+    }).catch(() => {});
+  };
+  check();
+  const step = (n, title, desc) => el("div", { class: "onb-step" },
+    el("div", { class: "onb-num" }, String(n)),
+    el("div", {},
+      el("h4", {}, title),
+      el("p", {}, desc),
+    ),
+  );
+  return el("div", { class: "onboarding card" },
+    el("div", { class: "onb-hero" },
+      el("div", { class: "big" }, "🧭"),
+      el("h3", {}, "Ton univers t'attend"),
+      el("p", {}, "Trois étapes et tu joues : connecte l'IA, crée ton premier monde (isekai ?), importe ou crée des personnages."),
+    ),
+    el("div", { class: "onb-steps" },
+      step(1, "L'IA", "LM Studio local ou OpenRouter, configuré dans les Réglages."),
+      step(2, "Ton monde", "Un monde = un cadre, son histoire, des scénarios multiples (mystère, romance, PVP…)."),
+      step(3, "Le casting", "Importe des cartes SillyTavern (.png) ou crée tes personnages — chacun avec sa voix TTS."),
+    ),
+    el("div", { class: "onb-status" }, modelLine, imgLine),
+    el("div", { class: "onb-cta" },
+      el("button", { class: "btn btn-primary", onclick: newGameWizard }, ICONS.plus, "Créer ma première partie"),
+      el("a", { href: "#/cards", class: "btn btn-ghost" }, ICONS.cards, "Importer des cartes"),
+      el("a", { href: "#/settings", class: "btn btn-ghost" }, "⚙️ Configurer l'IA"),
+    ),
+  );
+}
+
+async function togglePin(c) {
+  await api(`/api/conversations/${c.id}`, { method: "PATCH", body: { pinned: !c.pinned } });
+  await refreshAll();
+  renderDashboard();
+}
+
+function trashCard(c) {
+  const world = c.world;
+  return el("div", { class: "card trash-card" },
+    el("div", { class: "card-body" },
+      el("h3", {}, esc(c.title)),
+      el("div", { class: "desc" }, esc((c.last_message || "").slice(0, 90) || world?.name || "")),
+      el("div", { class: "card-actions" },
+        world ? el("span", { class: "chip" }, esc(world.name)) : null,
+        el("button", { class: "mini-btn", onclick: async () => {
+          await api(`/api/conversations/${c.id}`, { method: "PATCH", body: { archived: false } });
+          await refreshAll();
+          renderDashboard();
+        } }, "↩ Restaurer"),
+        el("button", { class: "mini-btn", style: { color: "var(--danger)" }, onclick: async () => {
+          if (await confirmModal({ title: "Supprimer définitivement", message: `Tout sera perdu (messages, audio, images) : « ${c.title} » ?`, confirmLabel: "Supprimer" })) {
+            await api(`/api/conversations/${c.id}/permanent`, { method: "DELETE" });
+            await refreshAll();
+            renderDashboard();
+          }
+        } }, ICONS.trash, "Définitif"),
+      ),
+    ),
+  );
 }
 
 function convCard(c) {
@@ -223,6 +363,7 @@ function convCard(c) {
   const last = c.last_message ? c.last_message.slice(0, 90) : "";
   return el("div", { class: "card", style: { cursor: "pointer" }, onclick: () => navigate(`#/chat/${c.id}`) },
     el("div", { class: "card-cover", style: world?.cover ? { backgroundImage: `url(${world.cover})` } : { background: "linear-gradient(135deg, var(--active-bg), transparent)" } }),
+    el("button", { class: "star-btn" + (c.pinned ? " on" : ""), title: c.pinned ? "Désépingler" : "Épingler cette partie", onclick: (e) => { e.stopPropagation(); togglePin(c); } }, c.pinned ? "★" : "☆"),
     el("div", { class: "card-body" },
       el("h3", {}, esc(c.title)),
       el("div", { class: "desc" }, esc(last || world?.name || "Nouvelle partie")),
@@ -236,14 +377,25 @@ function convCard(c) {
 }
 
 function worldCard(w) {
-  return el("div", { class: "card", style: { cursor: "pointer" }, onclick: () => navigate(`#/world/${w.id}`) },
-    el("div", { class: "card-cover", style: w.cover ? { backgroundImage: `url(${w.cover})` } : { background: "linear-gradient(135deg, var(--accent-glow), transparent)" } }),
+  // lore card: the world's map (if any) or cover becomes the hero backdrop,
+  // with scenario badges — the composition changes as the world lives
+  const art = w.map || w.cover;
+  const badges = [];
+  if (w.tone) badges.push(el("span", { class: "chip chip-tone" }, "🎭 " + esc(w.tone)));
+  if ((w.scenario_count ?? 0) > 0) badges.push(el("span", { class: "chip" }, `${w.scenario_count} scénario${w.scenario_count > 1 ? "s" : ""}`));
+  return el("div", { class: "card world-lore-card", style: { cursor: "pointer" }, onclick: () => navigate(`#/world/${w.id}`) },
+    el("div", { class: "lore-art", style: art
+      ? { backgroundImage: `url(${art})` }
+      : { background: "linear-gradient(150deg, var(--accent-glow), transparent 70%)" } },
+      el("div", { class: "lore-shade" }),
+      el("div", { class: "lore-badges" }, badges),
+    ),
     el("div", { class: "card-body" },
-      el("h3", {}, esc(w.name)),
+      el("h3", {}, "🗺 " + esc(w.name)),
       el("div", { class: "desc" }, esc(w.description || w.tone || "Monde sans description")),
       el("div", { class: "card-actions" },
-        el("span", { class: "chip" }, `${w.scenario_count ?? 0} scénario${w.scenario_count > 1 ? "s" : ""}`),
         el("button", { class: "mini-btn", onclick: (e) => { e.stopPropagation(); startGameFromWorld(w.id); } }, "Jouer ▶"),
+        el("button", { class: "mini-btn", onclick: (e) => { e.stopPropagation(); navigate(`#/world/${w.id}`); } }, "Explorer"),
       ),
     ),
   );
@@ -362,6 +514,65 @@ async function renderWorldDetail(id) {
     el("div", { class: "section-title" }, "Lore"),
     el("p", { style: { lineHeight: "1.7", color: "var(--text-dim)", whiteSpace: "pre-wrap", marginBottom: "8px" } }, esc(world.lore)),
   );
+
+  // ── carte du monde + export ──
+  body.append(el("div", { class: "section-title" }, "🗺 Carte du monde"));
+  const mapTools = el("div", { class: "map-tools" },
+    el("button", { class: "btn btn-ghost btn-sm", onclick: async (e) => {
+      const b = e.target;
+      b.disabled = true;
+      b.textContent = "🎨 génération de la carte… (20-40 s)";
+      try {
+        const r = await api(`/api/worlds/${world.id}/map/generate`, { method: "POST", body: {} });
+        await refreshAll();
+        renderWorldDetail(world.id);
+        toast("Carte générée ✓");
+      } catch (err) { toast(err.message, "err"); }
+      b.disabled = false;
+      b.textContent = "🎨 Générer la carte";
+    } }, "🎨 Générer la carte"),
+    el("button", { class: "btn btn-ghost btn-sm", onclick: async (e) => {
+      const b = e.target;
+      b.disabled = true;
+      try {
+        const res = await fetch(`/api/worlds/${world.id}/export`);
+        if (!res.ok) throw new Error("Export impossible");
+        const blob = await res.blob();
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `${world.name.replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-") || "monde"}.zip`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+        toast("Monde exporté (ZIP) ✓");
+      } catch (err) { toast(err.message, "err"); }
+      b.disabled = false;
+    } }, "⬇ Exporter le monde (ZIP)"),
+  );
+  const mapBox = el("div", { class: "world-map" });
+  body.append(mapTools, mapBox);
+  (async () => {
+    try {
+      const { map, locations } = await api(`/api/worlds/${world.id}/map`);
+      if (map) {
+        const img = el("img", { src: map, class: "world-map-img" });
+        img.addEventListener("load", () => {
+          const pins = el("div", { class: "map-pins" });
+          locations.forEach((name, i) => {
+            pins.append(el("div", { class: "map-pin", style: { left: (12 + ((i * 53 + 17) % 76)) + "%", top: (12 + ((i * 37 + 29) % 70)) + "%" }, title: name }, "📍"));
+          });
+          mapBox.replaceChildren(img, pins);
+          if (locations.length) mapBox.append(el("div", { class: "map-legend" }, locations.map((l) => el("span", { class: "chip" }, "📍 " + esc(l)))));
+        });
+        img.addEventListener("error", () => mapBox.replaceChildren(el("div", { class: "empty", style: { padding: "22px" } }, el("p", {}, "Carte introuvable — régénère-la."))));
+      } else {
+        mapBox.append(el("div", { class: "empty", style: { padding: "26px" } },
+          el("div", { class: "big" }, "🗺"),
+          el("h3", {}, "Pas encore de carte"),
+          el("p", {}, "Génère une carte illustrée de ce monde — les lieux cités dans tes parties y seront épinglés."),
+        ));
+      }
+    } catch { /* ignore */ }
+  })();
 
   body.append(el("div", { class: "section-title" }, `Scénarios (${scenarios.length})`));
   const addScen = el("button", { class: "btn btn-ghost btn-sm", onclick: () => scenarioModal(world) }, ICONS.plus, "Ajouter un scénario");
@@ -599,7 +810,48 @@ function cardModal(existing) {
     const cur = voice.input.value;
     voice.input.replaceChildren(...voiceOptsFor().map(([v, l2]) => el("option", { value: v, ...(v === cur ? { selected: "" } : {}) }, l2)));
   });
-  const body = el("div", {}, name.wrap, el("div", { class: "row" }, lang.wrap, voice.wrap), desc.wrap, perso.wrap, scenario.wrap, firstMes.wrap, example.wrap, sys.wrap);
+  // ── live preview (SillyTavern-style character sheet) ──
+  const preview = el("div", { class: "card-preview" }, el("div", { class: "card-preview-empty" }, "Aperçu en direct…"));
+  const updatePreview = () => {
+    const n = name.input.value.trim();
+    const d = desc.input.value.trim();
+    const p = perso.input.value.trim();
+    const sc = scenario.input.value.trim();
+    const fm = firstMes.input.value.trim();
+    const ex = example.input.value.trim();
+    const v = voice.input.value;
+    const voiceLabel = (store.voices || []).find((x) => x.name === v)?.label ?? (v || "par défaut");
+    preview.replaceChildren(
+      el("div", { class: "preview-avatar", style: { background: `linear-gradient(135deg, hsl(${(n.length * 59) % 360} 70% 55%), hsl(${(n.length * 59 + 60) % 360} 80% 40%))` } },
+        n ? n[0].toUpperCase() : "?"),
+      el("h3", {}, esc(n || "Nouvelle carte")),
+      el("div", { class: "preview-tags" },
+        v ? el("span", { class: "preview-tag" }, "🔊 " + esc(voiceLabel)) : null,
+        lang.input.value ? el("span", { class: "preview-tag" }, "🌍 " + (lang.input.value === "en" ? "EN" : "FR")) : null,
+      ),
+      el("div", { class: "preview-sec" },
+        el("strong", {}, "Description"),
+        el("p", {}, esc(d || "—")),
+      ),
+      p ? el("div", { class: "preview-sec" }, el("strong", {}, "Personnalité"), el("p", {}, esc(p))) : null,
+      sc ? el("div", { class: "preview-sec" }, el("strong", {}, "Situation"), el("p", {}, esc(sc))) : null,
+      fm ? el("div", { class: "preview-sec preview-greet" },
+        el("strong", {}, "Premier message"),
+        el("blockquote", {}, esc(fm)),
+      ) : null,
+      ex ? el("div", { class: "preview-sec preview-greet" },
+        el("strong", {}, "Exemple de dialogue"),
+        el("blockquote", {}, esc(ex)),
+      ) : null,
+    );
+  };
+  for (const inp of [name.input, desc.input, perso.input, scenario.input, firstMes.input, example.input, sys.input, voice.input, lang.input]) {
+    inp.addEventListener("input", updatePreview);
+    inp.addEventListener("change", updatePreview);
+  }
+  updatePreview();
+  const formCol = el("div", { class: "card-form-col" }, name.wrap, el("div", { class: "row" }, lang.wrap, voice.wrap), desc.wrap, perso.wrap, scenario.wrap, firstMes.wrap, example.wrap, sys.wrap);
+  const body = el("div", { class: "card-modal-grid" }, formCol, preview);
   const { close } = openModal({
     title: existing ? `Éditer ${existing.name}` : "Nouvelle carte",
     body, wide: true,
@@ -818,9 +1070,13 @@ async function renderSettings() {
   container.append(el("div", { class: "section-title" }, "Images (Koji)"));
   const imgSteps = field("Étapes de génération", s.image_steps || 28, { type: "number", min: 8, max: 60, step: 1 });
   const imgCfg = field("Guidance", s.image_cfg || 7, { type: "number", min: 3, max: 15, step: 0.5 });
+  const imgRef = field("Fidélité au portrait (img2img)", s.image_ref_strength ?? 0.55, {
+    type: "select",
+    options: [["0.35", "Inventive (0.35)"], ["0.55", "Équilibré (0.55)"], ["0.75", "Fidèle (0.75)"], ["1", "Copie (1 — déconseillé)"]],
+  });
   const imgPreload = checkbox("image_preload", s.image_preload === true, "Précharger le modèle d'images au démarrage");
   container.append(el("div", { class: "card", style: { padding: "18px 22px" } },
-    el("div", { class: "row" }, imgSteps.wrap, imgCfg.wrap),
+    el("div", { class: "row" }, imgSteps.wrap, imgCfg.wrap, imgRef.wrap),
     el("div", { class: "row" }, imgPreload.wrap),
     el("div", { style: { marginTop: "12px" } },
       el("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
@@ -833,6 +1089,46 @@ async function renderSettings() {
     ),
     el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "12px" } },
       "Koji (SD1.5) tourne dans un service Python local sur le GPU. Les scènes 100 % décor (paysages, lieux) sont générées en format paysage automatiquement.",
+    ),
+  ));
+
+  // ── Apparence & sécurité ──
+  container.append(el("div", { class: "section-title" }, "Apparence & sécurité"));
+  const accentCur = localStorage.getItem("ai-rp-accent") || getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#ff7ad9";
+  const accentWrap = el("label", { class: "fl-field" },
+    el("input", { type: "color", value: accentCur }),
+    el("span", { class: "fl-label" }, "Couleur d'accent"),
+  );
+  accentWrap.querySelector("input").addEventListener("input", (e) => {
+    localStorage.setItem("ai-rp-accent", e.target.value);
+    applyCustom();
+  });
+  const bgWrap = el("label", { class: "fl-field" },
+    el("input", { value: localStorage.getItem("ai-rp-bg") || "", placeholder: " " }),
+    el("span", { class: "fl-label" }, "Image de fond (URL)"),
+  );
+  bgWrap.querySelector("input").addEventListener("input", (e) => {
+    localStorage.setItem("ai-rp-bg", e.target.value.trim());
+    applyCustom();
+  });
+  const authField = field("Token d'accès LAN (vide = ouvert)", s.auth_token || "", { type: "password", placeholder: "Garde-le secret — protège l'API sur le réseau" });
+  const notifCb = checkbox("notifications", s.notifications !== false, "Notifications quand la réponse est prête");
+  const soundCb = checkbox("sound_effects", s.sound_effects !== false, "Effets sonores (whoosh, chime)");
+  container.append(el("div", { class: "card", style: { padding: "18px 22px" } },
+    el("div", { class: "row3" }, accentWrap, bgWrap, authField.wrap),
+    el("div", { class: "row" },
+      notifCb.wrap,
+      soundCb.wrap,
+      el("button", { class: "btn btn-ghost btn-sm", onclick: () => {
+        localStorage.removeItem("ai-rp-accent");
+        localStorage.removeItem("ai-rp-bg");
+        applyCustom();
+        toast("Apparence réinitialisée ✓");
+        renderSettings();
+      } }, "↺ Réinitialiser l'apparence"),
+    ),
+    el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "12px" } },
+      "Couleur d'accent et fond : stockés sur cet appareil. Token : quand il est défini, toute l'API exige ce mot de passe — utile quand l'app écoute sur le Wi-Fi.",
     ),
   ));
 
@@ -875,6 +1171,45 @@ async function renderSettings() {
     ),
   ));
 
+  // ── Stockage & backups auto ──
+  container.append(el("div", { class: "section-title" }, "Stockage & sauvegardes auto"));
+  const storageCard = el("div", { class: "card", style: { padding: "18px 22px" } }, el("div", { class: "storage-line" }, "⏳ lecture du disque…"));
+  const renderStorage = async () => {
+    try {
+      const st = await api("/api/storage");
+      const mb = (v) => `${Math.max(0, v).toFixed(1)} Mo`;
+      storageCard.replaceChildren(
+        el("div", { class: "storage-grid" },
+          el("div", { class: "storage-tile" }, el("strong", {}, mb(st.audioMB)), el("span", {}, "🎙 Audio généré")),
+          el("div", { class: "storage-tile" }, el("strong", {}, mb(st.imagesMB)), el("span", {}, "🖼 Illustrations")),
+          el("div", { class: "storage-tile" }, el("strong", {}, mb(st.uploadsMB)), el("span", {}, "📎 Avatars & uploads")),
+          el("div", { class: "storage-tile" }, el("strong", {}, mb(st.dbMB)), el("span", {}, "🗄 Base de données")),
+        ),
+        el("div", { class: "row", style: { marginTop: "14px" } },
+          el("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
+            try {
+              const r = await api("/api/backup", { body: {} });
+              toast(r.ok ? "Backup créé ✓" : "Backup impossible", r.ok ? "ok" : "err");
+              renderStorage();
+            } catch (e) { toast(e.message, "err"); }
+          } }, "💾 Créer un backup maintenant"),
+        ),
+        el("div", { class: "storage-backups" },
+          (st.backups?.length
+            ? st.backups.map((b) => el("div", { class: "storage-backup" },
+                el("span", {}, "📦 " + esc(b.file)),
+                el("span", {}, mb(b.size / 1e6) + " · " + new Date(b.date).toLocaleString("fr-FR")),
+              ))
+            : [el("p", { style: { color: "var(--text-dim)", fontSize: "13px" } }, "Aucun backup pour l'instant — un backup SQLite complet est créé chaque jour automatiquement.")]),
+        ),
+      );
+    } catch (e) {
+      storageCard.replaceChildren(el("div", { class: "storage-line" }, "Stockage indisponible : " + esc(e.message)));
+    }
+  };
+  renderStorage();
+  container.append(storageCard);
+
   container.append(el("div", { style: { marginTop: "24px", display: "flex", justifyContent: "flex-end" } },
     el("button", { class: "btn btn-primary", style: { padding: "12px 30px" }, onclick: async () => {
       try {
@@ -896,10 +1231,15 @@ async function renderSettings() {
             tts_autoplay: autoplay.input.checked,
             image_steps: Number(imgSteps.input.value),
             image_cfg: Number(imgCfg.input.value),
+            image_ref_strength: Number(imgRef.input.value),
             image_preload: imgPreload.input.checked,
             llm_timeout: Number(llmTimeout.input.value),
+            auth_token: authField.input.value.trim(),
+            notifications: notifCb.input.checked,
+            sound_effects: soundCb.input.checked,
           },
         });
+        applyCustom();
         toast("Réglages enregistrés ✓");
         await refreshAll();
         renderSettings();
@@ -1090,11 +1430,50 @@ export async function startGameFromWorld(worldId) {
   newGameWizard({ world_id: worldId });
 }
 
+// ─── LAN auth gate ────────────────────────────────────────────────────────────
+function showAuthModal() {
+  const tok = field("Token d'accès", "", { type: "password", autofocus: true, placeholder: "Token configuré dans les Réglages" });
+  const { close } = openModal({
+    title: "🔐 Accès sécurisé",
+    body: el("div", {},
+      el("p", { style: { lineHeight: "1.6", color: "var(--text-dim)", marginBottom: "12px" } },
+        "Ce serveur est protégé par un token. Demande-le à la personne qui l'a configuré (Réglages → Apparence & sécurité)."),
+      tok.wrap,
+    ),
+    footer: [
+      el("button", { class: "btn btn-ghost", onclick: () => close() }, "Annuler"),
+      el("button", { class: "btn btn-primary", onclick: async (e) => {
+        const btn = e.target;
+        btn.disabled = true;
+        try {
+          await api("/api/auth", { method: "POST", body: { token: tok.input.value.trim() } });
+          setToken(tok.input.value.trim());
+          close();
+          await refreshAll();
+          route();
+        } catch (err) { toast(err.message, "err"); btn.disabled = false; }
+      } }, "Déverrouiller"),
+    ],
+  });
+}
+
+window.addEventListener("airp-unauthorized", () => {
+  if (!document.querySelector(".modal")) showAuthModal();
+});
+
 // ─── boot ─────────────────────────────────────────────────────────────────────
 (async function boot() {
   try {
+    applyCustom();
+    if ("Notification" in window && Notification.permission === "default") Notification.requestPermission().catch(() => {});
     if (localStorage.getItem("ai-rp-sidebar") === "1") {
       document.getElementById("sidebar")?.classList.add("collapsed");
+    }
+    // LAN token gate: ask for the token before loading anything
+    const auth = await api("/api/auth");
+    if (auth.required && !auth.ok) {
+      showAuthModal();
+      return;
     }
     await refreshAll();
   } catch (e) {

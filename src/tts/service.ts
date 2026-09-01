@@ -186,6 +186,42 @@ export function buildUnits(segments: Segment[], ctx: TtsContext): SynthUnit[] { 
   return units;
 }
 
+/** Global LRU-ish disk cache: identical (voice, lang, lsd, text) → same wav.
+ * Prevents re-synthesizing repeated lines (refrains, catchphrases) or after a
+ * fork/regen when the files were copied but the pattern differs. Capped. */
+const TTS_CACHE_DIR = path.join(AUDIO_DIR, "_cache");
+
+function cachePath(text: string, voice: string, lang: TtsLang, lsdSteps: number): string {
+  const h = Bun.CryptoHasher.hash("sha1", `${voice}|${lang}|${lsdSteps}|${text}`).hex();
+  return path.join(TTS_CACHE_DIR, `${h}.wav`);
+}
+
+function cacheLookup(text: string, voice: string, lang: TtsLang, lsdSteps: number): string | null {
+  try {
+    const f = cachePath(text, voice, lang, lsdSteps);
+    return fs.existsSync(f) ? f : null;
+  } catch { return null; }
+}
+
+function cacheStore(from: string, text: string, voice: string, lang: TtsLang, lsdSteps: number): void {
+  try {
+    fs.mkdirSync(TTS_CACHE_DIR, { recursive: true });
+    const f = cachePath(text, voice, lang, lsdSteps);
+    if (!fs.existsSync(f)) fs.copyFileSync(from, f);
+  } catch { /* cache is best-effort */ }
+}
+
+/** Read a wav's duration (ms) from its header without decoding the PCM. */
+export function durationOfWav(file: string): number {
+  try {
+    const b = fs.readFileSync(file);
+    if (b.length < 44 || b.toString("ascii", 0, 4) !== "RIFF") return 0;
+    const byteRate = b.readUInt32LE(28);
+    const dataSize = b.readUInt32LE(40);
+    return byteRate > 0 ? Math.round((dataSize / byteRate) * 1000) : 0;
+  } catch { return 0; }
+}
+
 const placeholderFor = (seg: Segment, ctx: TtsContext): SynthAudio => {
   const { voice, lang } = resolveVoice(seg, ctx);
   return { type: seg.type, speaker: seg.speaker, path: "", voice, lang, durationMs: 0 };
@@ -243,11 +279,30 @@ export async function synthSegments(
       continue;
     }
     const text = joinSegments(unit.segments);
+    // global disk cache: same speaker + same line → same wav, no re-synthesis
+    const cachedWav = cacheLookup(text, unit.voice, unit.lang, ctx.lsdSteps);
     try {
+      if (cachedWav) {
+        fs.copyFileSync(cachedWav, file);
+        const dur = durationOfWav(file);
+        unit.segments.forEach((seg, k) => {
+          results.push({
+            type: seg.type,
+            speaker: seg.speaker,
+            path: k === 0 ? `/audio/${conversationId}/${messageId}-${segIndex}.wav` : "",
+            voice: unit.voice,
+            lang: unit.lang,
+            durationMs: k === 0 ? dur : 0,
+          });
+        });
+        segIndex += unit.segments.length;
+        continue;
+      }
       const res = await withMutex(() =>
         synthesize({ text, voice: unit.voice, lang: unit.lang, lsdSteps: ctx.lsdSteps }),
       );
       fs.writeFileSync(file, wavBytes(res.pcm, res.sampleRate));
+      cacheStore(file, text, unit.voice, unit.lang, ctx.lsdSteps);
       unit.segments.forEach((seg, k) => {
         results.push({
           type: seg.type,

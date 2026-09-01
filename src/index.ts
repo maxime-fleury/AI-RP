@@ -5,6 +5,7 @@ import { PUBLIC_DIR, AUDIO_DIR, IMAGES_DIR, UPLOADS_DIR, DATA_DIR, SAMPLES_DIR }
 import { warmupTts } from "./tts/service";
 import { ensureImageServer } from "./server/image";
 import { getSetting } from "./server/db";
+import { scheduleDailyBackup } from "./server/backup";
 
 const NAME = "ai-rp";
 const MIN_PORT = 3000;
@@ -125,5 +126,6 @@ if (getSetting("image_preload", false)) {
 }
 
 for (const d of [DATA_DIR]) fs.mkdirSync(d, { recursive: true });
+scheduleDailyBackup();
 
 export default server;

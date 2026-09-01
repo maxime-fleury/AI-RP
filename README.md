@@ -61,6 +61,30 @@ PORT=3210 bun src/index.ts
   bouton « Variante »). Pré-chargement du modèle au démarrage en option.
 - **Front** : SPA vanilla, deux thèmes (glassmorphism néon / anime vibrant),
   import de cartes PNG+JSON (spec SillyTavern V1/V2).
+- **Quality of life** : bouton ⏹ Stop pendant la génération (le partiel est
+  conservé), autocomplétion des slash commands (menu type Discord),
+  mini-lecteur de segments (clic sur un segment → 0,75×/1×/1,25×), réactions
+  émoji 👍❤️😂, notifications quand l'onglet est en arrière-plan, parties
+  épinglées ⭐ + corbeille (archive/restaure/supprime définitivement),
+  estimation des tokens du contexte dans les réglages de partie, galerie
+  d'illustrations avec légendes écrites par l'IA (lightbox), carte du monde
+  générée par l'IA avec lieux épinglés, export de monde en ZIP, export de carte
+  au format SillyTavern (PNG + chara), token d'accès LAN optionnel
+  (Réglages → Apparence & sécurité), couleur d'accent et fond personnalisables,
+  bannière du dashboard sur la jaquette du monde, raccourcis clavier,
+  transitions d'écran (View Transitions API), effets sonores synthétisés
+  (whoosh/chime, désactivables), /dice animé, progression live du stream dans
+  l'onglet, notification quand la voix est prête.
+- **Images (cohérence visuelle)** : img2img avec le **portrait de la carte en
+  image de référence** (fidélité réglable 0,35 → 0,75) quand le personnage a un
+  avatar, en plus du seed fixe par carte — la tête reste stable d'une scène à
+  l'autre. Scènes décor en format paysage automatique.
+- **Contexte** : tours gardés en mémoire configurables par partie, avec un **cap
+  global par monde** (Réglages du monde) pour protéger les petits modèles ;
+  budget tokens ≈ affiché dans les réglages de partie (source : partie/monde).
+- **Sauvegarde** : backup SQLite automatique chaque jour (`data/backups/`, 7
+  jours de rotation), backup manuel + état du disque (audio/illustrations/base)
+  dans Réglages → Stockage, en plus de l'export/restauration JSON.
 
 ## Structure
 

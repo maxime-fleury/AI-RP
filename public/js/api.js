@@ -1,11 +1,35 @@
 // Tiny API helper
+export function getToken() {
+  try { return localStorage.getItem("ai-rp-token") || ""; } catch { return ""; }
+}
+export function setToken(tok) {
+  try {
+    if (tok) localStorage.setItem("ai-rp-token", tok);
+    else localStorage.removeItem("ai-rp-token");
+  } catch { /* ignore */ }
+}
+
+function authUrl(path) {
+  const tok = getToken();
+  if (!tok) return path;
+  const u = new URL(path, location.href);
+  u.searchParams.set("token", tok);
+  return u.toString();
+}
+
 export async function api(path, opts = {}) {
-  const res = await fetch(path, {
+  const res = await fetch(authUrl(path), {
     method: opts.method || (opts.body ? "POST" : "GET"),
     headers: { "Content-Type": "application/json" },
     ...(opts.body ? { body: JSON.stringify(opts.body) } : {}),
     ...opts.fetchOpts,
   });
+  if (res.status === 401) {
+    window.dispatchEvent(new CustomEvent("airp-unauthorized"));
+    const err = new Error("Authentification requise — entre le token LAN (Réglages → Sécurité).");
+    err.status = 401;
+    throw err;
+  }
   if (!res.ok) {
     let msg = res.statusText;
     try { msg = (await res.json()).error || msg; } catch { /* ignore */ }
@@ -18,7 +42,11 @@ export async function api(path, opts = {}) {
 }
 
 export async function apiForm(path, formData) {
-  const res = await fetch(path, { method: "POST", body: formData });
+  const res = await fetch(authUrl(path), { method: "POST", body: formData });
+  if (res.status === 401) {
+    window.dispatchEvent(new CustomEvent("airp-unauthorized"));
+    throw new Error("Authentification requise — entre le token LAN.");
+  }
   if (!res.ok) {
     let msg = res.statusText;
     try { msg = (await res.json()).error || msg; } catch { /* ignore */ }

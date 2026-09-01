@@ -1,8 +1,7 @@
 name: CI
-
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
 
 jobs:
@@ -13,9 +12,5 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-      - name: Unit tests
-        run: bun test
-      - name: Build server
-        run: bun build src/index.ts --outdir /tmp/airp-build --target=bun
+      - run: bun install --frozen-lockfile
+      - run: bun run check
