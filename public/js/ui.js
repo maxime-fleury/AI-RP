@@ -75,24 +75,26 @@ export function confirmModal({ title, message, confirmLabel = "Supprimer", dange
   });
 }
 
+/* Floating-label field: the label lives inside the input and slides up when
+ * the field is focused or filled. Selects always keep the label floated (they
+ * always hold a value). */
 export function field(labelText, value, opts = {}) {
-  const wrap = el("div");
-  const lab = el("label", {}, labelText);
+  const wrap = el("label", { class: "fl-field" });
   let input;
   if (opts.type === "textarea") {
-    input = el("textarea", { rows: opts.rows || 3, placeholder: opts.placeholder || "" }, value ?? "");
+    input = el("textarea", { rows: opts.rows || 3, placeholder: opts.placeholder || " " }, value ?? "");
   } else if (opts.type === "select") {
     input = el("select", {});
     for (const [v, l] of opts.options || []) {
       input.append(el("option", { value: v, ...(String(v) === String(value) ? { selected: "" } : {}) }, l));
     }
   } else if (opts.type === "number") {
-    input = el("input", { type: "number", value, ...(opts.min ? { min: opts.min } : {}), ...(opts.max ? { max: opts.max } : {}), ...(opts.step ? { step: opts.step } : {}) });
+    input = el("input", { type: "number", value, placeholder: " ", ...(opts.min ? { min: opts.min } : {}), ...(opts.max ? { max: opts.max } : {}), ...(opts.step ? { step: opts.step } : {}) });
   } else {
-    input = el("input", { value, placeholder: opts.placeholder || "", ...(opts.type === "password" ? { type: "password" } : {}) });
+    input = el("input", { value, placeholder: opts.placeholder || " ", ...(opts.type === "password" ? { type: "password" } : {}) });
   }
   if (opts.autofocus) setTimeout(() => input.focus(), 60);
-  wrap.append(lab, input);
+  wrap.append(input, el("span", { class: "fl-label" }, labelText));
   return { wrap, input };
 }
 

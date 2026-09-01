@@ -156,16 +156,22 @@ export async function generateImage(req: ImageRequest): Promise<ImageResult> {
   return j as ImageResult;
 }
 
+export interface SavedImage {
+  url: string;
+  seed: number;
+  ms: number;
+}
+
 export async function generateAndSave(
   subdir: string,
   req: ImageRequest,
-): Promise<string> {
+): Promise<SavedImage> {
   const res = await generateImage(req);
   const dir = path.join(IMAGES_DIR, subdir);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${Date.now()}.png`);
   fs.writeFileSync(file, Buffer.from(res.image_base64, "base64"));
-  return `/images/${subdir}/${path.basename(file)}`;
+  return { url: `/images/${subdir}/${path.basename(file)}`, seed: res.seed, ms: res.ms };
 }
 
 export function stopImageServer(): void {

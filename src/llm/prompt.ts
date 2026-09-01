@@ -11,6 +11,7 @@ export interface CastContext {
   cards: CardRow[];
   scenario?: ScenarioRow | null;
   conversation: ConversationRow;
+  summary?: string; // rolling summary of events older than the kept history
 }
 
 export function buildSystemPrompt(ctx: CastContext): string {
@@ -68,6 +69,10 @@ export function buildSystemPrompt(ctx: CastContext): string {
     parts.push(`## Situation de départ\n${ctx.scenario.intro}\n`);
   }
 
+  if (ctx.summary) {
+    parts.push(`## Résumé des événements précédents\n${ctx.summary}\n`);
+  }
+
   const personaName = ctx.persona?.name ?? "le joueur";
   parts.push(`## Format d'écriture (important)
 - Le narrateur raconte UNIQUEMENT l'histoire, en narration entre astérisques : *Le vent soulevait la poussière.*
@@ -96,6 +101,20 @@ export function buildMessages(ctx: CastContext, history: MessageRow[]): { system
   return { system, messages };
 }
 
+// instructions for the background rolling-summary task
+export function summarizeSystem(): string {
+  return [
+    "Tu compresses un fil de roleplay en un résumé court et utile pour l'IA qui poursuit l'histoire.",
+    "Écris 3 à 6 phrases en français : personnages, lieu, événements importants, état émotionnel, objectifs en cours, indices encore actifs.",
+    "Garde les noms propres et les détails qui resteront importants plus tard. Pas de commentaires, uniquement le résumé.",
+  ].join("\n");
+}
+
+export function estimateTokens(text: string): number {
+  // rough heuristic (~4 chars/token for French) — used for context budgeting
+  return Math.ceil((text.length || 1) / 4);
+}
+
 // ─── Segment parsing (for TTS routing) ────────────────────────────────────────
 export type SegmentType = "narration" | "dialogue" | "action";
 
@@ -117,19 +136,21 @@ export function parseSegments(content: string): Segment[] {
       segments.push({ type: "dialogue", speaker: m[1].trim(), text: m[2].trim() });
       continue;
     }
-    // narration: *...* possibly with surrounding text
-    const italics = line.match(/\*([^*]+)\*/g);
-    if (italics) {
-      let rest = line.replace(/\*[^*]+\*/g, "").trim();
-      for (const it of italics) {
-        const inner = it.slice(1, -1).trim();
-        if (inner) segments.push({ type: "narration", speaker: "", text: inner });
+    // narration (*...*) and dialogue can share one line — walk it left to
+    // right so segments come out in written order (playback follows too)
+    if (line.includes("*")) {
+      const TOKEN_RE = /\*([^*]+)\*|([A-Za-zÀ-ÖØ-öø-ÿ'’ -]{1,40}?)\s*:\s*"([^"]*)"/g;
+      let m: RegExpExecArray | null;
+      let last = 0;
+      while ((m = TOKEN_RE.exec(line))) {
+        const plain = line.slice(last, m.index).trim();
+        if (plain) segments.push({ type: "action", speaker: "", text: plain });
+        if (m[1]) segments.push({ type: "narration", speaker: "", text: m[1].trim() });
+        else if (m[3] !== undefined) segments.push({ type: "dialogue", speaker: m[2].trim(), text: m[3].trim() });
+        last = m.index + m[0].length;
       }
-      if (rest) {
-        const dm = rest.match(NAME_RE);
-        if (dm) segments.push({ type: "dialogue", speaker: dm[1].trim(), text: dm[2].trim() });
-        else segments.push({ type: "action", speaker: "", text: rest });
-      }
+      const tail = line.slice(last).trim();
+      if (tail) segments.push({ type: "action", speaker: "", text: tail });
       continue;
     }
     // quoted speech without name → character line (speaker resolved later)

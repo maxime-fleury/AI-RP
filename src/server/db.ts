@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS conversations (
   group_mode INTEGER NOT NULL DEFAULT 0,
   settings TEXT NOT NULL DEFAULT '{}',
   last_message TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  summary_msg_id INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -86,6 +88,13 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at INTEGER NOT NULL
 );
 `);
+
+// migrations for pre-existing databases (columns added later)
+{
+  const convCols = new Set((db.query("PRAGMA table_info(conversations)").all() as any[]).map((c) => c.name));
+  if (!convCols.has("summary")) db.exec("ALTER TABLE conversations ADD COLUMN summary TEXT NOT NULL DEFAULT ''");
+  if (!convCols.has("summary_msg_id")) db.exec("ALTER TABLE conversations ADD COLUMN summary_msg_id INTEGER NOT NULL DEFAULT 0");
+}
 
 const now = () => Date.now();
 
@@ -282,7 +291,7 @@ export function deletePersona(id: number): void {
 export interface ConversationRow {
   id: number; title: string; world_id: number | null; persona_id: number | null;
   scenario_id: number | null; cast: string; group_mode: number; settings: string;
-  last_message: string; created_at: number; updated_at: number;
+  last_message: string; summary: string; summary_msg_id: number; created_at: number; updated_at: number;
 }
 
 export function listConversations(): ConversationRow[] {
@@ -312,10 +321,10 @@ export function updateConversation(id: number, c: Partial<ConversationRow>): Con
   for (const [k, v] of Object.entries(c)) if (v !== undefined) clean[k] = v;
   const merged = { ...cur, ...clean, id };
   db.query(
-    `UPDATE conversations SET title=?, world_id=?, persona_id=?, scenario_id=?, cast=?, group_mode=?, settings=?, last_message=?, updated_at=? WHERE id=?`,
+    `UPDATE conversations SET title=?, world_id=?, persona_id=?, scenario_id=?, cast=?, group_mode=?, settings=?, last_message=?, summary=?, summary_msg_id=?, updated_at=? WHERE id=?`,
   ).run(
     merged.title, merged.world_id, merged.persona_id, merged.scenario_id, merged.cast,
-    merged.group_mode, merged.settings, merged.last_message, now(), id,
+    merged.group_mode, merged.settings, merged.last_message, merged.summary, merged.summary_msg_id, now(), id,
   );
   return getConversation(id);
 }

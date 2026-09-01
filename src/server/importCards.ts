@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { UPLOADS_DIR } from "./paths";
-import { createCard, updateCard, type CardRow } from "./db";
+import { createCard, updateCard, getCard, type CardRow } from "./db";
 
 export interface ParsedCard {
   name: string;
@@ -161,7 +161,8 @@ export function importFile(
   }
 
   onProgress?.(fileName, `importé : ${parsed.name}`);
-  return card;
+  // re-read: the card row was updated with the avatar after createCard
+  return getCard(card.id);
 }
 
 export function scanDirectory(dirPath: string, onProgress?: (name: string, status: string) => void): number {

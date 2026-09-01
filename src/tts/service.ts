@@ -83,15 +83,18 @@ export interface TtsContext {
   lsdSteps: number;
 }
 
-export function buildTtsContext(conversation: { world_id: number | null; cast: string }): TtsContext {
-  const language = (getSetting("tts_language", "fr") === "en" ? "en" : "fr") as TtsLang;
+export function buildTtsContext(conversation: { world_id: number | null; cast: string; settings?: string }): TtsContext {
+  // per-conversation overrides (set from the ⚙️ modal of the party) win over globals
+  let cs: Record<string, unknown> = {};
+  try { cs = JSON.parse(conversation.settings || "{}"); } catch { /* ignore */ }
+  const language = ((cs.tts_language as string) || (getSetting("tts_language", "fr") as string === "en" ? "en" : "fr")) as TtsLang;
   const context: TtsContext = {
-    narratorVoice: getSetting("tts_voice_narrateur", "jean") as string,
-    defaultVoice: getSetting("tts_voice_default", "cosette") as string,
+    narratorVoice: (cs.tts_voice_narrateur || getSetting("tts_voice_narrateur", "jean")) as string,
+    defaultVoice: (cs.tts_voice_default || getSetting("tts_voice_default", "cosette")) as string,
     language,
     characterVoices: {},
     characterLangs: {},
-    lsdSteps: Number(getSetting("tts_lsd_steps", 4)),
+    lsdSteps: Number(cs.tts_lsd_steps ?? getSetting("tts_lsd_steps", 4)),
   };
   try {
     const cast: number[] = JSON.parse(conversation.cast || "[]");
@@ -119,48 +122,148 @@ function resolveVoice(seg: Segment, ctx: TtsContext): { voice: string; lang: Tts
   return { voice, lang };
 }
 
+// ─── synthesis units ───────────────────────────────────────────────────────────
+// Consecutive segments of the same speaker are merged into a single synthesis
+// unit while they stay short — one model call instead of N, with a single
+// intonation curve. Per-segment entries are kept in the output so the UI can
+// still index audio, but merged-away segments hold an empty `path` (the player
+// already skips those).
+const MERGE_MAX_WORDS = 42;
+const MERGE_MAX_SEGMENTS = 6;
+
+interface SynthUnit {
+  segments: Segment[];
+  voice: string;
+  lang: TtsLang;
+}
+
+function wordCount(text: string): number {
+  return text.split(/\s+/).filter(Boolean).length;
+}
+
+export function joinSegments(segs: Segment[]): string { // internal, exported for tests
+  let out = "";
+  for (const s of segs) {
+    const t = s.text.trim();
+    if (!out) { out = t; continue; }
+    const last = out[out.length - 1];
+    if (s.type === "dialogue" && !/[!?…\.]$/.test(out)) out += "… ";
+    else if (last && !/[!?…\.\s]$/.test(out)) out += ". ";
+    else out += " ";
+    out += t;
+  }
+  return out;
+}
+
+export function buildUnits(segments: Segment[], ctx: TtsContext): SynthUnit[] { // internal, exported for tests
+  const units: SynthUnit[] = [];
+  let cur: Segment[] = [];
+  let curVoice = "";
+  let curLang: TtsLang = "fr";
+  const flush = () => {
+    if (!cur.length) return;
+    units.push({ segments: cur, voice: curVoice, lang: curLang });
+    cur = [];
+  };
+  for (const seg of segments) {
+    const { voice, lang } = resolveVoice(seg, ctx);
+    const sameSpeaker =
+      cur.length > 0 &&
+      (cur[0].type === seg.type) &&
+      (seg.type !== "dialogue" || cur[0].speaker === seg.speaker) &&
+      curVoice === voice && curLang === lang;
+    const words = cur.reduce((a, s) => a + wordCount(s.text), 0);
+    if (sameSpeaker && words + wordCount(seg.text) <= MERGE_MAX_WORDS && cur.length < MERGE_MAX_SEGMENTS) {
+      cur.push(seg);
+    } else {
+      flush();
+      cur = [seg];
+      curVoice = voice;
+      curLang = lang;
+    }
+  }
+  flush();
+  return units;
+}
+
+const placeholderFor = (seg: Segment, ctx: TtsContext): SynthAudio => {
+  const { voice, lang } = resolveVoice(seg, ctx);
+  return { type: seg.type, speaker: seg.speaker, path: "", voice, lang, durationMs: 0 };
+};
+
+/**
+ * Synthesize the audio of a message's segments. Short segments are merged into
+ * larger units; only the first `maxUnits` units are synthesized eagerly (the
+ * rest are returned as placeholders and generated on demand when the user
+ * presses play) — pass `forceAll` to synthesize everything now.
+ */
 export async function synthSegments(
   conversationId: number,
   messageId: number,
   segments: Segment[],
   ctx: TtsContext,
   existing: SynthAudio[] = [],
+  opts: { forceAll?: boolean } = {},
 ): Promise<SynthAudio[]> {
   const results: SynthAudio[] = [];
   const dir = path.join(AUDIO_DIR, String(conversationId));
   fs.mkdirSync(dir, { recursive: true });
-  for (let i = 0; i < segments.length; i++) {
-    const seg = segments[i];
-    if (existing[i]?.path && fs.existsSync(existing[i].path)) {
-      results.push(existing[i]);
+  const units = buildUnits(segments, ctx);
+  const maxUnits = opts.forceAll
+    ? Infinity
+    : Math.max(1, Number(getSetting("tts_max_segments", 5)));
+  let segIndex = 0;
+  for (let u = 0; u < units.length; u++) {
+    const unit = units[u];
+    const firstSeg = unit.segments[0];
+    const eager = u < maxUnits;
+    // reuse a previously synthesized (merged) wav covering this unit
+    const cached = existing[segIndex]?.path && fs.existsSync(existing[segIndex].path);
+    if (cached) {
+      for (let k = 0; k < unit.segments.length; k++) {
+        const seg = unit.segments[k];
+        results.push({ ...existing[segIndex], type: seg.type, speaker: seg.speaker, path: k === 0 ? existing[segIndex].path : "" });
+      }
+      segIndex += unit.segments.length;
       continue;
     }
-    const { voice, lang } = resolveVoice(seg, ctx);
-    const file = path.join(dir, `${messageId}-${i}.wav`);
+    if (existing[segIndex]?.path) {
+      // old-style per-segment wav: keep it, do not re-synthesise
+      for (let k = 0; k < unit.segments.length; k++) {
+        results.push({ ...existing[segIndex + k], path: existing[segIndex + k]?.path ?? "" });
+      }
+      segIndex += unit.segments.length;
+      continue;
+    }
+    const file = path.join(dir, `${messageId}-${segIndex}.wav`);
+    if (!eager) {
+      // not part of the eager window → placeholder (synthesized on demand)
+      for (const seg of unit.segments) results.push(placeholderFor(seg, ctx));
+      segIndex += unit.segments.length;
+      continue;
+    }
+    const text = joinSegments(unit.segments);
     try {
       const res = await withMutex(() =>
-        synthesize({ text: seg.text, voice, lang, lsdSteps: ctx.lsdSteps }),
+        synthesize({ text, voice: unit.voice, lang: unit.lang, lsdSteps: ctx.lsdSteps }),
       );
       fs.writeFileSync(file, wavBytes(res.pcm, res.sampleRate));
-      results.push({
-        type: seg.type,
-        speaker: seg.speaker,
-        path: `/audio/${conversationId}/${messageId}-${i}.wav`,
-        voice,
-        lang,
-        durationMs: res.durationMs,
+      unit.segments.forEach((seg, k) => {
+        results.push({
+          type: seg.type,
+          speaker: seg.speaker,
+          path: k === 0 ? `/audio/${conversationId}/${messageId}-${segIndex}.wav` : "",
+          voice: unit.voice,
+          lang: unit.lang,
+          durationMs: k === 0 ? res.durationMs : 0,
+        });
       });
     } catch (e) {
-      results.push({
-        type: seg.type,
-        speaker: seg.speaker,
-        path: "",
-        voice,
-        lang,
-        durationMs: 0,
-        error: String(e),
-      });
+      for (const seg of unit.segments) {
+        results.push({ ...placeholderFor(seg, ctx), error: String(e) });
+      }
     }
+    segIndex += unit.segments.length;
   }
   return results;
 }

@@ -1,6 +1,6 @@
-import { api, apiForm, uploadFiles } from "./api.js?v=15";
-import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=15";
-import { renderChat } from "./chat.js?v=15";
+import { api, apiForm, uploadFiles } from "./api.js?v=20";
+import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=20";
+import { renderChat } from "./chat.js?v=20";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -431,12 +431,14 @@ async function renderCards() {
   dropzone.addEventListener("drop", (e) => doImport(e.dataTransfer.files));
 
   const scanBtn = el("button", { class: "btn btn-ghost", onclick: scanDir }, ICONS.worlds, "Scanner un dossier");
+  const newBtn = el("button", { class: "btn btn-primary", onclick: () => cardModal() }, ICONS.plus, "Créer un personnage");
   const container = el("div", {},
     el("div", { class: "page-head" },
       el("div", {},
         el("h2", {}, "🎭 Cartes"),
-        el("div", { class: "sub" }, "Tes personnages importés (cartes SillyTavern V1/V2). Chaque carte peut avoir sa propre voix et sa langue."),
+        el("div", { class: "sub" }, "Tes personnages importés (cartes SillyTavern V1/V2) ou créés à la main, avec leur propre voix et langue."),
       ),
+      newBtn,
       scanBtn,
     ),
     dropzone,
@@ -445,7 +447,8 @@ async function renderCards() {
     container.append(el("div", { class: "empty" },
       el("div", { class: "big" }, "🃏"),
       el("h3", {}, "Aucune carte pour l'instant"),
-      el("p", {}, "Importe des cartes de personnages au format SillyTavern pour les faire jouer dans tes mondes."),
+      el("p", {}, "Importe des cartes SillyTavern (PNG/JSON) ou crée ton premier personnage directement dans l'app."),
+      el("button", { class: "btn btn-primary", onclick: () => cardModal() }, ICONS.plus, "Créer un personnage"),
     ));
   } else {
     container.append(el("div", { class: "grid" }, store.cards.map(cardTile)));
@@ -521,9 +524,26 @@ function cardModal(existing) {
   const firstMes = field("Premier message (greeting)", f(existing?.first_mes), { type: "textarea", rows: 3 });
   const example = field("Exemple de dialogue", f(existing?.mes_example), { type: "textarea", rows: 4 });
   const sys = field("Prompt système (bonus)", f(existing?.system_prompt), { type: "textarea", rows: 2 });
-  const voice = field("Voix TTS", f(existing?.voice), { type: "select", options: [["", "Par défaut"], ...store.voices.map((v) => [v.name, v.label])] });
   const lang = field("Langue de la voix", f(existing?.language), { type: "select", options: [["", "Par défaut"], ["fr", "Français"], ["en", "English"]] });
-  const body = el("div", {}, name.wrap, desc.wrap, perso.wrap, scenario.wrap, firstMes.wrap, example.wrap, sys.wrap, el("div", { class: "row" }, voice.wrap, lang.wrap));
+  // voices filtered by the chosen language (empty = toutes)
+  const voiceOptsFor = () => {
+    const l = lang.input.value;
+    const seen = new Set();
+    const out = [["", "Par défaut"]];
+    for (const v of store.voices || []) {
+      if (l && v.lang !== l) continue;
+      if (seen.has(v.name)) continue;
+      seen.add(v.name);
+      out.push([v.name, v.label]);
+    }
+    return out;
+  };
+  const voice = field("Voix TTS", f(existing?.voice), { type: "select", options: voiceOptsFor() });
+  lang.input.addEventListener("change", () => {
+    const cur = voice.input.value;
+    voice.input.replaceChildren(...voiceOptsFor().map(([v, l2]) => el("option", { value: v, ...(v === cur ? { selected: "" } : {}) }, l2)));
+  });
+  const body = el("div", {}, name.wrap, el("div", { class: "row" }, lang.wrap, voice.wrap), desc.wrap, perso.wrap, scenario.wrap, firstMes.wrap, example.wrap, sys.wrap);
   const { close } = openModal({
     title: existing ? `Éditer ${existing.name}` : "Nouvelle carte",
     body, wide: true,
@@ -667,10 +687,12 @@ async function renderSettings() {
   lmUrl.input.addEventListener("change", refreshModels);
   orKey.input.addEventListener("input", () => { /* typed; saved on save */ });
 
+  const llmTimeout = field("Timeout du modèle (s)", s.llm_timeout || 150, { type: "number", min: 20, max: 900, step: 10 });
   container.append(el("div", { class: "card", style: { padding: "18px 22px" } },
     el("div", { class: "row" }, providerSel.wrap, narrStyle.wrap),
     el("div", { class: "row" }, lmUrl.wrap, orKey.wrap),
     el("div", { class: "row" }, lmModel.wrap, orModel.wrap),
+    el("div", { class: "row" }, llmTimeout.wrap),
     el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "12px" } },
       "LM Studio : lance le serveur local (onglet Developer → Start Server, port 1234). OpenRouter : colle ta clé API — les deux peuvent être utilisés et le choix se fait au lancement de partie. Le style du narrateur s'applique aux nouvelles réponses.",
     ),
@@ -683,6 +705,7 @@ async function renderSettings() {
   const narrator = field("Voix du narrateur", s.tts_voice_narrateur || "jean", { type: "select", options: voicesOptions(ttsLang.input.value) });
   const defChar = field("Voix par défaut des personnages", s.tts_voice_default || "cosette", { type: "select", options: voicesOptions(ttsLang.input.value) });
   const lsd = field("Qualité (pas de décodage)", s.tts_lsd_steps || 4, { type: "number", min: 1, max: 10, step: 1 });
+  const maxSeg = field("Segments vocaux par réponse", s.tts_max_segments ?? 5, { type: "number", min: 1, max: 20, step: 1 });
   const autoplay = checkbox("tts_autoplay", s.tts_autoplay !== false, "Lecture auto des réponses");
   // ▶ buttons: play a sample of the currently selected voice
   const narratorPlay = samplePlayBtn(() => narrator.input.value, () => ttsLang.input.value);
@@ -721,7 +744,7 @@ async function renderSettings() {
   });
   container.append(el("div", { class: "card", style: { padding: "18px 22px" } },
     el("div", { class: "row" }, ttsOn.wrap, autoplay.wrap),
-    el("div", { class: "row" }, ttsLang.wrap, lsd.wrap),
+    el("div", { class: "row" }, ttsLang.wrap, lsd.wrap, maxSeg.wrap),
     el("div", { class: "row" }, narrator.wrap, defChar.wrap),
     stripBox,
     el("div", { style: { marginTop: "14px" } },
@@ -739,10 +762,60 @@ async function renderSettings() {
   container.append(el("div", { class: "section-title" }, "Images (Koji)"));
   const imgSteps = field("Étapes de génération", s.image_steps || 28, { type: "number", min: 8, max: 60, step: 1 });
   const imgCfg = field("Guidance", s.image_cfg || 7, { type: "number", min: 3, max: 15, step: 0.5 });
+  const imgPreload = checkbox("image_preload", s.image_preload === true, "Précharger le modèle d'images au démarrage");
   container.append(el("div", { class: "card", style: { padding: "18px 22px" } },
     el("div", { class: "row" }, imgSteps.wrap, imgCfg.wrap),
+    el("div", { class: "row" }, imgPreload.wrap),
+    el("div", { style: { marginTop: "12px" } },
+      el("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
+        try {
+          toast("Chargement du modèle d'images… (plusieurs minutes la 1re fois)", "ok", 20000);
+          const r = await api("/api/images/preload", { body: {} });
+          toast(r.ok ? "Modèle d'images prêt ✓" : "Échec du chargement — regarde les logs.", r.ok ? "ok" : "err");
+        } catch (e) { toast(e.message, "err"); }
+      } }, ICONS.image, "Précharger le modèle d'images"),
+    ),
     el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "12px" } },
-      "La génération d'images utilise le modèle Koji via un service Python local (GPU). Le modèle se charge au premier usage.",
+      "Koji (SD1.5) tourne dans un service Python local sur le GPU. Les scènes 100 % décor (paysages, lieux) sont générées en format paysage automatiquement.",
+    ),
+  ));
+
+  // ── Backup / restore ──
+  container.append(el("div", { class: "section-title" }, "Sauvegarde"));
+  const fileInput = el("input", { type: "file", accept: ".json,application/json", hidden: true });
+  fileInput.addEventListener("change", async () => {
+    const file = fileInput.files?.[0];
+    fileInput.value = "";
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      toast("Restauration en cours…", "ok", 8000);
+      const res = await api("/api/backup", { body: { backup: parsed } });
+      toast(`Restauration terminée : ${res.worlds} mondes, ${res.cards} cartes, ${res.conversations} parties ✓`);
+      await refreshAll();
+      renderSettings();
+    } catch (e) { toast("Fichier invalide : " + e.message, "err"); }
+  });
+  container.append(el("div", { class: "card", style: { padding: "18px 22px" } },
+    el("div", { class: "row" },
+      el("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
+        try {
+          const data = await api("/api/export");
+          const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = `ai-rp-backup-${new Date().toISOString().slice(0, 10)}.json`;
+          a.click();
+          URL.revokeObjectURL(a.href);
+          toast("Sauvegarde téléchargée ✓");
+        } catch (e) { toast(e.message, "err"); }
+      } }, "⬇️ Exporter tout (mondes, cartes, parties)"),
+      el("button", { class: "btn btn-ghost btn-sm", onclick: () => fileInput.click() }, "⬆️ Restaurer depuis un fichier"),
+      fileInput,
+    ),
+    el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "12px" } },
+      "La sauvegarde contient tes mondes, scénarios, cartes, personas et conversations (texte + réglages) ; les fichiers audio et images générés ne sont pas inclus — tu peux copier le dossier data/ pour tout conserver.",
     ),
   ));
 
@@ -763,9 +836,12 @@ async function renderSettings() {
             tts_voice_narrateur: narrator.input.value,
             tts_voice_default: defChar.input.value,
             tts_lsd_steps: Number(lsd.input.value),
+            tts_max_segments: Number(maxSeg.input.value),
             tts_autoplay: autoplay.input.checked,
             image_steps: Number(imgSteps.input.value),
             image_cfg: Number(imgCfg.input.value),
+            image_preload: imgPreload.input.checked,
+            llm_timeout: Number(llmTimeout.input.value),
           },
         });
         toast("Réglages enregistrés ✓");

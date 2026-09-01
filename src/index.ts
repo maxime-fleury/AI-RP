@@ -3,6 +3,8 @@ import path from "node:path";
 import { handleApi } from "./server/routes";
 import { PUBLIC_DIR, AUDIO_DIR, IMAGES_DIR, UPLOADS_DIR, DATA_DIR, SAMPLES_DIR } from "./server/paths";
 import { warmupTts } from "./tts/service";
+import { ensureImageServer } from "./server/image";
+import { getSetting } from "./server/db";
 
 const NAME = "ai-rp";
 const MIN_PORT = 3000;
@@ -116,6 +118,11 @@ console.log(`🟤 ${NAME} running → http://localhost:${port}`);
 
 // Warm up the TTS in the background so the first voice is ready quickly.
 warmupTts().catch((e) => console.warn("[tts] warmup failed:", e));
+
+// Optional: pre-spawn the Python image sidecar so the first illustration is fast.
+if (getSetting("image_preload", false)) {
+  ensureImageServer().then((ok) => console.log(`[image] preload ${ok ? "ready" : "failed — first generation will load it"}`));
+}
 
 for (const d of [DATA_DIR]) fs.mkdirSync(d, { recursive: true });
 
