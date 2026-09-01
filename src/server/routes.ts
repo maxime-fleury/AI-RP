@@ -20,6 +20,7 @@ import type { MessageRow } from "./db";
 import { synthSegments, buildTtsContext, listVoices, warmupTts, getVoiceSample } from "../tts/service";
 import { ensureTtsLoaded, synthesize, wavBytes } from "../tts/engine";
 import { generateAndSave, probeImageStatus, ensureImageServer } from "./image";
+import { zipFiles } from "./zip";
 import { AUDIO_DIR, IMAGES_DIR } from "./paths";
 
 const preparingAudio = new Set<number>();
@@ -501,6 +502,123 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       }
       return json({ ok: true });
     }
+    // fork a conversation up to a message — branching: regenerate in a copy,
+    // the original stays intact (audio + images are copied with remapped ids)
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "fork" && method === "POST") {
+      const body = await readJson(req);
+      const src = getConversation(Number(parts[2]));
+      if (!src) return json({ error: "not found" }, 404);
+      // copy everything strictly BEFORE the given message: the caller replays
+      // that message itself (regenerate re-sends the user turn), so copying it
+      // too would duplicate it in the branch
+      const before = Number(body.upToMessageId);
+      const srcMsgs = listMessages(src.id).filter((m) => m.id < before);
+      if (!srcMsgs.length) return json({ error: "rien à copier" }, 400);
+      const fork = createConversation({
+        title: (src.title || "Partie") + " · variante",
+        world_id: src.world_id,
+        persona_id: src.persona_id,
+        scenario_id: src.scenario_id,
+        cast: src.cast,
+        group_mode: src.group_mode,
+        settings: src.settings,
+      });
+      const audioSrcDir = path.join(AUDIO_DIR, String(src.id));
+      const audioDstDir = path.join(AUDIO_DIR, String(fork.id));
+      const imgSrcDir = path.join(IMAGES_DIR, "conversations", String(src.id));
+      const imgDstDir = path.join(IMAGES_DIR, "conversations", String(fork.id));
+      for (const m of srcMsgs) {
+        const view = messageView({ ...m });
+        const audio = view.audio as any[];
+        const meta = view.meta as any;
+        const newMid = createMessage({
+          conversation_id: fork.id, role: m.role, name: m.name, content: m.content,
+          segments: m.segments, audio: "[]", meta: "{}",
+        }).id;
+        // copy each real wav with a remapped filename (old mid → new mid)
+        const segMap = new Map<string, string>();
+        const newAudio = audio.map((a: any) => {
+          if (!a.path) return a;
+          const file = path.basename(a.path);
+          let dest = segMap.get(file);
+          if (!dest) {
+            dest = `${newMid}-${file.split("-").slice(1).join("-")}`;
+            const srcFile = path.join(audioSrcDir, file);
+            if (fs.existsSync(srcFile)) {
+              fs.mkdirSync(audioDstDir, { recursive: true });
+              fs.copyFileSync(srcFile, path.join(audioDstDir, dest));
+            }
+            segMap.set(file, dest);
+          }
+          return { ...a, path: `/audio/${fork.id}/${dest}` };
+        });
+        updateMessage(newMid, { audio: JSON.stringify(newAudio) });
+        // copy the illustration
+        if (meta.image) {
+          const file = path.basename(meta.image);
+          const srcImg = path.join(imgSrcDir, file);
+          if (fs.existsSync(srcImg)) {
+            fs.mkdirSync(imgDstDir, { recursive: true });
+            fs.copyFileSync(srcImg, path.join(imgDstDir, file));
+            meta.image = `/images/conversations/${fork.id}/${file}`;
+          }
+        }
+        delete meta.suggestions; // the branch point changed the context
+        updateMessage(newMid, { meta: JSON.stringify(meta) });
+      }
+      const last = srcMsgs[srcMsgs.length - 1];
+      updateConversation(fork.id, { last_message: last.content.slice(0, 200) });
+      const view = conversationView(fork.id)!;
+      view.messages = listMessages(view.id).map(messageView);
+      return json(view, 201);
+    }
+    // full export of a conversation: markdown + JSON + audio + images, as a ZIP
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "export" && method === "GET") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const view = conversationView(conv.id)!;
+      const msgs = listMessages(conv.id).map(messageView);
+      const lines = msgs.map((m: any) => {
+        const who = m.role === "user" ? (view.persona?.name || "Moi") : (m.name || "Narrateur");
+        const body = (m.meta?.image ? `![illustration](${m.meta.image})\n` : "") + (m.content || "");
+        return m.role === "user" ? `**${who}** : ${body}` : `> **${who}** : ${body}`;
+      }).join("\n\n");
+      const md = `# ${conv.title}\n\n${lines}\n`;
+      const files: { path: string; data: Uint8Array | string }[] = [
+        { path: "conversation.md", data: md },
+        {
+          path: "messages.json",
+          data: JSON.stringify({
+            title: conv.title, world: view.world?.name ?? null, exported_at: new Date().toISOString(), messages: msgs,
+          }, null, 2),
+        },
+      ];
+      const audioDir = path.join(AUDIO_DIR, String(conv.id));
+      const imgDir = path.join(IMAGES_DIR, "conversations", String(conv.id));
+      const seenAudio = new Set<string>();
+      const seenImg = new Set<string>();
+      for (const m of msgs as any[]) {
+        for (const a of m.audio || []) {
+          if (!a.path || seenAudio.has(a.path)) continue;
+          seenAudio.add(a.path);
+          const full = path.join(audioDir, path.basename(a.path));
+          if (fs.existsSync(full)) files.push({ path: `audio/${m.id}-${path.basename(a.path)}`, data: new Uint8Array(fs.readFileSync(full)) });
+        }
+        if (m.meta?.image && !seenImg.has(m.meta.image)) {
+          seenImg.add(m.meta.image);
+          const full = path.join(imgDir, path.basename(m.meta.image));
+          if (fs.existsSync(full)) files.push({ path: `images/${path.basename(m.meta.image)}`, data: new Uint8Array(fs.readFileSync(full)) });
+        }
+      }
+      const zip = zipFiles(files);
+      const name = encodeURIComponent((conv.title || "partie").replace(/[^\p{L}\p{N} _-]+/gu, "").slice(0, 60));
+      return new Response(zip, {
+        headers: {
+          "Content-Type": "application/zip",
+          "Content-Disposition": `attachment; filename*=UTF-8''${name}.zip`,
+        },
+      });
+    }
     // edit a message's content (double-click in the UI)
     if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] && method === "PATCH") {
       const convId = Number(parts[2]);
@@ -595,7 +713,17 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const world = conv.world_id ? getWorld(conv.world_id) : null;
       const kind = body.kind === "landscape" || body.kind === "portrait" ? body.kind : detectSceneKind(m.content);
       const landscape = kind === "landscape";
-      const prompt = buildIllustrationPrompt(world?.name ?? "", world?.description ?? "", world?.tone ?? "épique", m.content, kind);
+      // character consistency: if the message is a character's line, bake their
+      // look into the prompt and pin the seed so the face stays recognizable
+      let cast: any[] = [];
+      try { cast = (JSON.parse(conv.cast || "[]") as number[]).map((cid) => getCard(Number(cid))).filter(Boolean); } catch { /* ignore */ }
+      const char = characterForMessage(cast, m.content);
+      const prompt = buildIllustrationPrompt(world?.name ?? "", world?.description ?? "", world?.tone ?? "épique", m.content, kind, char);
+      const seed =
+        typeof body.seed === "number" ? body.seed
+        : body.vary ? undefined
+        : char ? charSeed(char.id)
+        : undefined;
       const res = await generateAndSave(`conversations/${convId}`, {
         prompt,
         negative: NEGATIVE_PROMPT,
@@ -603,11 +731,11 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         cfg: Number(getSetting("image_cfg", 7)),
         width: Number(getSetting("image_width", landscape ? 1152 : 768)),
         height: Number(getSetting("image_height", landscape ? 768 : 1152)),
-        seed: body.seed, // undefined → random (each call is a new variant)
+        seed,
       });
-      const meta = { ...messageView(m).meta, image: res.url, image_seed: res.seed, image_kind: kind };
+      const meta = { ...messageView(m).meta, image: res.url, image_seed: res.seed, image_kind: kind, image_char: char?.name ?? undefined };
       updateMessage(mid, { meta: JSON.stringify(meta) });
-      return json({ image: res.url, seed: res.seed, kind });
+      return json({ image: res.url, seed: res.seed, kind, character: char?.name ?? null });
     }
 
     // pre-generate missing TTS audio for the recent assistant messages
@@ -782,24 +910,68 @@ export function detectSceneKind(content: string): "landscape" | "portrait" {
   return hits >= 2 && wc >= 5 ? "landscape" : "portrait";
 }
 
-function buildIllustrationPrompt(world: string, desc: string, tone: string, scene: string, kind: "auto" | "landscape" | "portrait" = "auto"): string {
-  // strip roleplay markup, keep a clean lowercase word list
-  const raw = scene.replace(/[*"«»]/g, " ").replace(/\s+/g, " ").trim();
-  const stop = new Set([
-    "le", "la", "les", "un", "une", "des", "de", "du", "et", "ou", "dans", "sur", "sous", "avec", "pour", "plus", "pas",
-    "très", "tres", "mais", "comme", "lui", "elle", "il", "ils", "tu", "vous", "je", "me", "moi", "mon", "ma", "mes",
-    "ton", "ta", "tes", "sa", "son", "ses", "ce", "cet", "cette", "ces", "au", "aux", "en", "par", "se", "si", "ne",
-    "y", "vers", "contre", "entre", "tout", "tous", "alors", "quand", "où", "ou", "comment", "pourquoi", "à", "a", "était",
-    "etait", "être", "fait", "faire", "voit", "vois", "dit", "dis", "demande", "répond", "repond", "veux", "veut", "peux",
-    "peut", "semble", "déjà", "deja", "encore", "aussi", "bien", "même", "meme", "autre", "rien", "quelque", "petite", "petit",
-    "grand", "grande", "toujours", "jamais", "seul", "seule", "place", "peu", "long", "voix", "regarde", "sait", "savez", "sais",
-    "face", "côté", "cote", "doit", "faites", "êtes", "etes",
-  ]);
+/** Deterministic seed per card — the same character always gets the same seed. */
+export function charSeed(cardId: number): number {
+  return ((cardId * 2654435761) >>> 0) % 2_147_483_647;
+}
+
+/**
+ * If the message is (mostly) a character's line, return that card so the
+ * illustration keeps their look (prompt identity + fixed seed).
+ */
+export function characterForMessage(cast: { id: number; name: string; description?: string }[], content: string): { id: number; name: string; description: string } | null {
+  if (!cast.length) return null;
+  // first dialogue speaker of the message wins (the scene is about them)
+  for (const seg of parseSegments(content)) {
+    if (seg.type === "dialogue" && seg.speaker) {
+      const card = cast.find((c) => c.name.toLowerCase() === seg.speaker.toLowerCase());
+      if (card) return { id: card.id, name: card.name, description: card.description ?? "" };
+    }
+  }
+  // narration mentioning a cast member by name → that character
+  const lower = content.toLowerCase();
+  const card = cast.find((c) => c.name.length > 2 && lower.includes(c.name.toLowerCase()));
+  return card ? { id: card.id, name: card.name, description: card.description ?? "" } : null;
+}
+
+/** Card description → danbooru-style tags (shared pipeline with the scene prompt). */
+function descriptionToTags(desc: string): string[] {
+  const raw = desc.replace(/[*"«»]/g, " ").replace(/\s+/g, " ").trim();
   const words = raw
     .toLowerCase()
     .split(/[^\p{L}'-]+/u)
     .map((w) => w.replace(/^'+|'+$/g, ""))
-    .filter((w) => w.length > 3 && !stop.has(w) && !/^\d+$/.test(w));
+    .filter((w) => w.length > 3 && !STOP_WORDS.has(w) && !/^\d+$/.test(w));
+  const tags: string[] = [];
+  const seen = new Set<string>();
+  for (const w of words) {
+    const t = IMG_TAGS_FR2EN[w] ?? w;
+    if (seen.has(t)) continue;
+    seen.add(t);
+    tags.push(t);
+  }
+  return tags;
+}
+
+const STOP_WORDS = new Set([
+  "le", "la", "les", "un", "une", "des", "de", "du", "et", "ou", "dans", "sur", "sous", "avec", "pour", "plus", "pas",
+  "très", "tres", "mais", "comme", "lui", "elle", "il", "ils", "tu", "vous", "je", "me", "moi", "mon", "ma", "mes",
+  "ton", "ta", "tes", "sa", "son", "ses", "ce", "cet", "cette", "ces", "au", "aux", "en", "par", "se", "si", "ne",
+  "y", "vers", "contre", "entre", "tout", "tous", "alors", "quand", "où", "ou", "comment", "pourquoi", "à", "a", "était",
+  "etait", "être", "fait", "faire", "voit", "vois", "dit", "dis", "demande", "répond", "repond", "veux", "veut", "peux",
+  "peut", "semble", "déjà", "deja", "encore", "aussi", "bien", "même", "meme", "autre", "rien", "quelque", "petite", "petit",
+  "grand", "grande", "toujours", "jamais", "seul", "seule", "place", "peu", "long", "voix", "regarde", "sait", "savez", "sais",
+  "face", "côté", "cote", "doit", "faites", "êtes", "etes",
+]);
+
+function buildIllustrationPrompt(world: string, desc: string, tone: string, scene: string, kind: "auto" | "landscape" | "portrait" = "auto", character?: { id: number; name: string; description?: string } | null): string {
+  // strip roleplay markup, keep a clean lowercase word list
+  const raw = scene.replace(/[*"«»]/g, " ").replace(/\s+/g, " ").trim();
+  const words = raw
+    .toLowerCase()
+    .split(/[^\p{L}'-]+/u)
+    .map((w) => w.replace(/^'+|'+$/g, ""))
+    .filter((w) => w.length > 3 && !STOP_WORDS.has(w) && !/^\d+$/.test(w));
   // translate known words, keep unique order
   const tags: string[] = [];
   const seen = new Set<string>();
@@ -817,6 +989,16 @@ function buildIllustrationPrompt(world: string, desc: string, tone: string, scen
     "comique": "comedic", "heroïque": "heroic", "heroique": "heroic", "neutre": "",
   };
   const worldPart = [world || "fantasy", TONE_EN[String(tone || "").toLowerCase().trim()] || ""].filter(Boolean).join(", ");
+  // character identity: description-derived tags + name + stable face framing
+  let charPart: string[] = [];
+  if (character) {
+    charPart = [
+      "character focus, one character",
+      ...descriptionToTags(character.description),
+      character.name.replace(/\s+/g, "_"),
+      "solo, upper body, detailed face, face focus, looking at viewer",
+    ].filter(Boolean);
+  }
   // environment-only scenes: push the scenery, keep the frame empty of people
   const sceneOverride =
     kind === "landscape"
@@ -826,7 +1008,8 @@ function buildIllustrationPrompt(world: string, desc: string, tone: string, scen
   return [
     "masterpiece, best quality, anime illustration, highly detailed, vibrant colors",
     worldPart,
-    tags.slice(0, 16).join(", "),
+    ...charPart,
+    tags.slice(0, 12).join(", "),
     ...sceneOverride,
   ].filter(Boolean).join(", ");
 }

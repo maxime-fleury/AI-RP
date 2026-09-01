@@ -1,6 +1,6 @@
-import { api, readSseStream } from "./api.js?v=22";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=22";
-import { store, refreshAll, navigate, applyTheme } from "./app.js?v=22";
+import { api, readSseStream } from "./api.js?v=26";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=26";
+import { store, refreshAll, navigate, applyTheme } from "./app.js?v=26";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -14,29 +14,36 @@ const audioQueue = {
   items: [],
   playing: false,
   current: null,
+  resolveCurrent: null,
+  gen: 0,
   async play(urls) {
     for (const u of urls) this.items.push(u);
     if (!this.playing) await this.pump();
   },
   async pump() {
     this.playing = true;
+    const myGen = this.gen;
     while (this.items.length) {
       const url = this.items.shift();
       await new Promise((resolve) => {
+        this.resolveCurrent = resolve;
         const a = new Audio(url);
         this.current = a;
-        a.onended = resolve;
-        a.onerror = resolve;
-        a.play().catch(resolve);
+        const done = () => { if (this.resolveCurrent === resolve) this.resolveCurrent = null; resolve(); };
+        a.onended = done;
+        a.onerror = done;
+        a.play().catch(done);
       });
+      if (myGen !== this.gen) break; // stopped mid-play → abandon this pump
     }
-    this.playing = false;
-    this.current = null;
+    if (myGen === this.gen) { this.playing = false; this.current = null; }
   },
   stop() {
     this.items = [];
-    if (this.current) { try { this.current.pause(); } catch { /* ignore */ } }
+    this.gen++;
     this.playing = false;
+    if (this.resolveCurrent) { const r = this.resolveCurrent; this.resolveCurrent = null; r(); }
+    if (this.current) { try { this.current.pause(); } catch { /* ignore */ } }
   },
 };
 
@@ -46,7 +53,7 @@ export async function renderChat(convIdRaw) {
   if (convIdRaw === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=22");
+    const { newGameWizard } = await import("./app.js?v=26");
     newGameWizard(pre);
     return;
   }
@@ -74,12 +81,13 @@ export async function renderChat(convIdRaw) {
     ),
     persona ? el("span", { class: "chip" }, "Toi : " + esc(persona.name)) : null,
   );
-  const groupBtn = el("button", { class: "btn btn-ghost btn-sm", onclick: toggleGroup },
+  const groupBtn = el("button", { class: "btn btn-ghost btn-sm group-toggle", onclick: toggleGroup },
     conv.group_mode ? ICONS.group + " Groupe" : ICONS.solo + " Solo",
   );
   const settingsBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Réglages de la partie", onclick: convSettingsModal }, "⚙️");
-  const searchBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Rechercher dans l'historique", onclick: () => { searchBar.hidden = !searchBar.hidden; if (!searchBar.hidden) searchInput.focus(); } }, "🔍");
-  const exportBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Exporter le fil en Markdown", onclick: exportThread }, "⬇");
+  const searchBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Rechercher dans l'historique (Entrée = suivant)", onclick: () => { searchBar.hidden = !searchBar.hidden; if (!searchBar.hidden) searchInput.focus(); } }, "🔍");
+  const exportBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Exporter la partie (ZIP : texte + audio + images)", onclick: exportZip }, "⬇");
+  const delBtn = el("button", { class: "btn btn-ghost btn-icon", style: { color: "var(--danger)" }, title: "Supprimer cette partie", onclick: deleteConversation }, "🗑");
 
   const searchInput = el("input", { placeholder: "Rechercher dans le fil… (Entrée = suivant)" });
   const searchBar = el("div", { class: "search-bar", hidden: true }, searchInput);
@@ -115,22 +123,33 @@ export async function renderChat(convIdRaw) {
     }
   }
 
-  const header = el("div", { class: "chat-header" }, backBtn, titleBlock, castStrip, groupBtn, searchBtn, exportBtn, settingsBtn);
+  const header = el("div", { class: "chat-header" }, backBtn, titleBlock, castStrip, groupBtn, searchBtn, exportBtn, delBtn, settingsBtn);
 
-  function exportThread() {
-    const lines = (conv.messages || []).map((m) => {
-      const who = m.role === "user" ? (currentConversation.persona?.name || "Moi") : (m.name || "Narrateur");
-      const body = (m.meta?.image ? `![illustration](${m.meta.image})` : "") + (m.content || "");
-      return m.role === "user" ? `**${who}** : ${body}` : `> **${who}** : ${body}`;
-    }).join("\n\n");
-    const md = `# ${conv.title}\n\n${lines}\n`;
-    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `${(conv.title || "partie").replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-")}.md`;
-    a.click();
-    URL.revokeObjectURL(a.href);
-    toast("Fil exporté en Markdown ✓");
+  async function exportZip() {
+    exportBtn.disabled = true;
+    try {
+      const res = await fetch(`/api/conversations/${convId}/export`);
+      if (!res.ok) throw new Error((await res.text().catch(() => "")) || "Export impossible");
+      const blob = await res.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `${(conv.title || "partie").replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-") || "partie"}.zip`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      toast("Partie exportée (ZIP) ✓");
+    } catch (e) {
+      toast(e.message, "err");
+    } finally {
+      exportBtn.disabled = false;
+    }
+  }
+
+  async function deleteConversation() {
+    if (!(await confirmModal({ title: "Supprimer la partie", message: `Supprimer « ${conv.title || "Partie"} » et tous ses fichiers audio/images ?`, confirmLabel: "Supprimer" }))) return;
+    await api(`/api/conversations/${convId}`, { method: "DELETE" });
+    await refreshAll();
+    navigate("#/");
+    toast("Partie supprimée.");
   }
 
   // scroll area
@@ -634,12 +653,14 @@ function renderMessage(m) {
     const illu = el("div", { class: "msg-illu" },
       el("img", { src: m.meta.image, alt: "illustration" }),
       el("div", { class: "illu-meta" },
+        m.meta.image_char ? el("span", { class: "illu-char" }, "🎭 " + esc(m.meta.image_char)) : null,
         el("span", { class: "illu-seed" }, "seed " + (m.meta.image_seed ?? "—")),
         el("button", { class: "mini-btn", title: "Nouvelle variante du même prompt", onclick: async (e) => {
           e.target.disabled = true;
           e.target.textContent = "↻…";
           try {
-            await api(`/api/conversations/${currentConversation.id}/messages/${m.id}/image`, { body: { kind: m.meta.image_kind || "auto" } });
+            // vary: keep the character's look in the prompt but roll a new seed
+            await api(`/api/conversations/${currentConversation.id}/messages/${m.id}/image`, { body: { kind: m.meta.image_kind || "auto", vary: true } });
             renderChat(currentConversation.id);
           } catch (err) { toast(err.message, "err"); e.target.disabled = false; e.target.textContent = "↻ Variante"; }
         } }, "↻ Variante"),
@@ -718,8 +739,21 @@ function messageActions(messageId, audio) {
       renderChat(currentConversation.id);
     } catch (err) { toast(err.message, "err"); e.target.disabled = false; e.target.textContent = "🖼"; }
   } }, ICONS.image, "Illustrer");
-  const retryBtn = el("button", { class: "mini-btn", onclick: () => regenerate(messageId) }, ICONS.retry, "Régénérer");
+  const retryBtn = el("button", { class: "mini-btn regen-btn", onclick: () => regenerate(messageId) }, ICONS.retry, "Régénérer");
   return [playBtn, illuBtn, retryBtn];
+}
+
+// keyboard shortcuts from within the chat (see app.js global handler)
+export function chatShortcut(key) {
+  if (key === "r") {
+    const last = [...document.querySelectorAll(".msg[data-role='assistant']")].pop();
+    last?.querySelector(".regen-btn")?.click();
+  } else if (key === "g") {
+    document.querySelector(".group-toggle")?.click();
+  } else if (key === "/") {
+    const ta = document.querySelector(".composer textarea");
+    if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+  }
 }
 
 async function playMessageAudio(messageId, btn) {
@@ -728,50 +762,59 @@ async function playMessageAudio(messageId, btn) {
   const msg = conv.messages.find((m) => m.id === messageId);
   if (!msg) return;
   let audio = msg.audio || [];
-  const real = audio.filter((a) => a.path);
+  let real = audio.filter((a) => a.path);
   // placeholders only (segments capped by tts_max_segments) → synthesize everything now
-  if (audio.length && !real.length && msg.content) {
+  if ((audio.length && !real.length || !audio.length) && msg.content) {
     toast("Génération de la voix…", "ok", 6000);
     const res = await api(`/api/conversations/${currentConversation.id}/messages/${messageId}/tts`, { body: {} });
     audio = res.audio || [];
-    await refreshAll();
-  } else if (!audio.length && msg.content) {
-    toast("Génération de la voix…", "ok", 6000);
-    const res = await api(`/api/conversations/${currentConversation.id}/messages/${messageId}/tts`, { body: {} });
-    audio = res.audio || [];
+    real = audio.filter((a) => a.path);
     await refreshAll();
   }
-  if (!audio.length) return toast("Pas de segments vocaux pour ce message.", "err");
+  if (!real.length) return toast("Pas de segments vocaux pour ce message.", "err");
   if (btn) {
+    // toggle: same handler plays and stops (a second listener on the button
+    // would fire both and restart the playback)
+    if (btn.classList.contains("playing")) {
+      audioQueue.stop();
+      btn.classList.remove("playing");
+      btn.textContent = ICONS.voice + ` Voix (${real.length})`;
+      return;
+    }
     btn.classList.add("playing");
     btn.textContent = "⏹ Arrêter";
-    btn.onclick = () => { audioQueue.stop(); btn.classList.remove("playing"); btn.textContent = ICONS.voice + " Voix"; };
   }
-  await audioQueue.play(audio.filter((a) => a.path).map((a) => a.path));
-  if (btn) { btn.classList.remove("playing"); btn.textContent = ICONS.voice + " Voix"; }
+  await audioQueue.play(real.map((a) => a.path));
+  if (btn) { btn.classList.remove("playing"); btn.textContent = ICONS.voice + ` Voix (${real.length})`; }
 }
 
 async function regenerate(messageId) {
-  if (!(await confirmModal({ title: "Régénérer", message: "Cette réponse sera remplacée par une nouvelle. La suite de la conversation est supprimée.", confirmLabel: "Régénérer" }))) return;
+  // branching: a variant is forked off and regenerated — the original thread
+  // stays untouched, and the variant can be explored or deleted later
+  const msgs = currentConversation.messages || [];
+  const idx = msgs.findIndex((m) => m.id === messageId);
+  if (idx < 0) return;
+  const lastUser = [...msgs.slice(0, idx)].reverse().find((m) => m.role === "user");
+  if (!lastUser) return toast("Rien à régénérer.", "err");
+  if (!(await confirmModal({
+    title: "Régénérer en variante",
+    message: "Une nouvelle variante de la partie sera créée à partir d'ici et régénérée. Le fil d'origine reste intact — tu pourras supprimer la variante si elle ne te plaît pas.",
+    confirmLabel: "Créer la variante",
+  }))) return;
   try {
-    await api(`/api/conversations/${currentConversation.id}/messages/${messageId}`, { method: "DELETE" });
-    await renderChat(currentConversation.id);
-    const conv = await api(`/api/conversations/${currentConversation.id}`);
-    currentConversation = conv;
-    // retrigger the last user message → the model regenerates right away
-    const users = conv.messages.filter((m) => m.role === "user");
-    const lastUser = users[users.length - 1];
-    if (lastUser) {
-      // replay the exact model input (slash commands / directives rewrite it)
-      const meta = lastUser.meta || {};
-      const opts = {};
-      if (meta.prompt) opts.prompt = meta.prompt;
-      if (meta.directive) opts.directive = meta.directive;
-      toast("↻ Régénération en cours…", "ok", 3000);
-      await doStream(lastUser.content, opts);
-    } else {
-      toast("Rien à régénérer.", "err");
-    }
+    const fork = await api(`/api/conversations/${currentConversation.id}/fork`, { body: { upToMessageId: lastUser.id } });
+    await refreshAll();
+    // point the URL at the variant without re-triggering route() (mid-stream)
+    history.replaceState(null, "", `#/chat/${fork.id}`);
+    await renderChat(fork.id);
+    currentConversation = fork;
+    // replay the exact model input (slash commands / directives rewrite it)
+    const meta = lastUser.meta || {};
+    const opts = {};
+    if (meta.prompt) opts.prompt = meta.prompt;
+    if (meta.directive) opts.directive = meta.directive;
+    toast("↻ Régénération en cours…", "ok", 3000);
+    await doStream(lastUser.content, opts);
   } catch (e) { toast(e.message, "err"); }
 }
 
@@ -827,7 +870,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal, field } from "./ui.js?v=22";
+import { openModal, field } from "./ui.js?v=26";
 void applyTheme;
 void fmtTime;
 void currentConversation;

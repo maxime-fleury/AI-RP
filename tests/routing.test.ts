@@ -43,6 +43,25 @@ describe("routing", async () => {
     expect(await res.text()).toContain('"not found"');
   });
 
+  test("POST /conversations/:id/fork copies messages strictly before the given id", async () => {
+    const conv = db.createConversation({ title: "Origine" });
+    const m1 = db.createMessage({ conversation_id: conv.id, role: "assistant", name: "Narrateur", content: "*Début.*" });
+    const m2 = db.createMessage({ conversation_id: conv.id, role: "user", content: "Bonjour" });
+    const m3 = db.createMessage({ conversation_id: conv.id, role: "assistant", name: "Alba", content: "Alba: \"Salut.\"" });
+
+    // fork everything before the user turn (the caller replays it itself)
+    const res = await api(routes, "POST", `/api/conversations/${conv.id}/fork`, { upToMessageId: m2.id });
+    expect(res.status).toBe(201);
+    const fork = await res.json();
+    expect(fork.title).toBe("Origine · variante");
+    const copied = fork.messages.map((m: any) => m.content);
+    expect(copied).toEqual(["*Début.*"]); // m2 and m3 are NOT copied
+    expect(copied).not.toContain("Bonjour");
+    expect(copied).not.toContain("Salut.");
+    // the original is untouched
+    expect(db.listMessages(conv.id)).toHaveLength(3);
+  });
+
   test("GET /worlds/:id does not match /worlds/:id/scenarios", async () => {
     const world = db.createWorld({ name: "Eldoria", description: "Royaume elfique" });
     const s = db.createScenario({ world_id: world.id, name: "L'invocation" });

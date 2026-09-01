@@ -52,13 +52,16 @@ export function openModal({ title, sub, body, footer, wide = false, onClose }) {
   backdrop.append(modal);
   root.append(backdrop);
   const close = () => {
+    document.removeEventListener("keydown", escKey);
     backdrop.remove();
     onClose?.();
   };
   backdrop.addEventListener("mousedown", (e) => { if (e.target === backdrop) close(); });
-  document.addEventListener("keydown", function escKey(e) {
-    if (e.key === "Escape") { document.removeEventListener("keydown", escKey); close(); }
-  });
+  // Escape closes only the topmost modal, and the listener dies with the modal
+  function escKey(e) {
+    if (e.key === "Escape" && backdrop === root.lastElementChild) close();
+  }
+  document.addEventListener("keydown", escKey);
   return { close, modal, backdrop };
 }
 

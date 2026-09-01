@@ -1,6 +1,6 @@
-import { api, apiForm, uploadFiles } from "./api.js?v=22";
-import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=22";
-import { renderChat } from "./chat.js?v=22";
+import { api, apiForm, uploadFiles } from "./api.js?v=26";
+import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=26";
+import { renderChat } from "./chat.js?v=26";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -122,6 +122,7 @@ async function route() {
   const section = parts[0] || "";
   currentSection = section === "world" ? "worlds" : section;
   renderSidebar(currentSection);
+  document.getElementById("sidebar")?.classList.remove("open"); // close the mobile drawer
   window.scrollTo(0, 0);
   try {
     if (section === "" || section === "home") return renderDashboard();
@@ -143,6 +144,49 @@ async function route() {
 }
 
 window.addEventListener("hashchange", route);
+
+// ─── keyboard shortcuts ───────────────────────────────────────────────────────
+function isTypingTarget(e) {
+  const t = e.target;
+  return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable);
+}
+
+function shortcutsHelp() {
+  const row = (k, desc) => el("div", { class: "k-row" }, el("kbd", {}, k), el("span", {}, desc));
+  openModal({
+    title: "⌨️ Raccourcis clavier",
+    body: el("div", { class: "shortcuts" },
+      row("n", "Nouvelle partie"),
+      row("/", "Écrire un message (dans une partie)"),
+      row("r", "Régénérer la dernière réponse (variante)"),
+      row("g", "Basculer solo / groupe"),
+      row("Esc", "Fermer la fenêtre / annuler l'édition"),
+      row("?", "Afficher cette aide"),
+    ),
+  });
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey || e.key === "Escape") return;
+  if (isTypingTarget(e) || document.querySelector(".modal")) return;
+  const k = e.key.toLowerCase();
+  const inChat = location.hash.startsWith("#/chat/");
+  if (k === "?") { e.preventDefault(); shortcutsHelp(); }
+  else if (k === "n") { e.preventDefault(); newGameWizard(); }
+  else if (inChat && (k === "r" || k === "g" || k === "/")) {
+    e.preventDefault();
+    import("./chat.js?v=26").then((m) => m.chatShortcut(k)).catch(() => {});
+  }
+});
+
+// ─── mobile sidebar drawer ────────────────────────────────────────────────────
+const menuBtn = () => document.getElementById("menu-btn");
+menuBtn()?.addEventListener("click", () => {
+  document.getElementById("sidebar")?.classList.toggle("open");
+});
+document.getElementById("sidebar")?.addEventListener("click", (e) => {
+  if (e.target.closest("a")) document.getElementById("sidebar")?.classList.remove("open");
+});
 
 // ─── dashboard ────────────────────────────────────────────────────────────────
 function renderDashboard() {
