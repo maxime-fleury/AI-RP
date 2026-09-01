@@ -1,6 +1,6 @@
-import { api, readSseStream } from "./api.js?v=13";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=13";
-import { store, refreshAll, navigate, applyTheme } from "./app.js?v=13";
+import { api, readSseStream } from "./api.js?v=14";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=14";
+import { store, refreshAll, navigate, applyTheme } from "./app.js?v=14";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -46,7 +46,7 @@ export async function renderChat(convIdRaw) {
   if (convIdRaw === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=13");
+    const { newGameWizard } = await import("./app.js?v=14");
     newGameWizard(pre);
     return;
   }
@@ -415,10 +415,18 @@ function renderMessage(m) {
   } else if (m.content) {
     for (const b of splitBlocks(m.content)) body.append(el("div", {}, formatBody(b)));
   }
-  const bubble = el("div", { class: "bubble" },
+  const bubble = el("div", { class: "bubble", title: "Double-clic pour modifier" },
     isMe ? null : el("div", { class: "who" }, esc(m.name || "Narrateur")),
     body,
   );
+  // double-click → inline edit (Enter valide, Échap annule)
+  const midStr = String(m.id || "");
+  if (!midStr.startsWith("tmp-") && !midStr.startsWith("pending")) {
+    bubble.addEventListener("dblclick", (e) => {
+      if (e.target.closest("button, a, img")) return;
+      startEdit(m, body, bubble);
+    });
+  }
   if (!isMe && m.meta?.image) {
     bubble.append(el("div", { class: "msg-illu" }, el("img", { src: m.meta.image, alt: "illustration" })));
   }
@@ -430,6 +438,45 @@ function renderMessage(m) {
     avatar,
     bubble,
   );
+}
+
+// inline edit: double-click a message, Enter to validate, Esc to cancel
+function startEdit(m, body, bubble) {
+  if (busy) return;
+  if (body.querySelector(".edit-ta")) return;
+  const ta = el("textarea", { class: "edit-ta", rows: Math.min(6, Math.max(2, (m.content || "").split("\n").length + 1)) }, m.content || "");
+  body.replaceChildren(ta, el("div", { class: "edit-hint" }, "Entrée : valider · Échap : annuler"));
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+  let done = false;
+  const finish = async (save) => {
+    if (done) return;
+    done = true;
+    const text = ta.value.trim();
+    if (!save || text === (m.content || "")) {
+      // cancel or no change → restore the original rendering
+      bubble.closest(".msg")?.replaceWith(renderMessage(m));
+      return;
+    }
+    try {
+      const updated = await api(`/api/conversations/${currentConversation.id}/messages/${m.id}`, {
+        method: "PATCH", body: { content: text },
+      });
+      const idx = currentConversation.messages.findIndex((x) => x.id === m.id);
+      if (idx >= 0) currentConversation.messages[idx] = updated;
+      bubble.closest(".msg")?.replaceWith(renderMessage(updated));
+      toast("Message modifié ✓");
+    } catch (e) {
+      toast(e.message, "err");
+      done = false;
+    }
+  };
+  const onKey = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); finish(true); }
+    else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+  };
+  ta.addEventListener("keydown", onKey);
+  ta.addEventListener("blur", () => finish(true));
 }
 
 function avatarFor(m) {
@@ -550,7 +597,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal } from "./ui.js?v=13";
+import { openModal } from "./ui.js?v=14";
 void applyTheme;
 void fmtTime;
 void currentConversation;

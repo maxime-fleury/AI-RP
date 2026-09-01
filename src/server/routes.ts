@@ -418,6 +418,30 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       }
       return json({ ok: true });
     }
+    // edit a message's content (double-click in the UI)
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] && method === "PATCH") {
+      const convId = Number(parts[2]);
+      const mid = Number(parts[4]);
+      const body = await readJson(req);
+      const m = getMessage(mid);
+      const conv = getConversation(convId);
+      if (!conv || !m) return json({ error: "not found" }, 404);
+      if (typeof body.content !== "string" || !body.content.trim()) {
+        return json({ error: "contenu vide" }, 400);
+      }
+      const content = body.content.trim();
+      const updates: Record<string, string> = { content };
+      if (m.role === "assistant") {
+        updates.segments = JSON.stringify(parseSegmentsFor(conv, content));
+      }
+      // content changed → the old audio + response suggestions no longer match
+      updates.audio = "[]";
+      const meta = JSON.parse(m.meta || "{}");
+      delete meta.suggestions;
+      updates.meta = JSON.stringify(meta);
+      updateMessage(mid, updates);
+      return json(messageView(getMessage(mid)!));
+    }
     // delete message + everything after (for regenerate/edit)
     if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] && method === "DELETE") {
       const convId = Number(parts[2]);

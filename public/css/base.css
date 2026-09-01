@@ -260,6 +260,16 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
 .msg.me .who { color: var(--accent2); }
 .msg .body { line-height: 1.6; font-size: 14.5px; white-space: pre-wrap; word-wrap: break-word; }
 .msg .body em, .msg .body i { color: var(--text-dim); }
+.msg .edit-ta {
+  width: 100%; min-height: 70px; resize: vertical;
+  font: inherit; line-height: 1.5; color: var(--text);
+  background: var(--input-bg); border: 1px solid var(--accent);
+  border-radius: 10px; padding: 10px 12px; outline: none;
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+.msg .edit-hint { font-size: 11px; color: var(--text-dim); margin-top: 6px; }
+.msg .bubble:hover { border-color: var(--accent-border); }
+.msg .bubble { transition: border-color .2s; }
 .msg .body p { margin: 0 0 8px; } .msg .body p:last-child { margin-bottom: 0; }
 .msg-actions { display: flex; gap: 6px; margin-top: 10px; opacity: 0; transition: opacity .2s; }
 .msg:hover .msg-actions, .msg .msg-actions.show { opacity: 1; }

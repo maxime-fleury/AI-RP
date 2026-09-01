@@ -1,6 +1,6 @@
-import { api, apiForm, uploadFiles } from "./api.js?v=13";
-import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=13";
-import { renderChat } from "./chat.js?v=13";
+import { api, apiForm, uploadFiles } from "./api.js?v=14";
+import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=14";
+import { renderChat } from "./chat.js?v=14";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
