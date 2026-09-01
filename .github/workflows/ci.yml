@@ -8,9 +8,17 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
+      # frontend: syntax check + make sure every cache-buster ?v= is in sync
+      # across index.html and the JS imports (a stale version serves old JS to
+      # users — this catches misses like index.html at ?v=38 with ?v=37 imports)
+      - run: |
+          for f in public/js/*.js; do node --check "$f"; done
+          V=$(grep -ho '?v=[0-9]*' public/index.html public/js/app.js public/js/chat.js | sort -u)
+          test "$(printf '%s' "$V" | wc -l)" = "1" \
+            || (echo "❌ cache-buster ?v= désynchronisés :" && echo "$V" && exit 1)
       - run: bun run check

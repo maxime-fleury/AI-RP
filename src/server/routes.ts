@@ -671,6 +671,64 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       if (!hasAny) return json({ error: "Le modèle n'a rien proposé — réessaie ou vérifie ta connexion IA." }, 502);
       return json({ fields });
     }
+    // generate a character avatar with the image model: portrait built from the
+    // card fields, stable seed per character (same face as chat illustrations),
+    // optional img2img from the previous avatar on rerolls (face consistency)
+    if (p === "/api/cards/generate-avatar" && method === "POST") {
+      const body = await readJson(req);
+      const name = String(body.name || "").trim().slice(0, 80);
+      const description = String(body.description || "").trim().slice(0, 2000);
+      const personality = String(body.personality || "").trim().slice(0, 2000);
+      const scenario = String(body.scenario || "").trim().slice(0, 1000);
+      let tags: string[] = [];
+      try {
+        const t = JSON.parse(String(body.tags || "[]"));
+        if (Array.isArray(t)) tags = t.map(String).slice(0, 12);
+      } catch {
+        tags = String(body.tags || "").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 12);
+      }
+      if (!name && !description && !personality && !scenario && !tags.length) return json({ error: "Remplis au moins un champ du personnage pour générer un avatar." }, 400);
+      const cardId = Number(body.id);
+      const seed =
+        typeof body.seed === "number" ? body.seed
+        : Number.isFinite(cardId) && cardId > 0 ? charSeed(cardId)
+        : undefined;
+      // same portrait pipeline as the message illustrations: identity tags + stable framing
+      const charTags = descriptionToTags([name, description, personality, scenario, ...tags].join(" ")).slice(0, 18);
+      const prompt = [
+        "masterpiece, best quality, anime illustration, highly detailed, vibrant colors, character focus, one character",
+        ...charTags,
+        name.replace(/\s+/g, "_"),
+        "portrait, solo, upper body, detailed face, face focus, looking at viewer, cinematic lighting, detailed background",
+      ].filter(Boolean).join(", ");
+      // img2img from the current avatar so rerolls keep the same face
+      let init_image: string | undefined;
+      const refBase = path.basename(String(body.ref_image || ""));
+      if (refBase) {
+        for (const dir of [path.join(IMAGES_DIR, "avatars"), path.join(UPLOADS_DIR, "avatars")]) {
+          const f = path.join(dir, refBase);
+          if (fs.existsSync(f)) { init_image = fs.readFileSync(f).toString("base64"); break; }
+        }
+      }
+      console.log(`[cards/generate-avatar] 🎨 ${name || "nouveau personnage"}${seed != null ? ` seed ${seed}` : ""}${init_image ? " (img2img)" : ""}`);
+      try {
+        const res = await generateAndSave("avatars", {
+          prompt,
+          negative: NEGATIVE_PROMPT,
+          steps: Number(getSetting("image_steps", 28)),
+          cfg: Number(getSetting("image_cfg", 7)),
+          width: Number(getSetting("image_width", 768)),
+          height: Number(getSetting("image_height", 1152)),
+          seed,
+          init_image,
+          strength: Number(getSetting("image_ref_strength", 0.55)),
+        });
+        return json({ image: res.url, seed: res.seed });
+      } catch (e) {
+        console.error(`[cards/generate-avatar] échec : ${e instanceof Error ? e.message : e}`);
+        return json({ error: "La génération d'image a échoué — vérifie que le serveur d'images est bien configuré." }, 502);
+      }
+    }
     if (parts[1] === "cards" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
       if (body.avatar && typeof body.avatar === "string" && body.avatar.startsWith("data:image/")) {
@@ -858,6 +916,42 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       deleteConversation(convId);
       try { fs.rmSync(path.join(IMAGES_DIR, "conversations", String(convId)), { recursive: true, force: true }); } catch { /* ignore */ }
       return json({ ok: true });
+    }
+    // quest journal: POST {refresh:true} asks the LLM to extract the current
+    // objectives from the conversation; POST {quests:[...]} saves them (manual
+    // status edits). Stored in the conversation settings, never in the prompt.
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "quests" && method === "POST") {
+      const convId = Number(parts[2]);
+      const conv = getConversation(convId);
+      if (!conv) return json({ error: "not found" }, 404);
+      const body = await readJson(req);
+      let cs: Record<string, unknown> = {};
+      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+      let quests: Quest[] = [];
+      try { quests = Array.isArray(cs.quests) ? cs.quests : []; } catch { /* ignore */ }
+      if (body.refresh) {
+        console.log(`[quests] 📜 conversation #${convId} « ${(conv.title || "").slice(0, 50)} » — analyse IA`);
+        try {
+          const fresh = await generateQuests(conv.title || "Partie", listMessages(convId));
+          // keep the player's manual status changes on same-titled quests
+          const byTitle = new Map(quests.map((q) => [q.title.toLowerCase(), q]));
+          quests = fresh.map((q) => ({ ...q, status: byTitle.get(q.title.toLowerCase())?.status ?? q.status }));
+        } catch (e) {
+          console.warn("[quests] analyse échouée:", String(e?.message ?? e).slice(0, 160));
+          return json({ error: "L'analyse IA a échoué — vérifie la connexion au modèle.", quests }, 502);
+        }
+      } else if (Array.isArray(body.quests)) {
+        quests = body.quests
+          .map((q: any) => ({
+            title: String(q?.title || "").trim().slice(0, 140),
+            status: ["active", "done", "dropped"].includes(q?.status) ? q.status : "active",
+            notes: String(q?.notes || "").trim().slice(0, 400),
+          }))
+          .filter((q: Quest) => q.title);
+      }
+      cs.quests = quests;
+      updateConversation(convId, { settings: JSON.stringify(cs) });
+      return json({ quests });
     }
     // fork a conversation up to a message — branching: regenerate in a copy,
     // the original stays intact (images are copied with remapped ids)
@@ -1672,6 +1766,61 @@ async function generateCardAssist(idea: string): Promise<CardAssistFields> {
     console.warn("[cards/assist] JSON invalide:", String(e?.message ?? e).slice(0, 120));
   }
   return out;
+}
+
+// ─── quest journal ────────────────────────────────────────────────────────────
+// The model reads the conversation and extracts the player's concrete
+// objectives (0-5). Stored in conv.settings.quests — purely a UI aid, never
+// injected in the prompt (the player may fake or reorder them).
+type Quest = { title: string; status: "active" | "done" | "dropped"; notes?: string };
+
+async function generateQuests(title: string, messages: MessageRow[]): Promise<Quest[]> {
+  const provider = getProvider();
+  let model = defaultModelFor(provider.id);
+  if (!model) {
+    const models = await provider.models();
+    model = models[0] ?? "";
+  }
+  const transcript = messages
+    .slice(-60)
+    .map((m) => `${m.role === "user" ? "Joueur" : m.name || "Narrateur"} : ${(m.content || "").replace(/\s+/g, " ").slice(0, 320)}`)
+    .join("\n");
+  const sys = [
+    `Tu suis la partie de roleplay « ${title.slice(0, 60)} » comme maître de jeu.`,
+    "À partir du fil de la partie, identifie les objectifs concrets du joueur, en cours ou récemment terminés/abandonnés (0 à 5 éléments).",
+    "Une quête = un objectif concret : retrouver quelqu'un, récupérer un objet, résoudre un mystère, échapper à une menace, gagner une bataille…",
+    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : {"quests":[{"title":"titre court","status":"active|done|dropped","notes":"une phrase de contexte"}]}.',
+    "Ne recopie pas les répliques ; titre court et nominal ; notes en une phrase. Tout en français. JSON complet, non tronqué.",
+  ].join(" ");
+  let text = "";
+  try {
+    text = await provider.complete({
+      messages: [{ role: "system", content: sys }, { role: "user", content: transcript }],
+      model,
+      temperature: 0.6,
+      maxTokens: 900,
+      noThinking: true,
+      signal: AbortSignal.timeout(120_000),
+    });
+  } catch (e) {
+    console.warn("[quests] complete failed:", String(e?.message ?? e).slice(0, 160));
+    return [];
+  }
+  try {
+    const parsed = parseCardAssistJson(text || "");
+    const list = Array.isArray(parsed?.quests) ? parsed.quests : [];
+    return list
+      .map((q: any) => ({
+        title: String(q?.title ?? "").trim().slice(0, 140),
+        status: ["active", "done", "dropped"].includes(q?.status) ? q.status : "active",
+        notes: String(q?.notes ?? "").trim().slice(0, 400),
+      }))
+      .filter((q: Quest) => q.title)
+      .slice(0, 6);
+  } catch (e) {
+    console.warn("[quests] JSON invalide:", String(e?.message ?? e).slice(0, 120));
+    return [];
+  }
 }
 
 /** Extract + parse the first balanced JSON object — robust to prose around it,

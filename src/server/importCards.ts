@@ -40,6 +40,19 @@ export interface ParsedCard {
 
 const str = (v: unknown): string => (typeof v === "string" ? v : v == null ? "" : String(v));
 
+/**
+ * Decode text with a UTF-8 first, CP1252 fallback. SillyTavern exports saved
+ * by Windows tools are often Latin-1/CP1252: decoding them as UTF-8 turns
+ * every accent into U+FFFD (""). If the UTF-8 pass produces replacement
+ * characters, retry with windows-1252 and keep that result when it is clean.
+ */
+function decodeText(bytes: Uint8Array): string {
+  const utf8 = new TextDecoder("utf-8").decode(bytes);
+  if (!utf8.includes("\uFFFD")) return utf8;
+  const cp1252 = new TextDecoder("windows-1252").decode(bytes);
+  return cp1252.includes("\uFFFD") ? utf8 : cp1252;
+}
+
 export function normalizeCard(v: any): ParsedCard {
   if (v && typeof v === "object" && v.data && typeof v.data === "object") {
     // V2
@@ -107,10 +120,13 @@ export function parsePngCard(bytes: Uint8Array): { card: ParsedCard; image: Uint
   if (!charaText) return null;
   let parsed: any = null;
   try {
-    parsed = JSON.parse(charaText);
+    parsed = JSON.parse(charaText.replace(/^\uFEFF/, ""));
   } catch {
     try {
-      parsed = JSON.parse(atob(charaText.trim()));
+      // some exporters base64 a CP1252-encoded JSON — decode bytes, then parse
+      const b64 = charaText.trim().replace(/^\uFEFF/, "");
+      const raw = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      parsed = JSON.parse(decodeText(raw));
     } catch {
       return null;
     }
@@ -119,9 +135,9 @@ export function parsePngCard(bytes: Uint8Array): { card: ParsedCard; image: Uint
 }
 
 export function parseJsonCard(bytes: Uint8Array): ParsedCard | null {
-  const text = new TextDecoder().decode(bytes);
+  const text = decodeText(bytes);
   try {
-    const parsed = JSON.parse(text);
+    const parsed = JSON.parse(text.replace(/^\uFEFF/, ""));
     if (parsed && typeof parsed === "object") return normalizeCard(parsed);
   } catch {
     return null;

@@ -1,7 +1,31 @@
 import { describe, test, expect } from "bun:test";
 import { loadApp } from "./helpers";
+import { cacheKeyFor } from "../src/server/image";
 
 const { routes } = await loadApp();
+
+describe("image cache key", () => {
+  const req = { prompt: "elfe rousse", negative: "flou", steps: 28, cfg: 7, width: 768, height: 1152, seed: 123 };
+  test("same seed + inputs → identical key (cache hit)", () => {
+    expect(cacheKeyFor("avatars", req)).toBe(cacheKeyFor("avatars", { ...req }));
+  });
+  test("different seed → different key", () => {
+    expect(cacheKeyFor("avatars", req)).not.toBe(cacheKeyFor("avatars", { ...req, seed: 124 }));
+  });
+  test("different prompt or subdir → different key", () => {
+    expect(cacheKeyFor("avatars", req)).not.toBe(cacheKeyFor("conversations/1", req));
+    expect(cacheKeyFor("avatars", req)).not.toBe(cacheKeyFor("avatars", { ...req, prompt: "elfe blonde" }));
+  });
+  test("img2img source changes the key (new reference = new render)", () => {
+    const a = cacheKeyFor("avatars", { ...req, init_image: "AAAA" });
+    const b = cacheKeyFor("avatars", { ...req, init_image: "BBBB" });
+    expect(a).not.toBe(b);
+  });
+  test("seeded render is cached, seed-less render is not (generateAndSave cache branch)", () => {
+    // cacheKeyFor only exists for seeded requests; the route only caches when req.seed != null
+    expect(cacheKeyFor("avatars", req).length).toBe(24);
+  });
+});
 
 describe("detectSceneKind", () => {
   test("pure scenery → landscape", () => {

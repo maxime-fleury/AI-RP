@@ -2,7 +2,7 @@ import { describe, test, expect } from "bun:test";
 import { loadApp, dataDir } from "./helpers";
 
 const { db, routes } = await loadApp();
-const { importFile, parsePngCard, normalizeCard, fingerprintFor, sizeLimitFor, MAX_JSON_BYTES } = await import("../src/server/importCards");
+const { importFile, parseJsonCard, parsePngCard, normalizeCard, fingerprintFor, sizeLimitFor, MAX_JSON_BYTES } = await import("../src/server/importCards");
 
 const enc = new TextEncoder();
 
@@ -80,6 +80,37 @@ describe("importCards", () => {
     const res = parsePngCard(png);
     expect(res).not.toBeNull();
     expect(res!.card.name).toBe("Elda");
+  });
+
+  test("parseJsonCard strips a UTF-8 BOM before parsing", () => {
+    const withBom = "\uFEFF" + JSON.stringify({ data: { name: "Bom", description: "Accent é ok" } });
+    const res = parseJsonCard(enc.encode(withBom));
+    expect(res).not.toBeNull();
+    expect(res!.name).toBe("Bom");
+    expect(res!.description).toBe("Accent é ok");
+  });
+
+  test("parseJsonCard recovers accented text from a CP1252-encoded file", () => {
+    // "Chanté" where é = 0xE9 (Latin-1) — decodes as U+FFFD under UTF-8
+    const bytes = new Uint8Array([
+      0x7B, 0x22, 0x64, 0x61, 0x74, 0x61, 0x22, 0x3A, 0x7B, 0x22, 0x6E, 0x61, 0x6D, 0x65, 0x22, 0x3A,
+      0x22, 0x43, 0x68, 0x61, 0x6E, 0x74, 0xE9, 0x22, 0x7D, 0x7D, // {"data":{"name":"Chanté"}}
+    ]);
+    const res = parseJsonCard(bytes);
+    expect(res).not.toBeNull();
+    expect(res!.name).toBe("Chanté");
+  });
+
+  test("parsePngCard decodes a base64 CP1252 chara chunk (exporters edge case)", () => {
+    const cp1252 = new Uint8Array([
+      0x7B, 0x22, 0x64, 0x61, 0x74, 0x61, 0x22, 0x3A, 0x7B, 0x22, 0x6E, 0x61, 0x6D, 0x65, 0x22, 0x3A,
+      0x22, 0x44, 0xE9, 0x6A, 0xE0, 0x76, 0x75, 0x22, 0x7D, 0x7D, // {"data":{"name":"Déjàvu"}}
+    ]);
+    const b64 = Buffer.from(cp1252).toString("base64");
+    const png = pngWithChara(b64); // base64 is ASCII, safe in a tEXt chunk
+    const res = parsePngCard(png);
+    expect(res).not.toBeNull();
+    expect(res!.card.name).toBe("Déjàvu");
   });
 
   test("importFile PNG creates a card + avatar", async () => {

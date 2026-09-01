@@ -3,6 +3,7 @@
  * demand, waits for it to be healthy, then proxies generation requests.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { PYTHON_DIR, IMAGES_DIR } from "./paths";
@@ -166,13 +167,48 @@ export interface SavedImage {
   ms: number;
 }
 
+/**
+ * Deterministic cache key for a seed-pinned generation. Seed + every prompt/
+ * render parameter (and a fingerprint of the img2img source) must all match,
+ * so only identical re-renders hit the cache — variations and „🔒 même seed“
+ * rerolls (which append a variation clause) keep distinct keys.
+ */
+export function cacheKeyFor(subdir: string, req: ImageRequest): string {
+  const h = createHash("sha256");
+  h.update([
+    subdir,
+    req.prompt,
+    req.negative ?? "",
+    String(req.steps ?? 28),
+    String(req.cfg ?? 7),
+    String(req.width ?? 0),
+    String(req.height ?? 0),
+    String(req.seed ?? ""),
+    String(req.strength ?? ""),
+    req.init_image ? createHash("sha256").update(req.init_image).digest("hex") : "",
+  ].join("\u001f"));
+  return h.digest("hex").slice(0, 24);
+}
+
 export async function generateAndSave(
   subdir: string,
   req: ImageRequest,
 ): Promise<SavedImage> {
-  const res = await generateImage(req);
   const dir = path.join(IMAGES_DIR, subdir);
   fs.mkdirSync(dir, { recursive: true });
+  // GPU cache: a seed-pinned request with identical inputs is deterministic,
+  // so reuse the already-rendered PNG instead of burning GPU time again.
+  if (req.seed != null) {
+    const key = cacheKeyFor(subdir, req);
+    const hit = path.join(dir, `${key}.png`);
+    if (fs.existsSync(hit)) {
+      return { url: `/images/${subdir}/${key}.png`, seed: req.seed, ms: 0 };
+    }
+    const res = await generateImage(req);
+    fs.writeFileSync(path.join(dir, `${key}.png`), Buffer.from(res.image_base64, "base64"));
+    return { url: `/images/${subdir}/${key}.png`, seed: res.seed, ms: res.ms };
+  }
+  const res = await generateImage(req);
   const file = path.join(dir, `${Date.now()}.png`);
   fs.writeFileSync(file, Buffer.from(res.image_base64, "base64"));
   return { url: `/images/${subdir}/${path.basename(file)}`, seed: res.seed, ms: res.ms };

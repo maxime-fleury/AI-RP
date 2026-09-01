@@ -132,6 +132,31 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
 .library-tools .search { flex: 1; max-width: 420px; }
 .avatar-editor { display: flex; align-items: center; gap: 14px; padding: 10px 0; }
 .avatar-editor input { max-width: 260px; }
+.avatar-controls { display: flex; flex-direction: column; gap: 8px; flex: 1; min-width: 0; }
+.avatar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.avatar-gen-status { font-size: 12px; color: var(--text-dim); }
+.preview-avatar.img { object-fit: cover; }
+
+/* mini character sheet shown on hover in the chat */
+.mini-sheet {
+  position: fixed; z-index: 300; width: 268px; padding: 12px 14px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 14px; box-shadow: 0 14px 44px rgba(0,0,0,.55);
+  pointer-events: none; animation: fadeIn .12s ease;
+}
+.mini-sheet-top { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.mini-sheet-name { font-size: 14px; font-weight: 700; }
+.ms-desc { margin: 0; font-size: 12px; line-height: 1.55; color: var(--text-dim); white-space: pre-wrap; max-height: 96px; overflow: auto; }
+.ms-desc.muted { font-style: italic; opacity: .7; }
+.ms-tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 8px; }
+
+/* quest journal modal */
+.quest-list { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; max-height: 46vh; overflow: auto; }
+.quest-row { display: flex; gap: 8px; align-items: center; }
+.quest-title { flex: 1; min-width: 0; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13.5px; }
+.quest-status { padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px; }
+.quest-actions { display: flex; align-items: center; gap: 10px; }
+.quest-actions .assist-status { margin: 0; }
 .card-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
 
 /* ── headings & hero ── */

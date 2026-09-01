@@ -1,6 +1,6 @@
-import { api, apiFetch, readSseStream } from "./api.js?v=37";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=37";
-import { store, refreshAll, navigate, applyTheme } from "./app.js?v=37";
+import { api, apiFetch, readSseStream } from "./api.js?v=41";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=41";
+import { store, refreshAll, navigate, applyTheme } from "./app.js?v=41";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -84,7 +84,7 @@ export async function renderChat(convIdRaw) {
   if (convIdRaw === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=37");
+    const { newGameWizard } = await import("./app.js?v=41");
     newGameWizard(pre);
     return;
   }
@@ -299,6 +299,7 @@ export async function renderChat(convIdRaw) {
 
   // ── header overflow menu: secondary actions grouped by category ⇣ ──────────
   // the header keeps only the essentials; everything else lives in a dropdown
+  const questBtn = el("button", { title: "Journal de quêtes", onclick: () => questModal(conv) }, "🗡"); // invisible trigger, surfaced via the menu
   const menu = el("div", { class: "header-menu", hidden: true, role: "menu" });
   const closeHeaderMenu = () => { menu.hidden = true; };
   const menuSection = (title, pairs) => {
@@ -320,7 +321,7 @@ export async function renderChat(convIdRaw) {
     ...menuSection("🎬 Scène & mémoire", [[sceneBtn, "État de la scène"], [memoryBtn, "Mémoire structurée"], [dmBtn, "Directives du maître de jeu"], [branchesBtn, "Variantes"], [validateBtn, "Vérifier la cohérence"]]),
     ...menuSection("🔎 Fil & sélection", [[searchBtn, "Rechercher"], [bookmarkFilterBtn, "Favoris seulement"], [selectBtn, "Sélectionner plusieurs messages"]]),
     ...menuSection("📤 Export", [[mdBtn, "Exporter en Markdown"], [copyThreadBtn, "Copier le fil"], [galleryBtn, "Galerie d'illustrations"], [exportBtn, "Exporter en ZIP"]]),
-    ...menuSection("🛠 Partie", [[settingsBtn, "Réglages de la partie"], [delBtn, "Archiver la partie"]]),
+    ...menuSection("🛠 Partie", [[questBtn, "Journal de quêtes"], [settingsBtn, "Réglages de la partie"], [delBtn, "Archiver la partie"]]),
   );
   const header = el("div", { class: "chat-header" }, backBtn, titleBlock, castStrip, groupBtn, menuBtn, menu);
 
@@ -428,6 +429,7 @@ export async function renderChat(convIdRaw) {
     scrollToBottom(scroll, true);
   };
   paintThread();
+  initMiniSheets(scroll);
 
   // composer
   const textarea = el("textarea", { rows: 1, placeholder: conv.cards?.[0] ? `Écris ta réplique à ${conv.cards[0].name}…` : "Écris ton action ou ta réplique…" });
@@ -652,6 +654,10 @@ export async function renderChat(convIdRaw) {
       el("span", { class: "lbl" }, "Vérifier la cohérence après chaque tour"),
       el("input", { type: "checkbox", ...(convSettings.validate_auto ? { checked: "" } : {}) }),
     );
+    const diceCb = el("label", { class: "setting-row" },
+      el("span", { class: "lbl" }, "Lancer des dés (/dice)"),
+      el("input", { type: "checkbox", "aria-label": "Activer /dice", ...(convSettings.dice_enabled === false ? {} : { checked: "" }) }),
+    );
     // choosing a preset pre-fills the temperature / max tokens fields (still editable)
     presetSel.input.addEventListener("change", () => {
       const p = GENERATION_PRESETS[presetSel.input.value];
@@ -737,6 +743,7 @@ export async function renderChat(convIdRaw) {
       presetSel.wrap,
       el("div", { class: "row3" }, temp.wrap, maxTok.wrap, ctxMax.wrap),
       autoValCb,
+      diceCb,
       ctxLine,
       el("div", { class: "modal-section" }, "Mode de jeu"),
       el("div", { class: "row" }, el("div", { class: "modal-line" },
@@ -769,6 +776,7 @@ export async function renderChat(convIdRaw) {
           max_tokens: Number(maxTok.input.value),
           context_max_messages: Number(ctxMax.input.value),
           validate_auto: autoValCb.querySelector("input").checked,
+          dice_enabled: diceCb.querySelector("input").checked,
         };
         await api(`/api/conversations/${convId}`, { method: "PATCH", body: { settings, cast: [...castIds], group_mode: groupMode } });
         store.settings.provider = provider.input.value;
@@ -1078,6 +1086,9 @@ function parseSlash(raw) {
   if (!cmd.startsWith("/")) return null;
   const rest = raw.trim().slice(cmd0.length).trim();
   if (cmd === "/dice") {
+    let cs = {};
+    try { cs = JSON.parse(currentConversation?.settings || "{}"); } catch { /* ignore */ }
+    if (cs.dice_enabled === false) return { display: "🎲 Les dés sont désactivés dans les réglages de la partie.", prompt: "" };
     const r = rollDice(rest || "1d20");
     if (!r) return { display: "🎲 Syntaxe : /dice 2d6, /dice d20, /dice 3d8+2 — ex. /dice 1d20", prompt: "" };
     const spec = `${r.n}d${r.sides}${r.mod ? (r.mod > 0 ? "+" + r.mod : String(r.mod)) : ""}`;
@@ -1572,9 +1583,15 @@ async function noteModal(m) {
 
 // keyboard shortcuts from within the chat (see app.js global handler)
 export function chatShortcut(key) {
+  const last = [...document.querySelectorAll(".msg[data-role='assistant']")].pop();
   if (key === "r") {
-    const last = [...document.querySelectorAll(".msg[data-role='assistant']")].pop();
     last?.querySelector(".regen-btn")?.click();
+  } else if (key === "e") {
+    // same path as a double-click: inline editor on the last reply
+    last?.querySelector(".bubble")?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+  } else if (key === "i") {
+    const sel = last?.querySelector(".mini-select");
+    if (sel) { sel.value = "auto"; sel.dispatchEvent(new Event("change")); }
   } else if (key === "g") {
     document.querySelector(".group-toggle")?.click();
   } else if (key === "/") {
@@ -1658,6 +1675,139 @@ function formatBody(b) {
   return el("span", {}, esc(b.text));
 }
 
+// ─── mini character sheet on hover ───────────────────────────────────────────
+// Hovering a speaker (message header, avatar or in-body name) opens a small
+// sheet with their avatar, description and tags. Data comes from the cast / persona.
+let sheetEl = null;
+let sheetTimer = null;
+let sheetLast = null;
+function sheetDataFor(name) {
+  const lower = String(name || "").trim().toLowerCase();
+  if (!lower) return null;
+  const card = (currentConversation?.cards || []).find((c) => c.name.toLowerCase() === lower);
+  if (card) return { name: card.name, desc: card.description || "", avatar: card.avatar || "", tags: card.tags };
+  const persona = currentConversation?.persona;
+  if (persona && (lower === "joueur" || (persona.name.toLowerCase() === lower))) {
+    return { name: persona.name, desc: persona.description || "", avatar: persona.avatar || "", tags: null };
+  }
+  return null;
+}
+function hideMiniSheet() {
+  clearTimeout(sheetTimer);
+  sheetEl?.remove();
+  sheetEl = null;
+}
+function showMiniSheetFor(host) {
+  const msgEl = host.closest(".msg");
+  let name = null;
+  if (host.classList.contains("who")) name = host.textContent.trim();
+  else if (host.closest(".seg")) name = host.textContent.replace(/\s*:\s*$/, "").trim();
+  else if (msgEl?.dataset.role === "user") name = "Joueur";
+  else {
+    const m = (currentConversation?.messages || []).find((x) => String(x.id) === String(msgEl?.dataset.mid));
+    name = m?.name || null;
+  }
+  const data = sheetDataFor(name);
+  if (!data) return;
+  let tags = [];
+  try { tags = Array.isArray(data.tags) ? data.tags : JSON.parse(data.tags || "[]"); } catch { /* ignore */ }
+  sheetEl = el("div", { class: "mini-sheet", role: "tooltip" },
+    el("div", { class: "mini-sheet-top" },
+      data.avatar
+        ? el("img", { src: data.avatar, class: "avatar avatar-md" })
+        : el("div", { class: "avatar avatar-md init-avatar", style: { display: "grid", placeItems: "center", background: `linear-gradient(135deg, hsl(${nameHue(data.name)} 65% 45%), hsl(${(nameHue(data.name) + 50) % 360} 75% 26%))`, color: "#fff", fontWeight: 800 } }, (data.name || "?").charAt(0).toUpperCase()),
+      el("span", { class: "mini-sheet-name" }, esc(data.name)),
+    ),
+    data.desc ? el("p", { class: "ms-desc" }, esc(data.desc)) : el("p", { class: "ms-desc muted" }, "Pas de description."),
+    tags.length ? el("div", { class: "ms-tags" }, ...tags.slice(0, 6).map((t) => el("span", { class: "chip tiny" }, "#" + esc(t)))) : null,
+  );
+  document.body.append(sheetEl);
+  const r = host.getBoundingClientRect();
+  const pad = 10;
+  let left = Math.min(r.left, window.innerWidth - sheetEl.offsetWidth - pad);
+  let top = r.bottom + 8;
+  if (top + sheetEl.offsetHeight > window.innerHeight - pad) top = r.top - sheetEl.offsetHeight - 8;
+  sheetEl.style.left = Math.max(pad, left) + "px";
+  sheetEl.style.top = Math.max(pad, top) + "px";
+}
+function initMiniSheets(scroll) {
+  const TARGET = ".who, .avatar, .seg strong";
+  scroll.addEventListener("mouseover", (e) => {
+    const t = e.target.closest?.(TARGET);
+    if (!t || !scroll.contains(t) || t.closest("button, a, .illu-meta")) return;
+    if (t === sheetLast && sheetEl) return;
+    sheetLast = t;
+    clearTimeout(sheetTimer);
+    sheetTimer = setTimeout(() => showMiniSheetFor(t), 200);
+  });
+  scroll.addEventListener("mouseout", (e) => {
+    const t = e.target.closest?.(TARGET);
+    if (t === sheetLast) { clearTimeout(sheetTimer); hideMiniSheet(); sheetLast = null; }
+  });
+  scroll.addEventListener("scroll", hideMiniSheet, { passive: true });
+}
+document.addEventListener("click", (e) => { if (sheetEl && !sheetEl.contains(e.target)) hideMiniSheet(); });
+
+// ─── quest journal ───────────────────────────────────────────────────────────
+// Objectives auto-extracted by the LLM on demand, editable by the player.
+// Stored user-side only: never injected into the model prompt.
+async function questModal(conv) {
+  const convId = currentConversation.id;
+  let quests = [];
+  try { quests = JSON.parse(conv.settings || "{}").quests || []; } catch { /* ignore */ }
+  const list = el("div", { class: "quest-list" });
+  const STATUS = [
+    ["active", "▶ En cours"], ["done", "✓ Accomplie"], ["dropped", "✗ Abandonnée"],
+  ];
+  const paint = () => {
+    list.replaceChildren(...quests.map((q, i) => {
+      const title = el("input", { class: "quest-title", value: q.title || "", "aria-label": "Titre de la quête" });
+      title.addEventListener("input", () => { q.title = title.value; });
+      const sel = el("select", { class: "quest-status", "aria-label": "Statut" },
+        ...STATUS.map(([v, l]) => el("option", { value: v, ...(q.status === v ? { selected: "" } : {}) }, l)));
+      sel.addEventListener("change", () => { q.status = sel.value; });
+      const del = el("button", { class: "mini-btn", title: "Retirer cette quête", "aria-label": "Retirer", onclick: () => { quests.splice(i, 1); paint(); } }, ICONS.trash);
+      return el("div", { class: "quest-row" }, title, sel, del);
+    }));
+  };
+  paint();
+  const status = el("div", { class: "assist-status", hidden: true });
+  const analyzeBtn = el("button", { class: "btn btn-primary btn-sm" }, ICONS.sparkles, "Analyser avec l'IA");
+  analyzeBtn.addEventListener("click", async () => {
+    analyzeBtn.disabled = true;
+    status.hidden = false;
+    status.textContent = "✨ L'IA relit la partie…";
+    try {
+      const r = await api(`/api/conversations/${convId}/quests`, { body: { refresh: true } });
+      quests = r.quests || [];
+      paint();
+      status.textContent = quests.length ? "Objectifs détectés ✓ — ajuste-les puis enregistre." : "Aucun objectif détecté pour l'instant.";
+    } catch (e) { status.hidden = true; toast(e.message, "err"); }
+    finally { analyzeBtn.disabled = false; }
+  });
+  const addBtn = el("button", { class: "btn btn-ghost btn-sm", onclick: () => { quests.push({ title: "", status: "active", notes: "" }); paint(); list.querySelector(".quest-title")?.focus(); } }, "＋ Ajouter");
+  const cancelBtn = el("button", { class: "btn btn-ghost" }, "Fermer");
+  const saveBtn = el("button", { class: "btn btn-primary" }, "Enregistrer");
+  const { close } = openModal({
+    title: "🗡 Journal de quêtes",
+    body: el("div",
+      el("p", { class: "modal-note" }, "Les objectifs détectés par l'IA à la lecture de la partie — ajuste-les ou ajoute les tiens. Ce journal est pour toi seul·e, jamais envoyé au modèle."),
+      el("div", { class: "quest-actions" }, analyzeBtn, status),
+      list,
+      el("div", { style: { display: "flex", justifyContent: "flex-end" } }, addBtn),
+    ),
+    footer: [cancelBtn, saveBtn],
+  });
+  cancelBtn.addEventListener("click", close);
+  saveBtn.addEventListener("click", async () => {
+    try {
+      await api(`/api/conversations/${convId}/quests`, { body: { quests: quests.map((q) => ({ title: q.title.trim(), status: q.status, notes: q.notes || "" })).filter((q) => q.title) } });
+      close();
+      toast("Journal de quêtes enregistré ✓");
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
 function scrollToBottom(scroll, force = false) {
   requestAnimationFrame(() => {
     scroll.scrollTop = scroll.scrollHeight;
@@ -1665,7 +1815,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal, field } from "./ui.js?v=37";
+import { openModal, field } from "./ui.js?v=41";
 void applyTheme;
 void fmtTime;
 void currentConversation;

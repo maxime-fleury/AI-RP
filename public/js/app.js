@@ -1,6 +1,6 @@
-import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=37";
-import { el, esc, toast, actionToast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=37";
-import { renderChat } from "./chat.js?v=37";
+import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=41";
+import { el, esc, toast, actionToast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=41";
+import { renderChat } from "./chat.js?v=41";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -292,10 +292,12 @@ function isTypingTarget(e) {
 
 // ─── configurable keyboard shortcuts ──────────────────────────────────────────
 // bindings are stored in settings.shortcuts as canonical strings: "ctrl+k", "n", "?"
-const SHORTCUT_DEFAULTS = { palette: "ctrl+k", new_game: "n", help: "?", composer: "/", regen: "r", group: "g" };
+const SHORTCUT_DEFAULTS = { palette: "ctrl+k", new_game: "n", help: "?", composer: "/", regen: "r", edit_last: "e", illustrate_last: "i", group: "g" };
 const SHORTCUT_LABELS = {
   palette: "Palette de commandes", new_game: "Nouvelle partie", help: "Aide des raccourcis",
-  composer: "Écrire un message (dans une partie)", regen: "Régénérer la dernière réponse", group: "Basculer solo / groupe",
+  composer: "Écrire un message (dans une partie)", regen: "Régénérer la dernière réponse",
+  edit_last: "Modifier la dernière réponse (dans une partie)", illustrate_last: "Illustrer la dernière réponse (dans une partie)",
+  group: "Basculer solo / groupe",
 };
 export function getShortcuts() {
   const custom = store.settings.shortcuts || {};
@@ -329,7 +331,7 @@ function shortcutsHelp() {
 }
 let shortcutCapturing = false; // set while the settings editor awaits a keypress
 function fireShortcut(k) {
-  import("./chat.js?v=37").then((m) => m.chatShortcut(k)).catch(() => {});
+  import("./chat.js?v=41").then((m) => m.chatShortcut(k)).catch(() => {});
 }
 document.addEventListener("keydown", (e) => {
   if (shortcutCapturing) return; // the settings key-capture owns this press
@@ -342,6 +344,8 @@ document.addEventListener("keydown", (e) => {
   if (press === S.help) { e.preventDefault(); shortcutsHelp(); }
   else if (press === S.new_game) { e.preventDefault(); newGameWizard(); }
   else if (inChat && press === S.regen) { e.preventDefault(); fireShortcut("r"); }
+  else if (inChat && press === S.edit_last) { e.preventDefault(); fireShortcut("e"); }
+  else if (inChat && press === S.illustrate_last) { e.preventDefault(); fireShortcut("i"); }
   else if (inChat && press === S.group) { e.preventDefault(); fireShortcut("g"); }
   else if (inChat && press === S.composer) { e.preventDefault(); fireShortcut("/"); }
 });
@@ -1598,10 +1602,55 @@ function cardModal(existing) {
   const sys = field("Prompt système (bonus)", f(existing?.system_prompt), { type: "textarea", rows: 2 });
   const tags = field("Tags (séparés par des virgules)", parseTags(existing?.tags).join(", "), { placeholder: "mage, romance, pnJ" });
   const avatarInput = el("input", { type: "file", accept: "image/png,image/jpeg,image/webp" });
+  // ✨ AI avatar generation: portrait from the card fields, stable seed per
+  // character, img2img rerolls (vary / same seed) keep the same face.
+  const genBtn = el("button", { class: "btn btn-sm", onclick: () => genAvatar() }, "✨ Générer un avatar");
+  const avatarStatus = el("span", { class: "avatar-gen-status" });
+  const sameSeedBtn = el("button", { class: "mini-btn", hidden: true, title: "Même composition, détails différents", onclick: () => genAvatar("seed") }, "🔒 Même seed");
+  const varyBtn = el("button", { class: "mini-btn", hidden: true, title: "Nouvelle variation du même personnage", onclick: () => genAvatar("vary") }, "🎲 Varier");
   const avatarPreview = existing?.avatar ? el("img", { src: existing.avatar, class: "avatar avatar-lg" }) : el("div", { class: "avatar avatar-lg", style: { display: "grid", placeItems: "center" } }, "🎭");
-  const avatarBox = el("div", { class: "avatar-editor" }, avatarPreview, avatarInput);
-  let avatarData = null;
-  avatarInput.addEventListener("change", () => { const file = avatarInput.files?.[0]; if (!file || file.size > 5 * 1024 * 1024) return toast("Avatar limité à 5 Mo", "err"); const reader = new FileReader(); reader.onload = () => { avatarData = String(reader.result); avatarPreview.replaceWith(el("img", { src: avatarData, class: "avatar avatar-lg" })); }; reader.readAsDataURL(file); });
+  const avatarBox = el("div", { class: "avatar-editor" },
+    avatarPreview,
+    el("div", { class: "avatar-controls" },
+      el("div", { class: "avatar-actions" }, genBtn, avatarStatus),
+      el("div", { class: "avatar-actions" }, avatarInput, sameSeedBtn, varyBtn),
+    ),
+  );
+  let avatarData = null;   // dataURL d'un fichier choisi manuellement
+  let avatarServer = null; // URL d'un avatar généré par IA
+  let lastSeed = null;
+  let genBusy = false;
+  let everGen = false;
+  avatarInput.addEventListener("change", () => { const file = avatarInput.files?.[0]; if (!file || file.size > 5 * 1024 * 1024) return toast("Avatar limité à 5 Mo", "err"); const reader = new FileReader(); reader.onload = () => { avatarData = String(reader.result); avatarServer = null; lastSeed = null; sameSeedBtn.hidden = true; varyBtn.hidden = true; avatarStatus.textContent = ""; avatarPreview.replaceWith(el("img", { src: avatarData, class: "avatar avatar-lg" })); updatePreview(); }; reader.readAsDataURL(file); });
+  async function genAvatar(mode) {
+    if (genBusy) return;
+    if (!name.input.value.trim() && !desc.input.value.trim() && !perso.input.value.trim() && !scenario.input.value.trim() && !tags.input.value.trim()) return toast("Remplis au moins un champ du personnage pour générer un avatar.", "err");
+    genBusy = true;
+    genBtn.disabled = true;
+    genBtn.textContent = "🎨 Génération…";
+    try {
+      const r = await api("/api/cards/generate-avatar", {
+        body: {
+          ...(existing?.id ? { id: existing.id } : {}),
+          name: name.input.value.trim(),
+          description: desc.input.value.trim(),
+          personality: perso.input.value.trim(),
+          scenario: scenario.input.value.trim(),
+          tags: tags.input.value,
+          ...(mode === "seed" && lastSeed != null ? { seed: lastSeed } : {}),
+          ...(avatarServer ? { ref_image: avatarServer } : {}),
+        },
+      });
+      avatarServer = r.image; lastSeed = r.seed; avatarData = null;
+      avatarPreview.replaceWith(el("img", { src: avatarServer, class: "avatar avatar-lg" }));
+      avatarStatus.textContent = "seed " + r.seed;
+      sameSeedBtn.hidden = false; varyBtn.hidden = false;
+      everGen = true;
+      toast("Avatar généré ✓ — enregistre pour le garder", "ok");
+      updatePreview();
+    } catch (e) { toast(e.message, "err"); }
+    finally { genBusy = false; genBtn.disabled = false; genBtn.textContent = everGen ? "↻ Régénérer l'avatar" : "✨ Générer un avatar"; }
+  }
   // ── ✨ Aide IA : tu décris ton idée, le modèle propose des chips par champ ──
   // et tu choisis tes préférées d'un clic (chaque chip remplit son champ).
   const ASSIST_FIELDS = [
@@ -1692,9 +1741,12 @@ function cardModal(existing) {
     if (sc) secs.push(el("div", { class: "preview-sec" }, el("strong", {}, "Situation"), el("p", {}, esc(sc))));
     if (fm) secs.push(el("div", { class: "preview-sec preview-greet" }, el("strong", {}, "Premier message"), el("blockquote", {}, esc(fm))));
     if (ex) secs.push(el("div", { class: "preview-sec preview-greet" }, el("strong", {}, "Exemple de dialogue"), el("blockquote", {}, esc(ex))));
+    const previewImg = avatarServer || avatarData || existing?.avatar || null;
     preview.replaceChildren(
-      el("div", { class: "preview-avatar", style: { background: `linear-gradient(135deg, hsl(${(n.length * 59) % 360} 70% 55%), hsl(${(n.length * 59 + 60) % 360} 80% 40%))` } },
-        n ? n[0].toUpperCase() : "?"),
+      previewImg
+        ? el("img", { src: previewImg, class: "preview-avatar img" })
+        : el("div", { class: "preview-avatar", style: { background: `linear-gradient(135deg, hsl(${(n.length * 59) % 360} 70% 55%), hsl(${(n.length * 59 + 60) % 360} 80% 40%))` } },
+          n ? n[0].toUpperCase() : "?"),
       el("h3", {}, esc(n || "Nouvelle carte")),
       el("div", { class: "preview-sec" },
         el("strong", {}, "Description"),
@@ -1731,7 +1783,7 @@ function cardModal(existing) {
           description: desc.input.value.trim(), personality: perso.input.value.trim(),
           scenario: scenario.input.value.trim(), first_mes: firstMes.input.value.trim(),
           mes_example: example.input.value.trim(), system_prompt: sys.input.value.trim(),
-          tags: JSON.stringify(tags.input.value.split(",").map((x) => x.trim()).filter(Boolean)), ...(avatarData ? { avatar: avatarData } : {}),
+          tags: JSON.stringify(tags.input.value.split(",").map((x) => x.trim()).filter(Boolean)), ...(avatarData ? { avatar: avatarData } : {}), ...(avatarServer ? { avatar: avatarServer } : {}),
         };
         try {
           if (existing) await api(`/api/cards/${existing.id}`, { method: "PATCH", body: payload });
