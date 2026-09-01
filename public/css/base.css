@@ -21,9 +21,10 @@ input, textarea, select {
   color-scheme: dark; /* native dropdown rendered in dark mode */
   transition: border-color .2s, box-shadow .2s, background .2s;
 }
-/* explicit option styling as a fallback (Firefox / older Chromium) */
+/* native <option> popup needs an OPAQUE background (var(--input-bg) is a
+   translucent white → would render white-on-white) */
 select option {
-  background: var(--input-bg);
+  background: var(--select-bg, #1a1726);
   color: var(--text);
 }
 input:focus, textarea:focus, select:focus {

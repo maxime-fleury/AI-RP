@@ -1,6 +1,6 @@
-import { api, apiForm, uploadFiles } from "./api.js?v=14";
-import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=14";
-import { renderChat } from "./chat.js?v=14";
+import { api, apiForm, uploadFiles } from "./api.js?v=15";
+import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=15";
+import { renderChat } from "./chat.js?v=15";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -237,12 +237,32 @@ function worldModal(existing) {
   const lang = field("Langue du monde", f(existing?.language), {
     type: "select", options: [["", "Par défaut (réglages)"], ["fr", "Français"], ["en", "English"]],
   });
-  const body = el("div", {}, name.wrap, desc.wrap, lore.wrap, el("div", { class: "row" }, tone.wrap, nstyle.wrap), lang.wrap);
+  // jaquette générée par IA (édition seulement — il faut un id de monde)
+  const coverBox = el("div", { class: "cover-box", style: { marginTop: "16px" } });
+  if (existing) {
+    const preview = existing.cover ? el("img", { src: existing.cover, style: { width: "100%", maxHeight: "220px", objectFit: "cover", borderRadius: "12px", border: "1px solid var(--border)" } }) : null;
+    const genBtn = el("button", { class: "btn btn-ghost btn-sm", style: { marginTop: "10px" }, onclick: async () => {
+      genBtn.disabled = true;
+      genBtn.textContent = "🎨 génération… (15-20 s)";
+      try {
+        const res = await api(`/api/worlds/${existing.id}/cover`, { body: {} });
+        toast("Jaquette générée ✓");
+        await refreshAll();
+        if (preview) preview.src = res.cover;
+        else coverBox.prepend(el("img", { src: res.cover, style: { width: "100%", maxHeight: "220px", objectFit: "cover", borderRadius: "12px", border: "1px solid var(--border)" } }));
+      } catch (e) { toast(e.message, "err"); }
+      genBtn.disabled = false;
+      genBtn.textContent = "🎨 Générer une jaquette";
+    } }, "🎨 Générer une jaquette");
+    if (preview) coverBox.append(preview);
+    coverBox.append(genBtn);
+  }
+  const body = el("div", {}, name.wrap, desc.wrap, lore.wrap, el("div", { class: "row" }, tone.wrap, nstyle.wrap), lang.wrap, coverBox);
   const { close } = openModal({
     title: existing ? "Modifier le monde" : "Nouveau monde",
     body,
     footer: [
-      el("button", { class: "btn btn-ghost", onclick: close }, "Annuler"),
+      el("button", { class: "btn btn-ghost", onclick: () => close() }, "Annuler"),
       el("button", { class: "btn btn-primary", onclick: async () => {
         const payload = {
           name: name.input.value.trim() || "Monde sans nom",
@@ -377,7 +397,7 @@ function scenarioModal(world, existing) {
           void gen;
         } catch (e) { toast(e.message, "err"); }
       } }, ICONS.sparkles, "Générer par l'IA") : null,
-      el("button", { class: "btn btn-ghost", onclick: close }, "Annuler"),
+      el("button", { class: "btn btn-ghost", onclick: () => close() }, "Annuler"),
       el("button", { class: "btn btn-primary", onclick: async () => {
         const payload = {
           name: name.input.value.trim() || "Scénario",
@@ -450,7 +470,7 @@ async function scanDir() {
     title: "Scanner un dossier",
     body: el("div", {}, wrap, el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "8px" } }, "Tous les .png et .json du dossier seront importés.")),
     footer: [
-      el("button", { class: "btn btn-ghost", onclick: close }, "Annuler"),
+      el("button", { class: "btn btn-ghost", onclick: () => close() }, "Annuler"),
       el("button", { class: "btn btn-primary", onclick: async () => {
         try {
           const res = await api("/api/cards/scan", { body: { dir: input.value.trim() } });
@@ -508,7 +528,7 @@ function cardModal(existing) {
     title: existing ? `Éditer ${existing.name}` : "Nouvelle carte",
     body, wide: true,
     footer: [
-      el("button", { class: "btn btn-ghost", onclick: close }, "Annuler"),
+      el("button", { class: "btn btn-ghost", onclick: () => close() }, "Annuler"),
       el("button", { class: "btn btn-primary", onclick: async () => {
         const payload = {
           name: name.input.value.trim() || "Carte",
@@ -581,7 +601,7 @@ function personaModal(existing) {
     title: existing ? "Modifier le persona" : "Nouveau persona",
     body,
     footer: [
-      el("button", { class: "btn btn-ghost", onclick: close }, "Annuler"),
+      el("button", { class: "btn btn-ghost", onclick: () => close() }, "Annuler"),
       el("button", { class: "btn btn-primary", onclick: async () => {
         const payload = { name: name.input.value.trim() || "Persona", description: desc.input.value.trim() };
         try {
@@ -862,7 +882,7 @@ export function newGameWizard(pre) {
 
   modal.append(worldSel.wrap, scenSel.wrap, persoSel.wrap, groupToggle.wrap, castWrap, castGrid,
     el("div", { class: "modal-footer" },
-      el("button", { class: "btn btn-ghost", onclick: close }, "Annuler"),
+      el("button", { class: "btn btn-ghost", onclick: () => close() }, "Annuler"),
       el("button", { class: "btn btn-primary", onclick: async (e) => {
         const btn = e.target;
         btn.disabled = true;

@@ -1,6 +1,6 @@
-import { api, readSseStream } from "./api.js?v=14";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=14";
-import { store, refreshAll, navigate, applyTheme } from "./app.js?v=14";
+import { api, readSseStream } from "./api.js?v=15";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=15";
+import { store, refreshAll, navigate, applyTheme } from "./app.js?v=15";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -46,7 +46,7 @@ export async function renderChat(convIdRaw) {
   if (convIdRaw === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=14");
+    const { newGameWizard } = await import("./app.js?v=15");
     newGameWizard(pre);
     return;
   }
@@ -597,7 +597,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal } from "./ui.js?v=14";
+import { openModal } from "./ui.js?v=15";
 void applyTheme;
 void fmtTime;
 void currentConversation;

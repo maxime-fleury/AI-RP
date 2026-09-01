@@ -5,6 +5,7 @@
   --modal-bg: rgba(30, 22, 54, 0.95);
   --sidebar-bg: rgba(24, 17, 46, 0.6);
   --input-bg: rgba(255, 255, 255, 0.08);
+  --select-bg: #251c38; /* opaque: native <option> list needs a solid color */
   --hover: rgba(255, 255, 255, 0.1);
   --active-bg: rgba(255, 102, 196, 0.16);
   --me-bg: rgba(77, 214, 255, 0.12);

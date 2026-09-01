@@ -235,13 +235,15 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const body = await readJson(req);
       const world = getWorld(Number(parts[2]));
       if (!world) return json({ error: "not found" }, 404);
-      const prompt = body.prompt || `Masterpiece anime key visual, ${world.name}, ${world.description || world.tone}, cinematic lighting, highly detailed`;
+      const sceneText = [world.description, world.lore, world.tone].filter(Boolean).join(" ");
+      const prompt = body.prompt || buildIllustrationPrompt(world.name, "", world.tone || "épique", sceneText || `${world.name}, fantasy landscape`);
       const cover = await generateAndSave(`worlds/${world.id}`, {
         prompt,
-        negative: "(worst quality, low quality:1.4),",
-        steps: 24,
-        width: 832,
-        height: 1216,
+        negative: NEGATIVE_PROMPT,
+        steps: Number(getSetting("image_steps", 28)),
+        cfg: Number(getSetting("image_cfg", 7)),
+        width: Number(getSetting("image_width", 768)),
+        height: Number(getSetting("image_height", 1152)),
       });
       updateWorld(world.id, { cover });
       return json({ cover });
