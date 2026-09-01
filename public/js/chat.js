@@ -1,6 +1,6 @@
-import { api, readSseStream } from "./api.js?v=12";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=12";
-import { store, refreshAll, navigate, applyTheme } from "./app.js?v=12";
+import { api, readSseStream } from "./api.js?v=13";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=13";
+import { store, refreshAll, navigate, applyTheme } from "./app.js?v=13";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -46,7 +46,7 @@ export async function renderChat(convIdRaw) {
   if (convIdRaw === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=12");
+    const { newGameWizard } = await import("./app.js?v=13");
     newGameWizard(pre);
     return;
   }
@@ -486,15 +486,15 @@ async function regenerate(messageId) {
     await renderChat(currentConversation.id);
     const conv = await api(`/api/conversations/${currentConversation.id}`);
     currentConversation = conv;
-    const last = [...conv.messages].reverse().find((m) => m.role === "assistant");
-    // retrigger the last user message
+    // retrigger the last user message → the model regenerates right away
     const users = conv.messages.filter((m) => m.role === "user");
     const lastUser = users[users.length - 1];
     if (lastUser) {
-      const input = currentCtx?.textarea;
-      if (input) input.value = lastUser.content;
+      toast("↻ Régénération en cours…", "ok", 3000);
+      await doStream(lastUser.content);
+    } else {
+      toast("Rien à régénérer.", "err");
     }
-    void last;
   } catch (e) { toast(e.message, "err"); }
 }
 
@@ -550,7 +550,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal } from "./ui.js?v=12";
+import { openModal } from "./ui.js?v=13";
 void applyTheme;
 void fmtTime;
 void currentConversation;

@@ -1,6 +1,6 @@
-import { api, apiForm, uploadFiles } from "./api.js?v=12";
-import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=12";
-import { renderChat } from "./chat.js?v=12";
+import { api, apiForm, uploadFiles } from "./api.js?v=13";
+import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=13";
+import { renderChat } from "./chat.js?v=13";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -660,13 +660,13 @@ async function renderSettings() {
   container.append(el("div", { class: "section-title" }, "Voix (TTS)"));
   const ttsOn = checkbox("tts_enabled", s.tts_enabled !== false, "Activer la synthèse vocale");
   const ttsLang = field("Langue des voix", s.tts_language || "fr", { type: "select", options: [["fr", "Français"], ["en", "English"]] });
-  const narrator = field("Voix du narrateur", s.tts_voice_narrateur || "jean", { type: "select", options: voicesOptions("fr") });
-  const defChar = field("Voix par défaut des personnages", s.tts_voice_default || "cosette", { type: "select", options: voicesOptions("fr") });
+  const narrator = field("Voix du narrateur", s.tts_voice_narrateur || "jean", { type: "select", options: voicesOptions(ttsLang.input.value) });
+  const defChar = field("Voix par défaut des personnages", s.tts_voice_default || "cosette", { type: "select", options: voicesOptions(ttsLang.input.value) });
   const lsd = field("Qualité (pas de décodage)", s.tts_lsd_steps || 4, { type: "number", min: 1, max: 10, step: 1 });
   const autoplay = checkbox("tts_autoplay", s.tts_autoplay !== false, "Lecture auto des réponses");
   // ▶ buttons: play a sample of the currently selected voice
-  const narratorPlay = samplePlayBtn(() => narrator.input.value);
-  const defCharPlay = samplePlayBtn(() => defChar.input.value);
+  const narratorPlay = samplePlayBtn(() => narrator.input.value, () => ttsLang.input.value);
+  const defCharPlay = samplePlayBtn(() => defChar.input.value, () => ttsLang.input.value);
   narrator.wrap.append(narratorPlay);
   defChar.wrap.append(defCharPlay);
   // samples strip: every voice, playable
@@ -689,7 +689,16 @@ async function renderSettings() {
     }
   };
   renderStrip();
-  ttsLang.input.addEventListener("change", renderStrip);
+  ttsLang.input.addEventListener("change", () => {
+    // voice selects follow the chosen language (keep selection when possible)
+    const lang = ttsLang.input.value;
+    const opts = voicesOptions(lang);
+    for (const sel of [narrator.input, defChar.input]) {
+      const cur = sel.value;
+      sel.replaceChildren(...opts.map(([v, l]) => el("option", { value: v, ...(v === cur ? { selected: "" } : {}) }, l)));
+    }
+    renderStrip();
+  });
   container.append(el("div", { class: "card", style: { padding: "18px 22px" } },
     el("div", { class: "row" }, ttsOn.wrap, autoplay.wrap),
     el("div", { class: "row" }, ttsLang.wrap, lsd.wrap),
@@ -805,8 +814,8 @@ async function playSample(name, lang, btn) {
     toast(String(e?.message ?? e), "err");
   }
 }
-function samplePlayBtn(getVoice) {
-  const b = el("button", { class: "mini-btn play-voice", style: { marginTop: "8px" }, onclick: () => playSample(getVoice(), "fr", b) }, "▶ Écouter");
+function samplePlayBtn(getVoice, getLang) {
+  const b = el("button", { class: "mini-btn play-voice", style: { marginTop: "8px" }, onclick: () => playSample(getVoice(), getLang ? getLang() : "fr", b) }, "▶ Écouter");
   return b;
 }
 

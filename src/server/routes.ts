@@ -20,7 +20,7 @@ import type { MessageRow } from "./db";
 import { synthSegments, buildTtsContext, listVoices, warmupTts, getVoiceSample } from "../tts/service";
 import { ensureTtsLoaded, synthesize, wavBytes } from "../tts/engine";
 import { generateAndSave, probeImageStatus, ensureImageServer } from "./image";
-import { AUDIO_DIR } from "./paths";
+import { AUDIO_DIR, IMAGES_DIR } from "./paths";
 
 const preparingAudio = new Set<number>();
 
@@ -218,16 +218,16 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const body = await readJson(req);
       return json(createWorld(body), 201);
     }
-    if (parts[1] === "worlds" && parts[2] && method === "GET") {
+    if (parts[1] === "worlds" && parts[2] && !parts[3] && method === "GET") {
       const w = getWorld(Number(parts[2]));
       return w ? json(w) : json({ error: "not found" }, 404);
     }
-    if (parts[1] === "worlds" && parts[2] && method === "PATCH") {
+    if (parts[1] === "worlds" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
       const w = updateWorld(Number(parts[2]), body);
       return w ? json(w) : json({ error: "not found" }, 404);
     }
-    if (parts[1] === "worlds" && parts[2] && method === "DELETE") {
+    if (parts[1] === "worlds" && parts[2] && !parts[3] && method === "DELETE") {
       deleteWorld(Number(parts[2]));
       return json({ ok: true });
     }
@@ -260,11 +260,11 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const body = await readJson(req);
       return json(createScenario(body), 201);
     }
-    if (parts[1] === "scenarios" && parts[2] && method === "PATCH") {
+    if (parts[1] === "scenarios" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
       return json(updateScenario(Number(parts[2]), body));
     }
-    if (parts[1] === "scenarios" && parts[2] && method === "DELETE") {
+    if (parts[1] === "scenarios" && parts[2] && !parts[3] && method === "DELETE") {
       deleteScenario(Number(parts[2]));
       return json({ ok: true });
     }
@@ -303,11 +303,11 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const body = await readJson(req);
       return json(createCard(body), 201);
     }
-    if (parts[1] === "cards" && parts[2] && method === "PATCH") {
+    if (parts[1] === "cards" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
       return json(updateCard(Number(parts[2]), body));
     }
-    if (parts[1] === "cards" && parts[2] && method === "DELETE") {
+    if (parts[1] === "cards" && parts[2] && !parts[3] && method === "DELETE") {
       deleteCard(Number(parts[2]));
       return json({ ok: true });
     }
@@ -320,11 +320,11 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const body = await readJson(req);
       return json(createPersona(body), 201);
     }
-    if (parts[1] === "personas" && parts[2] && method === "PATCH") {
+    if (parts[1] === "personas" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
       return json(updatePersona(Number(parts[2]), body));
     }
-    if (parts[1] === "personas" && parts[2] && method === "DELETE") {
+    if (parts[1] === "personas" && parts[2] && !parts[3] && method === "DELETE") {
       deletePersona(Number(parts[2]));
       return json({ ok: true });
     }
@@ -393,13 +393,13 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       }
       return json(view, 201);
     }
-    if (parts[1] === "conversations" && parts[2] && method === "GET") {
+    if (parts[1] === "conversations" && parts[2] && !parts[3] && method === "GET") {
       const view = conversationView(Number(parts[2]));
       if (!view) return json({ error: "not found" }, 404);
       view.messages = listMessages(view.id).map(messageView);
       return json(view);
     }
-    if (parts[1] === "conversations" && parts[2] && method === "PATCH") {
+    if (parts[1] === "conversations" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
       updateConversation(Number(parts[2]), {
         title: body.title,
@@ -409,8 +409,13 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       });
       return json(conversationView(Number(parts[2])));
     }
-    if (parts[1] === "conversations" && parts[2] && method === "DELETE") {
-      deleteConversation(Number(parts[2]));
+    if (parts[1] === "conversations" && parts[2] && !parts[3] && method === "DELETE") {
+      const convId = Number(parts[2]);
+      deleteConversation(convId);
+      // drop generated audio + images of this conversation
+      for (const dir of [path.join(AUDIO_DIR, String(convId)), path.join(IMAGES_DIR, "conversations", String(convId))]) {
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
       return json({ ok: true });
     }
     // delete message + everything after (for regenerate/edit)
@@ -420,7 +425,16 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const msgs = listMessages(convId);
       const idx = msgs.findIndex((m) => m.id === mid);
       if (idx < 0) return json({ error: "message not found" }, 404);
-      for (const m of msgs.slice(idx)) deleteMessage(m.id);
+      for (const m of msgs.slice(idx)) {
+        // also drop the synthesized audio files from disk
+        try {
+          const dir = path.join(AUDIO_DIR, String(convId));
+          for (const f of fs.readdirSync(dir)) {
+            if (f.startsWith(`${m.id}-`) && f.endsWith(".wav")) fs.rmSync(path.join(dir, f), { force: true });
+          }
+        } catch { /* no audio dir */ }
+        deleteMessage(m.id);
+      }
       const last = lastMessageOf(convId);
       updateConversation(convId, { last_message: last?.content ?? "" });
       return json({ ok: true });
@@ -588,7 +602,14 @@ function buildIllustrationPrompt(world: string, desc: string, tone: string, scen
     seen.add(t);
     tags.push(t);
   }
-  const worldPart = [world || "fantasy", (desc || tone || "").slice(0, 80)].filter(Boolean).join(", ");
+  // keep the prompt in tags: translate the tone, drop French prose (tag-trained
+  // anime models respond poorly to natural-language sentences)
+  const TONE_EN: Record<string, string> = {
+    "épique": "epic", "epique": "epic", "sombre": "dark, grim", "léger": "lighthearted",
+    "leger": "lighthearted", "mystérieux": "mysterious", "mysterieux": "mysterious",
+    "comique": "comedic", "heroïque": "heroic", "heroique": "heroic", "neutre": "",
+  };
+  const worldPart = [world || "fantasy", TONE_EN[String(tone || "").toLowerCase().trim()] || ""].filter(Boolean).join(", ");
   // danbooru-style: quality tags first, then environment, scene keywords, style
   return [
     "masterpiece, best quality, anime illustration, highly detailed, vibrant colors",
