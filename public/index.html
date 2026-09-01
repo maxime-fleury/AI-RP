@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="fr" data-theme="glass">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI-RP — Mondes & Personnages</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🪄</text></svg>" />
+  <link rel="stylesheet" href="/css/base.css?v=12" />
+  <link rel="stylesheet" href="/css/theme-glass.css?v=12" />
+  <link rel="stylesheet" href="/css/theme-anime.css?v=12" />
+  <script>
+    // apply saved theme before paint
+    try {
+      const t = JSON.parse(localStorage.getItem("ai-rp-theme") || '"glass"');
+      document.documentElement.dataset.theme = t;
+    } catch (e) { document.documentElement.dataset.theme = "glass"; }
+  </script>
+</head>
+<body>
+  <div class="aurora" aria-hidden="true"><span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span></div>
+  <div id="app" class="app">
+    <aside id="sidebar" class="sidebar"></aside>
+    <main id="main" class="main"></main>
+  </div>
+  <div id="toasts" class="toasts"></div>
+  <div id="modal-root"></div>
+  <div id="audio-root"></div>
+  <script type="module" src="/js/app.js?v=12"></script>
+</body>
+</html>

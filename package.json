@@ -1,0 +1,16 @@
+{
+  "name": "ai-rp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "dependencies": {
+    "onnxruntime-node": "^1.29.0",
+    "onnxruntime-web": "^1.29.0"
+  }
+}

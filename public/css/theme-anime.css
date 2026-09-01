@@ -1,0 +1,60 @@
+/* ── Thème : Anime / ISEKAI vibrant ── */
+[data-theme="anime"] {
+  --bg: #17122b;
+  --surface: rgba(255, 255, 255, 0.07);
+  --modal-bg: rgba(30, 22, 54, 0.95);
+  --sidebar-bg: rgba(24, 17, 46, 0.6);
+  --input-bg: rgba(255, 255, 255, 0.08);
+  --hover: rgba(255, 255, 255, 0.1);
+  --active-bg: rgba(255, 102, 196, 0.16);
+  --me-bg: rgba(77, 214, 255, 0.12);
+  --text: #fdf3ff;
+  --text-dim: #c4b8d8;
+  --accent: #ff66c4;
+  --accent2: #ffb45e;
+  --accent-border: rgba(255, 102, 196, 0.5);
+  --accent-glow: rgba(255, 102, 196, 0.3);
+  --border: rgba(255, 255, 255, 0.14);
+  --danger: #ff5d7a;
+  --danger-soft: rgba(255, 93, 122, 0.14);
+  --success: #4dffb8;
+  --warning: #ffd24d;
+  --radius-sm: 14px;
+  --radius-lg: 22px;
+  --shadow-soft: 0 10px 34px rgba(0, 0, 0, 0.35);
+  --glow: 0 0 24px var(--accent-glow);
+  --glow-soft: 0 0 16px var(--accent-glow);
+  --glow-strong: 0 12px 48px var(--accent-glow), 0 0 26px rgba(255, 180, 94, 0.25);
+  --grad-text: linear-gradient(100deg, #ff8acb 0%, #ffd37e 55%, #8ad4ff 100%);
+}
+
+[data-theme="anime"] .aurora { display: block; }
+[data-theme="anime"] .blob { mix-blend-mode: screen; opacity: .4; }
+[data-theme="anime"] .b1 { background: #ff2ea6; }
+[data-theme="anime"] .b2 { background: #7a3dff; }
+[data-theme="anime"] .b3 { background: #2ecbff; opacity: .3; }
+[data-theme="anime"] body {
+  background:
+    radial-gradient(1100px 700px at 10% 0%, rgba(255, 46, 166, 0.16), transparent 60%),
+    radial-gradient(900px 700px at 100% 100%, rgba(122, 61, 255, 0.15), transparent 60%),
+    radial-gradient(700px 500px at 60% 20%, rgba(46, 203, 255, 0.08), transparent 60%),
+    var(--bg);
+  background-size: 220% 220%;
+  animation: bgPan 60s ease-in-out infinite alternate;
+}
+@keyframes bgPan {
+  0% { background-position: 0% 0%; }
+  100% { background-position: 100% 100%; }
+}
+[data-theme="anime"] .blob { animation-duration: 40s; }
+@media (prefers-reduced-motion: reduce) {
+  [data-theme="anime"] body { animation: none !important; }
+}
+
+/* sparkle accents */
+[data-theme="anime"] .card:hover { box-shadow: 0 0 0 1px var(--accent-border), 0 16px 60px var(--accent-glow); }
+[data-theme="anime"] .hero h2::after, [data-theme="anime"] .page-head h2::after {
+  content: " ✦"; color: var(--accent2); font-size: .7em;
+}
+[data-theme="anime"] .msg .who { color: var(--accent2); }
+[data-theme="anime"] .card-cover { background-blend-mode: overlay; }

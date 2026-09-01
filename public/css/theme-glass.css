@@ -1,0 +1,63 @@
+/* ── Thème : Glassmorphism Néon (défaut) ── */
+:root, [data-theme="glass"] {
+  --bg: #07070f;
+  --surface: rgba(255, 255, 255, 0.045);
+  --modal-bg: rgba(18, 18, 32, 0.92);
+  --sidebar-bg: rgba(12, 12, 24, 0.55);
+  --input-bg: rgba(255, 255, 255, 0.05);
+  --hover: rgba(255, 255, 255, 0.07);
+  --active-bg: rgba(124, 92, 255, 0.12);
+  --me-bg: rgba(0, 200, 255, 0.08);
+  --text: #ecebf6;
+  --text-dim: #9b99b4;
+  --accent: #8b7cff;
+  --accent2: #00c8ff;
+  --accent-border: rgba(139, 124, 255, 0.45);
+  --accent-glow: rgba(139, 124, 255, 0.28);
+  --border: rgba(255, 255, 255, 0.10);
+  --danger: #ff5d7a;
+  --danger-soft: rgba(255, 93, 122, 0.12);
+  --success: #3dffb0;
+  --warning: #ffc24d;
+  --radius-sm: 12px;
+  --radius-lg: 20px;
+  --shadow-soft: 0 8px 30px rgba(0, 0, 0, 0.35);
+  --glow: 0 0 22px var(--accent-glow);
+  --glow-soft: 0 0 14px var(--accent-glow);
+  --glow-strong: 0 10px 44px var(--accent-glow), 0 0 22px rgba(0, 200, 255, 0.22);
+  --grad-text: linear-gradient(100deg, #a99bff 0%, #7de2ff 60%, #8b7cff 100%);
+}
+
+/* animated aurora background */
+.aurora { position: fixed; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; }
+.blob {
+  position: absolute; border-radius: 50%; filter: blur(90px); opacity: .5;
+  mix-blend-mode: screen; animation: drift 45s ease-in-out infinite alternate;
+  will-change: transform;
+}
+.b1 { width: 620px; height: 620px; background: #6b3dff; top: -180px; left: -140px; }
+.b2 { width: 520px; height: 520px; background: #0090ff; bottom: -160px; right: -100px; animation-delay: -15s; }
+.b3 { width: 420px; height: 420px; background: #b400e0; top: 35%; left: 55%; opacity: .32; animation-delay: -30s; }
+@keyframes drift {
+  0% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(80px, 50px) scale(1.18); }
+  66% { transform: translate(-70px, 90px) scale(.92); }
+  100% { transform: translate(30px, -60px) scale(1.1); }
+}
+[data-theme="glass"] .aurora { display: block; }
+[data-theme="glass"] body { background:
+  radial-gradient(1200px 800px at 20% -10%, rgba(107, 61, 255, 0.16), transparent 60%),
+  radial-gradient(1000px 700px at 110% 110%, rgba(0, 144, 255, 0.14), transparent 60%),
+  var(--bg);
+  background-size: 220% 220%;
+  animation: bgPan 70s ease-in-out infinite alternate;
+}
+@keyframes bgPan {
+  0% { background-position: 0% 0%; }
+  100% { background-position: 100% 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  body { animation: none !important; }
+  .blob { animation: none !important; }
+}
+[data-theme="glass"] .card, [data-theme="glass"] .hero, [data-theme="glass"] .modal { box-shadow: var(--glow-soft); }
