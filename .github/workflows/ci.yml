@@ -18,7 +18,6 @@ jobs:
       # users — this catches misses like index.html at ?v=38 with ?v=37 imports)
       - run: |
           for f in public/js/*.js; do node --check "$f"; done
-          V=$(grep -ho '?v=[0-9]*' public/index.html public/js/app.js public/js/chat.js | sort -u)
-          test "$(printf '%s' "$V" | wc -l)" = "1" \
-            || (echo "❌ cache-buster ?v= désynchronisés :" && echo "$V" && exit 1)
+          N=$(grep -ho '?v=[0-9]*' public/index.html public/js/app.js public/js/chat.js | sort -u | wc -l)
+          test "$N" = "1" || (echo "❌ cache-buster ?v= désynchronisés ($N versions trouvées)" && exit 1)
       - run: bun run check
