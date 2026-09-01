@@ -1,6 +1,6 @@
-import { api, readSseStream } from "./api.js?v=20";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=20";
-import { store, refreshAll, navigate, applyTheme } from "./app.js?v=20";
+import { api, readSseStream } from "./api.js?v=22";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=22";
+import { store, refreshAll, navigate, applyTheme } from "./app.js?v=22";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -46,7 +46,7 @@ export async function renderChat(convIdRaw) {
   if (convIdRaw === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=20");
+    const { newGameWizard } = await import("./app.js?v=22");
     newGameWizard(pre);
     return;
   }
@@ -762,8 +762,13 @@ async function regenerate(messageId) {
     const users = conv.messages.filter((m) => m.role === "user");
     const lastUser = users[users.length - 1];
     if (lastUser) {
+      // replay the exact model input (slash commands / directives rewrite it)
+      const meta = lastUser.meta || {};
+      const opts = {};
+      if (meta.prompt) opts.prompt = meta.prompt;
+      if (meta.directive) opts.directive = meta.directive;
       toast("↻ Régénération en cours…", "ok", 3000);
-      await doStream(lastUser.content);
+      await doStream(lastUser.content, opts);
     } else {
       toast("Rien à régénérer.", "err");
     }
@@ -822,7 +827,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal, field } from "./ui.js?v=20";
+import { openModal, field } from "./ui.js?v=22";
 void applyTheme;
 void fmtTime;
 void currentConversation;

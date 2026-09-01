@@ -23,6 +23,26 @@ describe("routing", async () => {
     expect(remaining).not.toContain(m2.id);
   });
 
+  test("POST /scenarios/:id/generate reaches the handler (not a 404)", async () => {
+    // regression: the route read parts[3] (= "generate") as the id, so
+    // getScenario(NaN) returned a 404 for every valid scenario
+    const world = db.createWorld({ name: "Eldoria", description: "Royaume elfique" });
+    const s = db.createScenario({ world_id: world.id, name: "L'invocation", intro: "" });
+    const res = await api(routes, "POST", `/api/scenarios/${s.id}/generate`, { genre: "mystere" });
+    // no LLM in tests → connection failure surfaces as a 500 with a real error,
+    // never as the route-miss 404
+    expect(res.status).not.toBe(404);
+    const text = await res.text();
+    expect(text).not.toContain('"not found"');
+  });
+
+  test("POST /worlds/:id/scenarios/generate matches and validates the world", async () => {
+    // missing world → 404 (correct), proving the route matched and read parts[2]
+    const res = await api(routes, "POST", "/api/worlds/999999/scenarios/generate", { genre: "romance" });
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain('"not found"');
+  });
+
   test("GET /worlds/:id does not match /worlds/:id/scenarios", async () => {
     const world = db.createWorld({ name: "Eldoria", description: "Royaume elfique" });
     const s = db.createScenario({ world_id: world.id, name: "L'invocation" });

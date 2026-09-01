@@ -1,6 +1,6 @@
-import { api, apiForm, uploadFiles } from "./api.js?v=20";
-import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=20";
-import { renderChat } from "./chat.js?v=20";
+import { api, apiForm, uploadFiles } from "./api.js?v=22";
+import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=22";
+import { renderChat } from "./chat.js?v=22";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -94,7 +94,7 @@ function toggleSidebar() {
   const sb = document.getElementById("sidebar");
   const collapsed = sb.classList.toggle("collapsed");
   try { localStorage.setItem("ai-rp-sidebar", collapsed ? "1" : "0"); } catch { /* ignore */ }
-  renderSidebar(active);
+  renderSidebar(currentSection);
 }
 
 function ttsDot() { return store.settings.tts_enabled === false ? "" : "ok"; }
@@ -109,6 +109,8 @@ function providerLabel() {
 
 // ─── router ───────────────────────────────────────────────────────────────────
 const main = () => document.getElementById("main");
+// which sidebar section is active — used by renderSidebar/toggleSidebar
+let currentSection = "";
 
 export function navigate(hash) {
   location.hash = hash;
@@ -118,7 +120,8 @@ async function route() {
   const hash = location.hash || "#/";
   const parts = hash.slice(2).split("/").filter(Boolean);
   const section = parts[0] || "";
-  renderSidebar(section === "world" ? "worlds" : section);
+  currentSection = section === "world" ? "worlds" : section;
+  renderSidebar(currentSection);
   window.scrollTo(0, 0);
   try {
     if (section === "" || section === "home") return renderDashboard();
@@ -324,17 +327,7 @@ async function renderWorldDetail(id) {
       el("h3", {}, "Aucun scénario"),
       el("p", {}, "Un scénario définit comment la partie commence — ex: « la carte t'a invoqué dans ce monde », « vous avez été invoqués ensemble par accident »…"),
       el("button", { class: "btn btn-primary", onclick: () => scenarioModal(world) }, ICONS.plus, "Créer un scénario"),
-      el("button", { class: "btn btn-ghost", style: { marginLeft: "8px" }, onclick: async () => {
-        try {
-          toast("Génération en cours…", "ok", 6000);
-          const s = await api(`/api/worlds/${world.id}/scenarios`, { body: { name: "Scénario généré", intro: "" } });
-          const gen = await api(`/api/scenarios/${s.id}/generate`, { body: { theme: world.description || "un départ inattendu" } });
-          toast("Scénario généré ✓");
-          await refreshAll();
-          renderWorldDetail(world.id);
-          void gen;
-        } catch (e) { toast(e.message, "err"); }
-      } }, ICONS.sparkles, "Générer par l'IA"),
+      el("button", { class: "btn btn-ghost", style: { marginLeft: "8px" }, onclick: () => scenarioModal(world) }, ICONS.sparkles, "Générer par l'IA"),
     ));
   } else {
     body.append(el("div", { class: "grid", style: { gridTemplateColumns: "repeat(auto-fill, minmax(300px,1fr))" } },
@@ -379,24 +372,43 @@ function scenarioModal(world, existing) {
     placeholder: "Le texte qui ouvre la partie — écrit à la 2e personne. Ex: « Tu t'éveilles dans un jardin étrange. Une silhouette ailée te fixe : « Toi aussi, tu as été invoqué ? » »",
   });
   const notes = field("Notes (privées)", existing?.notes, { type: "textarea", rows: 2, placeholder: "Indices, enjeux, PNJ à introduire…" });
+  const genreSel = field("Genre", "mystere", { type: "select", options: GENRE_OPTS });
+  const genBtn = el("button", { class: "btn btn-primary btn-sm", onclick: generate }, ICONS.sparkles, "Générer par l'IA");
   const body = el("div", {}, name.wrap, intro.wrap, notes.wrap,
-    el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "10px" } }, "Astuce : l'IA peut écrire cette introduction à ta place. Enregistre d'abord, puis clique « Générer par l'IA »."),
+    el("div", { class: "scen-gen-row", style: { marginTop: "4px" } }, genreSel.wrap, genBtn),
   );
+
+  // write the AI opening into the intro field (new scenarios are created first
+  // so they have an id to regenerate against)
+  async function generate() {
+    genBtn.disabled = true;
+    genBtn.textContent = "✨ Génération…";
+    try {
+      let id = existing?.id;
+      if (!id) {
+        const created = await api(`/api/worlds/${world.id}/scenarios`, {
+          body: { name: name.input.value.trim() || "Scénario", intro: "", notes: notes.input.value.trim() },
+        });
+        existing = created;
+        id = created.id;
+      }
+      const res = await api(`/api/scenarios/${id}/generate`, {
+        body: { genre: genreSel.input.value, theme: name.input.value.trim() || world.name },
+      });
+      intro.input.value = res.intro || "";
+      toast("Intro générée — clique « Enregistrer » pour la garder ✓");
+    } catch (e) {
+      toast(e.message, "err");
+    } finally {
+      genBtn.disabled = false;
+      genBtn.textContent = ICONS.sparkles + " Générer par l'IA";
+    }
+  }
+
   const { close } = openModal({
     title: existing ? "Modifier le scénario" : "Nouveau scénario",
     body,
     footer: [
-      existing ? el("button", { class: "btn btn-ghost", onclick: async () => {
-        try {
-          toast("L'IA rédige l'ouverture…", "ok", 8000);
-          const gen = await api(`/api/scenarios/${existing.id}/generate`, { body: { theme: name.input.value || existing.name } });
-          close();
-          toast("Intro générée ✓");
-          await refreshAll();
-          renderWorldDetail(world.id);
-          void gen;
-        } catch (e) { toast(e.message, "err"); }
-      } }, ICONS.sparkles, "Générer par l'IA") : null,
       el("button", { class: "btn btn-ghost", onclick: () => close() }, "Annuler"),
       el("button", { class: "btn btn-primary", onclick: async () => {
         const payload = {
@@ -916,6 +928,15 @@ function samplePlayBtn(getVoice, getLang) {
 }
 
 // ─── new game wizard ──────────────────────────────────────────────────────────
+const GENRE_OPTS = [
+  ["mystere", "🔍 Mystère"],
+  ["romance", "💞 Romance"],
+  ["comedie", "🎭 Comédie"],
+  ["action", "⚔️ Action / Aventure"],
+  ["horreur", "🌑 Horreur"],
+  ["pvp", "⚡ PVP"],
+];
+
 export function newGameWizard(pre) {
   const { close, modal } = openModal({
     title: "Nouvelle partie ✨",
@@ -924,10 +945,41 @@ export function newGameWizard(pre) {
   });
   const worldSel = field("Monde", pre?.world_id || "", { type: "select", options: [["", "— Choisir —"], ...store.worlds.map((w) => [w.id, w.name])] });
   const scenSel = field("Scénario", "", { type: "select", options: [["", "— Par défaut (le personnage t'accueille) —"]] });
+  // AI scenario generation: pick a genre, the model writes the opening
+  const genreSel = field("Genre du scénario", "mystere", { type: "select", options: GENRE_OPTS });
+  const scenGenBtn = el("button", { class: "btn btn-primary btn-sm", onclick: generateScenarioInWizard }, ICONS.sparkles, "Générer");
+  const scenGenRow = el("div", { class: "scen-gen-row" }, genreSel.wrap, scenGenBtn);
+  const scenPreview = el("div", { class: "gen-preview", hidden: true });
   const persoSel = field("Ton persona", "", { type: "select", options: [["", "— Inventé sur place —"], ...store.personas.map((p) => [p.id, p.name])] });
   const groupToggle = checkbox("group", false, "Mode groupe : plusieurs cartes dans la même scène");
   const castWrap = el("div", {}, el("label", {}, "Personnages présents (cartes)"));
   const castGrid = el("div", { class: "grid", style: { gridTemplateColumns: "repeat(auto-fill, minmax(140px,1fr))", marginTop: "8px" } });
+
+  async function generateScenarioInWizard() {
+    const wid = worldSel.input.value;
+    if (!wid) return toast("Choisis d'abord un monde.", "err");
+    scenGenBtn.disabled = true;
+    scenGenBtn.textContent = "✨ Génération…";
+    try {
+      const world = store.worlds.find((w) => String(w.id) === String(wid));
+      const s = await api(`/api/worlds/${wid}/scenarios/generate`, {
+        body: { genre: genreSel.input.value, theme: world?.description || undefined },
+      });
+      scenSel.input.append(el("option", { value: s.id, selected: "" }, s.name));
+      scenSel.input.value = String(s.id);
+      scenPreview.hidden = false;
+      scenPreview.replaceChildren(
+        el("div", { class: "gen-preview-head" }, "📜 " + esc(s.name)),
+        el("p", {}, esc(s.intro)),
+      );
+      toast("Scénario généré ✓");
+    } catch (e) {
+      toast(e.message, "err");
+    } finally {
+      scenGenBtn.disabled = false;
+      scenGenBtn.textContent = ICONS.sparkles + " Générer";
+    }
+  }
 
   const renderCast = () => {
     castGrid.replaceChildren(...store.cards.map((card) => {
@@ -944,6 +996,7 @@ export function newGameWizard(pre) {
   worldSel.input.addEventListener("change", async () => {
     const wid = worldSel.input.value;
     scenSel.input.replaceChildren(el("option", { value: "" }, "— Par défaut —"));
+    scenPreview.hidden = true;
     if (!wid) return;
     const sc = await api(`/api/worlds/${wid}/scenarios`).then((r) => r.scenarios).catch(() => []);
     scenSel.input.append(...sc.map((s) => el("option", { value: s.id }, s.name)));
@@ -956,7 +1009,7 @@ export function newGameWizard(pre) {
     worldSel.input.dispatchEvent(new Event("change"));
   }
 
-  modal.append(worldSel.wrap, scenSel.wrap, persoSel.wrap, groupToggle.wrap, castWrap, castGrid,
+  modal.append(worldSel.wrap, scenSel.wrap, scenGenRow, scenPreview, persoSel.wrap, groupToggle.wrap, castWrap, castGrid,
     el("div", { class: "modal-footer" },
       el("button", { class: "btn btn-ghost", onclick: () => close() }, "Annuler"),
       el("button", { class: "btn btn-primary", onclick: async (e) => {

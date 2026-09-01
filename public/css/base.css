@@ -568,3 +568,17 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
 .fl-field > select ~ .fl-label {
   top: 7px; font-size: 10px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; color: var(--accent);
 }
+
+/* ─── AI scenario generation ─────────────────────────────────────────────── */
+.scen-gen-row { display: flex; gap: 10px; align-items: flex-end; }
+.scen-gen-row .fl-field { flex: 1; min-width: 0; }
+.scen-gen-row .btn { white-space: nowrap; }
+.gen-preview {
+  margin: 6px 0 4px; padding: 14px 16px; border-radius: 12px;
+  background: linear-gradient(135deg, var(--active-bg), transparent);
+  border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  animation: fadeUp .35s ease both;
+}
+.gen-preview-head { font-weight: 700; margin-bottom: 6px; color: var(--accent); }
+.gen-preview p { margin: 0; line-height: 1.65; color: var(--text); font-size: 13.5px; white-space: pre-wrap; }
+@keyframes fadeUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }

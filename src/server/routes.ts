@@ -92,6 +92,84 @@ function parseSegmentsFor(conv: any, content: string): Segment[] {
   return fallbackSpeaker(parseSegments(content), castNames);
 }
 
+// ─── AI scenario generation (genre-aware) ─────────────────────────────────────
+const SCENARIO_GENRES: Record<string, { label: string; angle: string }> = {
+  mystere: {
+    label: "Mystère",
+    angle: "Un mystère s'installe dès les premières lignes : un événement étrange, une disparition ou un secret que le joueur va devoir élucider.",
+  },
+  romance: {
+    label: "Romance",
+    angle: "Une rencontre chargée d'électricité : un lien qui naît, une attirance ou une tension romantique immédiate entre le joueur et un personnage.",
+  },
+  comedie: {
+    label: "Comédie",
+    angle: "Une situation absurde et drôle : un quiproquo, un malentendu ou une catastrophe burlesque qui prête à rire.",
+  },
+  action: {
+    label: "Action / Aventure",
+    angle: "L'action démarre immédiatement : une menace, une course-poursuite ou un danger qui pousse le joueur à agir vite.",
+  },
+  horreur: {
+    label: "Horreur",
+    angle: "Une atmosphère oppressante : quelque chose ne tourne pas rond, les ombres bougent et le danger est là, invisible.",
+  },
+  pvp: {
+    label: "PVP",
+    angle: "Le joueur est en rivalité directe avec un ou plusieurs personnages présents : un duel, une compétition ou un conflit d'intérêts immédiat.",
+  },
+};
+
+/** Generate a scenario opening for a genre; returns a suggested name + intro. */
+async function generateScenarioIntro(
+  world: { id: number; name: string; description: string; lore: string } | null,
+  genre: string,
+  theme?: string,
+): Promise<{ name: string; intro: string }> {
+  const g = SCENARIO_GENRES[genre] ?? SCENARIO_GENRES.mystere;
+  const provider = getProvider();
+  let model = defaultModelFor(provider.id);
+  if (!model) {
+    const models = await provider.models();
+    model = models[0] ?? "";
+  }
+  const sys = [
+    "Tu écris l'ouverture d'un scénario de roleplay immersif.",
+    "Réponds en 120-220 mots, en français, à la deuxième personne (\"tu\"), vivant et sensoriel.",
+    "Commence par le titre du scénario sur sa propre ligne (sans # ni *), saute une ligne, puis écris l'introduction.",
+    "Aucune métadonnée, aucun commentaire, aucun texte autour du titre et de l'introduction.",
+  ].join(" ");
+  const promptText = [
+    `Monde : ${world?.name ?? "?"}`,
+    `Univers : ${world?.lore || world?.description || "?"}`,
+    `Thème / point de départ : ${theme || "un départ inattendu"}`,
+    `Genre : ${g.label} — ${g.angle}`,
+    "Écris l'ouverture de cette histoire.",
+  ].join("\n");
+  let text = "";
+  for await (const delta of provider.stream({
+    messages: [{ role: "system", content: sys }, { role: "user", content: promptText }],
+    model,
+    temperature: 0.95,
+    maxTokens: 600,
+    noThinking: true,
+    signal: AbortSignal.timeout(120_000),
+  })) {
+    text += delta;
+  }
+  const trimmed = text.trim();
+  const lines = trimmed.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+  // the model emits a title line first — reuse it as the scenario name, but
+  // only when it looks like a title (short, no sentence-ending punctuation,
+  // and a real intro follows)
+  const title =
+    lines.length > 1 && lines[0].length <= 50 && !/[.!?…:]$/.test(lines[0])
+      ? lines[0].replace(/^[*#\s]+|[*#\s]+$/g, "")
+      : "";
+  const rest = title ? lines.slice(1).join("\n") : trimmed;
+  return { name: title || `Scénario ${g.label}`, intro: rest || trimmed };
+}
+
 function conversationView(id: number) {
   const conv = getConversation(id);
   if (!conv) return null;
@@ -258,6 +336,17 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     if (parts[1] === "worlds" && parts[2] && parts[3] === "scenarios" && method === "GET") {
       return json({ scenarios: listScenarios(Number(parts[2])) });
     }
+    // generate a new scenario from a genre (wizard / world detail) — must come
+    // BEFORE the plain POST create route (same prefix, deeper path)
+    if (parts[1] === "worlds" && parts[2] && parts[3] === "scenarios" && parts[4] === "generate" && method === "POST") {
+      const body = await readJson(req);
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
+      const { name, intro } = await generateScenarioIntro(world, body.genre, body.theme);
+      const customName = typeof body.name === "string" && body.name.trim() ? body.name.trim() : null;
+      const s = createScenario({ world_id: world.id, name: customName ?? name, intro });
+      return json(s, 201);
+    }
     if (parts[1] === "worlds" && parts[2] && parts[3] === "scenarios" && method === "POST") {
       const body = await readJson(req);
       const s = createScenario({ world_id: Number(parts[2]), ...body });
@@ -275,31 +364,16 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       deleteScenario(Number(parts[2]));
       return json({ ok: true });
     }
+    // regenerate the intro of an existing scenario (genre-aware)
     if (parts[1] === "scenarios" && parts[2] && parts[3] === "generate" && method === "POST") {
       const body = await readJson(req);
-      const scenario = getScenario(Number(parts[3]));
+      const scenario = getScenario(Number(parts[2]));
       if (!scenario) return json({ error: "not found" }, 404);
       const world = getWorld(scenario.world_id);
       const theme = body.theme || scenario.name || "un nouveau départ";
-      const provider = getProvider();
-      let model = defaultModelFor(provider.id);
-      if (!model) {
-        const models = await provider.models();
-        model = models[0] ?? "";
-      }
-      const sys = `Tu écris l'introduction d'un scénario de roleplay. Réponds en 120-220 mots, en français, à la deuxième personne ("tu"), immersif, sans métadonnées, sans titre.`;
-      const promptText = `Monde : ${world?.name ?? "?"}\nUnivers : ${world?.lore || world?.description || "?"}\nThème du scénario : ${theme}\nÉcris l'ouverture de cette histoire.`;
-      let intro = "";
-      for await (const delta of provider.stream({
-        messages: [{ role: "system", content: sys }, { role: "user", content: promptText }],
-        model,
-        temperature: 0.9,
-        maxTokens: 600,
-      })) {
-        intro += delta;
-      }
-      updateScenario(scenario.id, { intro: intro.trim() });
-      return json(updateScenario(scenario.id, { intro: intro.trim() }));
+      const { intro } = await generateScenarioIntro(world, body.genre, theme);
+      updateScenario(scenario.id, { intro });
+      return json(updateScenario(scenario.id, { intro }));
     }
 
     // cards
@@ -789,8 +863,10 @@ function parseSuggestions(text: string): string[] {
 const SUMMARY_PREFIX = "(Session antérieure résumée)\n";
 
 function summarizeOverflow(convId: number, conv: ConversationRow, newMsgs: MessageRow[]): void {
-  const provider = getProvider();
-  const model = defaultModelFor(provider.id);
+  let cs: Record<string, unknown> = {};
+  try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  const provider = getProvider((cs.provider as string) || undefined);
+  const model = (cs.model as string) || defaultModelFor(provider.id);
   const old = conv.summary && !conv.summary.startsWith(SUMMARY_PREFIX) ? conv.summary : "";
   const chat: ChatMessage[] = [
     { role: "system", content: summarizeSystem() },
@@ -830,10 +906,10 @@ async function generateSuggestions(ctx: CastContext, history: MessageRow[]): Pro
   // same context policy as the main stream
   const { kept, summary } = applyContextWindow(ctx.conversation.id, ctx.conversation, history);
   ctx = { ...ctx, summary };
-  const provider = getProvider();
-  const model =
-    (ctx.conversation.settings ? (JSON.parse(ctx.conversation.settings || "{}") as any).model : undefined) ||
-    defaultModelFor(provider.id);
+  let cs: Record<string, unknown> = {};
+  try { cs = JSON.parse(ctx.conversation.settings || "{}"); } catch { /* ignore */ }
+  const provider = getProvider((cs.provider as string) || undefined);
+  const model = (cs.model as string) || defaultModelFor(provider.id);
   const messages: ChatMessage[] = [
     { role: "system", content: suggestSystem(ctx) },
     ...kept.slice(-10).map((m) => ({ role: m.role === "user" ? "user" : "assistant", content: m.content })),
@@ -866,11 +942,19 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
   const modelText = (body.prompt ?? body.content ?? "").trim(); // slash commands rewrite the model input
   const directive = (body.directive ?? "").trim();
   if (!userText && !directive) return json({ error: "message vide" }, 400);
+  // keep the model-facing input on the user message so "Régénérer" can replay
+  // it exactly (slash commands and directives rewrite the raw content)
+  const userMeta: Record<string, string> = {};
+  if (modelText && modelText !== userText) userMeta.prompt = modelText;
+  if (directive) userMeta.directive = directive;
   const userMsg = createMessage({
     conversation_id: convId, role: "user",
     name: persona?.name ?? "Moi", content: userText || directive.slice(0, 120),
+    meta: JSON.stringify(userMeta),
   });
 
+  // messages present before this exchange (used for the auto-title heuristic)
+  const historyBefore = listMessages(convId).filter((m) => m.id !== userMsg.id);
   // history + new user message
   const history = listMessages(convId);
   // context window: keep recent messages, compress the rest into a rolling summary
@@ -880,11 +964,9 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
   // interpellation directive (e.g. "ask the narrator / a character to speak")
   if (directive) messages[messages.length - 1].content += `\n\n[Directive : ${directive}]`;
 
-  const provider = getProvider();
-  const model =
-    (conv.settings ? (JSON.parse(conv.settings || "{}") as any).model : undefined) ||
-    defaultModelFor(provider.id);
   const settings = JSON.parse(conv.settings || "{}");
+  const provider = getProvider((settings.provider as string) || undefined);
+  const model = (settings.model as string) || defaultModelFor(provider.id);
   const temperature = Number(settings.temperature ?? getSetting("temperature", 0.9));
   const maxTokens = Number(settings.max_tokens ?? getSetting("max_tokens", 2048));
   const ttsEnabled = Boolean(settings.tts_enabled ?? getSetting("tts_enabled", true));
@@ -925,9 +1007,13 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
       updateMessage(assistant.id, { segments: JSON.stringify(segments) });
       touchConversation(convId);
       const firstLine = full.trim().split("\n")[0]?.slice(0, 60) ?? "";
-      if (history.length === 0 && conv.title === "Nouvelle partie") {
+      // fresh conversation (only the opening message so far) → name it from the
+      // first reply; keep manual titles
+      if (historyBefore.length <= 1 && conv.title === "Nouvelle partie") {
         updateConversation(convId, { title: firstLine || "Partie" });
       }
+      // dashboard preview = the latest exchange
+      updateConversation(convId, { last_message: full.trim().slice(0, 200) });
       send("done", { message: messageView(assistant) });
       // suggestions run in parallel with the (slow) TTS synthesis — the local
       // model accepts concurrent requests
