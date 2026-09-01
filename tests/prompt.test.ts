@@ -69,6 +69,18 @@ describe("buildSystemPrompt", async () => {
     expect(out.messages[0]).toEqual({ role: "user", content: "Bonjour" });
     expect(out.messages[1].role).toBe("assistant");
   });
+
+  test("chapter markers are display-only: never sent to the model", () => {
+    const conv = db.createConversation({ title: "P" });
+    const history = [
+      { id: 1, conversation_id: conv.id, role: "user", name: "", content: "J'entre dans la grotte.", segments: "[]", audio: "[]", meta: "{}", created_at: 1 },
+      { id: 2, conversation_id: conv.id, role: "assistant", name: "", content: "📖 Chapitre 1 — La grotte", segments: "[]", audio: "[]", meta: JSON.stringify({ chapter: true }), created_at: 2 },
+      { id: 3, conversation_id: conv.id, role: "assistant", name: "Alba", content: '*"Attention."*', segments: "[]", audio: "[]", meta: "{}", created_at: 3 },
+    ];
+    const out = prompt.buildMessages({ world: null, persona: null, cards: [], scenario: null, conversation: conv }, history);
+    expect(out.messages).toHaveLength(2);
+    expect(out.messages.some((m) => m.content.includes("Chapitre"))).toBe(false);
+  });
 });
 
 describe("context window via API", async () => {

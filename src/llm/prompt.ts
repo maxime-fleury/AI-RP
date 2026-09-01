@@ -272,6 +272,20 @@ export function buildSystemPrompt(ctx: CastContext): string {
     parts.push(`## Résumé des événements précédents\n${ctx.summary}\n`);
   }
 
+  // story chapters: titled + summarized arcs written into the thread (display
+  // only), injected here so long games keep a coherent narrative spine
+  try {
+    const cs = JSON.parse(ctx.conversation.settings || "{}");
+    const chapters = Array.isArray(cs.chapters) ? cs.chapters.slice(-3) : [];
+    if (chapters.length) {
+      parts.push(
+        `## Chapitres précédents\n${chapters
+          .map((c: any) => `Chapitre ${c.n} — ${String(c.title || "")}\n${String(c.summary || "")}`)
+          .join("\n\n")}\n`,
+      );
+    }
+  } catch { /* ignore */ }
+
   const personaName = ctx.persona?.name ?? "le joueur";
   parts.push(`## Format d'écriture (important)
 - Le narrateur raconte UNIQUEMENT l'histoire, en narration entre astérisques : *Le vent soulevait la poussière.*
@@ -298,6 +312,11 @@ export function buildMessages(ctx: CastContext, history: MessageRow[]): { system
   const personaName = ctx.persona?.name ?? "Moi";
   const messages: { role: "user" | "assistant"; content: string }[] = [];
   for (const m of history) {
+    // chapter markers are display-only: never part of the model input
+    try {
+      const meta = JSON.parse(m.meta || "{}");
+      if (meta.chapter) continue;
+    } catch { /* broken meta → treat as normal */ }
     if (m.role === "user") {
       messages.push({ role: "user", content: m.content });
     } else if (m.role === "assistant") {

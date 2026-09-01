@@ -157,6 +157,39 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
 .quest-status { padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px; }
 .quest-actions { display: flex; align-items: center; gap: 10px; }
 .quest-actions .assist-status { margin: 0; }
+
+/* game statistics modal */
+.stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 8px 0 18px; }
+.stat-tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px; text-align: center; }
+.stat-tile strong { display: block; font-size: 20px; }
+.stat-tile span { font-size: 11.5px; color: var(--text-dim); }
+.stat-speakers h4 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-dim); }
+.speaker-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.speaker-name { width: 130px; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.speaker-bar { flex: 1; height: 10px; border-radius: 99px; background: rgba(255,255,255,.06); overflow: hidden; }
+.speaker-bar div { height: 100%; border-radius: 99px; }
+.speaker-pct { width: 72px; text-align: right; font-size: 12px; color: var(--text-dim); }
+
+/* story chapters — display-only markers + resume banner */
+.chapter-resume { margin: 10px 14px 4px; padding: 10px 14px; border-radius: 12px; background: var(--active-bg); border: 1px solid var(--accent-border); }
+.chapter-resume strong { font-size: 12.5px; }
+.chapter-resume p { margin: 4px 0 0; font-size: 12.5px; color: var(--text-dim); line-height: 1.55; }
+.msg.chapter { margin-top: 18px; }
+.chapter-bubble { background: transparent !important; border: 1px dashed var(--border); border-radius: 12px; }
+.chapter-head { font-weight: 700; font-size: 13px; letter-spacing: .02em; }
+.chapter-summary { margin-top: 4px; color: var(--text-dim); font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; }
+
+/* dynamic NPC suggestion chips + modal cards */
+.npc-chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 6px 10px; }
+.npc-hint { font-size: 12px; color: var(--text-dim); margin-right: 2px; }
+.npc-list { display: flex; flex-direction: column; gap: 10px; margin: 10px 0; max-height: 50vh; overflow: auto; }
+.npc-card { border: 1px solid var(--border); border-radius: 12px; padding: 12px; background: var(--surface); }
+.npc-card-head { display: flex; gap: 10px; align-items: center; margin-bottom: 6px; }
+.npc-card-head strong { font-size: 14px; }
+.npc-card-head small { display: block; color: var(--text-dim); font-size: 11.5px; }
+.npc-desc { margin: 4px 0 0; font-size: 12.5px; line-height: 1.5; color: var(--text); }
+.npc-perso { margin: 3px 0 10px; font-size: 11.5px; color: var(--text-dim); font-style: italic; }
+.npc-card .btn { margin-top: 6px; }
 .card-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
 
 /* ── headings & hero ── */

@@ -1,6 +1,6 @@
-import { api, apiFetch, readSseStream } from "./api.js?v=41";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=41";
-import { store, refreshAll, navigate, applyTheme } from "./app.js?v=41";
+import { api, apiFetch, readSseStream } from "./api.js?v=43";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=43";
+import { store, refreshAll, navigate, applyTheme } from "./app.js?v=43";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -84,7 +84,7 @@ export async function renderChat(convIdRaw) {
   if (convIdRaw === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=41");
+    const { newGameWizard } = await import("./app.js?v=43");
     newGameWizard(pre);
     return;
   }
@@ -299,7 +299,9 @@ export async function renderChat(convIdRaw) {
 
   // ── header overflow menu: secondary actions grouped by category ⇣ ──────────
   // the header keeps only the essentials; everything else lives in a dropdown
-  const questBtn = el("button", { title: "Journal de quêtes", onclick: () => questModal(conv) }, "🗡"); // invisible trigger, surfaced via the menu
+  const questBtn = el("button", { title: "Journal de quêtes", onclick: () => questModal(conv) }, "🗡"); // invisible triggers, surfaced via the menu
+  const statsBtn = el("button", { title: "Statistiques", onclick: () => statsModal(convId) }, "📊");
+  const npcBtn = el("button", { title: "Proposer un PNJ", onclick: () => npcSuggestModal() }, "✨");
   const menu = el("div", { class: "header-menu", hidden: true, role: "menu" });
   const closeHeaderMenu = () => { menu.hidden = true; };
   const menuSection = (title, pairs) => {
@@ -321,7 +323,7 @@ export async function renderChat(convIdRaw) {
     ...menuSection("🎬 Scène & mémoire", [[sceneBtn, "État de la scène"], [memoryBtn, "Mémoire structurée"], [dmBtn, "Directives du maître de jeu"], [branchesBtn, "Variantes"], [validateBtn, "Vérifier la cohérence"]]),
     ...menuSection("🔎 Fil & sélection", [[searchBtn, "Rechercher"], [bookmarkFilterBtn, "Favoris seulement"], [selectBtn, "Sélectionner plusieurs messages"]]),
     ...menuSection("📤 Export", [[mdBtn, "Exporter en Markdown"], [copyThreadBtn, "Copier le fil"], [galleryBtn, "Galerie d'illustrations"], [exportBtn, "Exporter en ZIP"]]),
-    ...menuSection("🛠 Partie", [[questBtn, "Journal de quêtes"], [settingsBtn, "Réglages de la partie"], [delBtn, "Archiver la partie"]]),
+    ...menuSection("🛠 Partie", [[npcBtn, "Proposer un PNJ"], [questBtn, "Journal de quêtes"], [statsBtn, "Statistiques"], [settingsBtn, "Réglages de la partie"], [delBtn, "Archiver la partie"]]),
   );
   const header = el("div", { class: "chat-header" }, backBtn, titleBlock, castStrip, groupBtn, menuBtn, menu);
 
@@ -430,6 +432,17 @@ export async function renderChat(convIdRaw) {
   };
   paintThread();
   initMiniSheets(scroll);
+  // resume banner: when reopening a long game, show where the story stopped
+  let cs0 = {};
+  try { cs0 = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  const chapters0 = Array.isArray(cs0.chapters) ? cs0.chapters : [];
+  if (chapters0.length) {
+    const last = chapters0[chapters0.length - 1];
+    scroll.insertBefore(el("div", { class: "chapter-resume" },
+      el("strong", {}, `📖 Chapitre ${last.n} — ${esc(last.title || "")}`),
+      el("p", {}, esc(last.summary || "")),
+    ), toBottom);
+  }
 
   // composer
   const textarea = el("textarea", { rows: 1, placeholder: conv.cards?.[0] ? `Écris ta réplique à ${conv.cards[0].name}…` : "Écris ton action ou ta réplique…" });
@@ -599,7 +612,7 @@ export async function renderChat(convIdRaw) {
   scrollToBottom(scroll, true);
   setTimeout(() => textarea.focus(), 80);
 
-  currentCtx = { scroll, textarea, sendBtn, stopBtn };
+  currentCtx = { scroll, textarea, sendBtn, stopBtn, composerWrap };
   // close the header menu when clicking anywhere else in the chat
   chatMain.addEventListener("click", (e) => {
     if (!e.target.closest(".header-menu, .header-more-btn")) closeHeaderMenu();
@@ -913,6 +926,9 @@ async function doStream(content, opts = {}) {
         sceneRefreshHook?.();
         // optional auto-coherence check (opt-in in the party settings, throttled)
         maybeAutoValidate();
+        // background, non-blocking: close a story chapter / offer dynamic NPCs
+        maybeChapter().catch(() => {});
+        maybeNpcSuggest().catch(() => {});
       } else if (event === "suggestions") {
         const { messageId, suggestions } = data;
         if (suggestions?.length) renderChips(suggestions);
@@ -1349,9 +1365,14 @@ function openFindings(findings) {
 // ─── message rendering ────────────────────────────────────────────────────────
 function renderMessage(m) {
   const isMe = m.role === "user";
+  const isChapter = !isMe && m.meta?.chapter;
   const segs = m.segments || [];
   const body = el("div", { class: "body" });
-  if (isMe) {
+  if (isChapter) {
+    const [head, ...rest] = (m.content || "").split("\n\n");
+    body.append(el("div", { class: "chapter-head" }, esc(head || "")));
+    if (rest.length) body.append(el("div", { class: "chapter-summary" }, esc(rest.join("\n\n"))));
+  } else if (isMe) {
     body.append(el("div", {}, esc(m.content)));
   } else if (segs.length) {
     for (let i = 0; i < segs.length; i++) {
@@ -1360,19 +1381,19 @@ function renderMessage(m) {
   } else if (m.content) {
     for (const b of splitBlocks(m.content)) body.append(el("div", {}, formatBody(b)));
   }
-  const bubble = el("div", { class: "bubble" + (m.bubbleClass ? " " + m.bubbleClass : ""), title: "Double-clic pour modifier" },
-    isMe ? null : el("div", { class: "who" }, esc(m.name || "Narrateur")),
+  const bubble = el("div", { class: "bubble" + (m.bubbleClass ? " " + m.bubbleClass : "") + (isChapter ? " chapter-bubble" : ""), ...(!isChapter ? { title: "Double-clic pour modifier" } : {}) },
+    isMe || isChapter ? null : el("div", { class: "who" }, esc(m.name || "Narrateur")),
     body,
   );
   // double-click → inline edit (Enter valide, Échap annule)
   const midStr = String(m.id || "");
-  if (!midStr.startsWith("tmp-") && !midStr.startsWith("pending")) {
+  if (!isChapter && !midStr.startsWith("tmp-") && !midStr.startsWith("pending")) {
     bubble.addEventListener("dblclick", (e) => {
       if (e.target.closest("button, a, img")) return;
       startEdit(m, body, bubble);
     });
   }
-  if (!isMe && m.meta?.image) {
+  if (!isChapter && !isMe && m.meta?.image) {
     const illu = el("div", { class: "msg-illu" },
       el("img", { src: m.meta.image, alt: "illustration" }),
       el("div", { class: "illu-meta" },
@@ -1391,15 +1412,15 @@ function renderMessage(m) {
     );
     bubble.append(illu);
   }
-  if (!isMe && m.id && !String(m.id).startsWith("pending")) {
+  if (!isChapter && !isMe && m.id && !String(m.id).startsWith("pending")) {
     bubble.append(el("div", { class: "msg-actions" }, ...messageActions(m.id)));
   }
   // private note (visible only to the player, never sent to the model)
-  if (m.meta?.note && !String(m.id).startsWith("pending")) {
+  if (!isChapter && m.meta?.note && !String(m.id).startsWith("pending")) {
     bubble.append(el("div", { class: "msg-note" }, "📌 " + esc(m.meta.note)));
   }
   // emoji reactions (kept server-side in meta.reactions)
-  if (m.id && !String(m.id).startsWith("pending")) {
+  if (!isChapter && m.id && !String(m.id).startsWith("pending")) {
     const list = Array.isArray(m.meta?.reactions) ? m.meta.reactions : [];
     const reacts = el("div", { class: "reactions" });
     for (const r of ["👍", "❤️", "😂"]) {
@@ -1422,8 +1443,8 @@ function renderMessage(m) {
     }
     bubble.append(reacts);
   }
-  const avatar = avatarFor(m);
-  const node = el("div", { class: `msg${isMe ? " me" : ""}${selectedIds.has(m.id) ? " sel" : ""}`, dataset: { mid: m.id, role: m.role } }, avatar, bubble);
+  const avatar = isChapter ? null : avatarFor(m);
+  const node = el("div", { class: `msg${isMe ? " me" : ""}${isChapter ? " chapter" : ""}${selectedIds.has(m.id) ? " sel" : ""}`, dataset: { mid: m.id, role: m.role } }, avatar, bubble);
   if (selectionMode && m.id && !String(m.id).startsWith("pending")) {
     const cb = el("input", { type: "checkbox", class: "sel-cb", "aria-label": "Sélectionner ce message", ...(selectedIds.has(m.id) ? { checked: "" } : {}) });
     cb.addEventListener("change", () => {
@@ -1808,6 +1829,151 @@ async function questModal(conv) {
   });
 }
 
+// ─── game statistics ──────────────────────────────────────────────────────────
+// Simple aggregates computed server-side from the message history.
+async function statsModal(convId) {
+  const body = el("div", { class: "stats-body" }, el("p", { class: "modal-note" }, "Calcul des statistiques…"));
+  const { close } = openModal({ title: "📊 Statistiques de la partie", body, footer: [el("button", { class: "btn btn-ghost", onclick: close }, "Fermer")] });
+  let s;
+  try { s = await api(`/api/conversations/${convId}/stats`); }
+  catch (e) { body.replaceChildren(el("p", { class: "modal-note" }, esc(e.message))); return; }
+  const tile = (v, l) => el("div", { class: "stat-tile" }, el("strong", {}, v), el("span", {}, l));
+  const speakers = (s.speakers || []).slice(0, 6);
+  const maxC = speakers[0]?.count || 1;
+  const days = s.days ? (s.days === 1 ? "1 jour" : `${s.days} jours`) : "aujourd'hui";
+  body.replaceChildren(
+    el("div", { class: "stat-grid" },
+      tile(s.messages.toLocaleString("fr-FR"), "messages"),
+      tile(s.user_msgs.toLocaleString("fr-FR"), "tes répliques"),
+      tile(s.assistant_msgs.toLocaleString("fr-FR"), "réponses"),
+      tile(s.words.toLocaleString("fr-FR"), "mots écrits"),
+      tile(s.avg_words, "mots / message"),
+      tile(s.images, "illustrations"),
+      tile(s.bookmarks, "favoris"),
+      tile(days, "de partie"),
+    ),
+    speakers.length ? el("div", { class: "stat-speakers" },
+      el("h4", {}, "Personnages les plus présents"),
+      ...speakers.map((sp) => {
+        const pct = Math.round((sp.count / s.messages) * 100);
+        const hue = nameHue(sp.name || "?");
+        return el("div", { class: "speaker-row" },
+          el("span", { class: "speaker-name" }, esc(sp.name)),
+          el("div", { class: "speaker-bar" }, el("div", { style: { width: Math.max(4, pct) + "%", background: `hsl(${hue} 70% 55%)` } })),
+          el("span", { class: "speaker-pct" }, `${sp.count} · ${pct}%`),
+        );
+      }),
+    ) : null,
+  );
+}
+
+// ─── story chapters (automatic) ──────────────────────────────────────────────
+// After every completed turn we ask the server to close a chapter once enough
+// messages have piled up; the marker lands in the thread and the summary is
+// injected into the system prompt (buildSystemPrompt « Chapitres précédents »).
+async function maybeChapter() {
+  const conv = currentConversation;
+  if (!conv) return;
+  const r = await api(`/api/conversations/${conv.id}/chapter`, { body: {} });
+  if (r.created) {
+    toast(`📖 Chapitre ${r.chapter.n} — ${r.chapter.title} ✓`);
+    await refreshConversation(conv.id);
+    await renderChat(conv.id);
+  }
+}
+
+// ─── dynamic NPCs ────────────────────────────────────────────────────────────
+// After each turn (throttled to 8 min) the model looks for secondary characters
+// emerging from the fiction; the player can approve them into the cast, or ask
+// for a fresh batch anytime via the header menu.
+async function maybeNpcSuggest() {
+  const conv = currentConversation;
+  if (!conv || !conv.cards?.length) return;
+  let cs = {};
+  try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  if (Date.now() - Number(cs.npc_last_suggest || 0) < 8 * 60_000) return;
+  cs.npc_last_suggest = Date.now();
+  await api(`/api/conversations/${conv.id}`, { method: "PATCH", body: { settings: cs } }).catch(() => {});
+  const r = await api(`/api/conversations/${conv.id}/npcs/suggest`, { body: {} }).catch(() => ({ npcs: [] }));
+  if (r.npcs?.length) showNpcChips(r.npcs);
+}
+
+function showNpcChips(npcs) {
+  const wrap = currentCtx?.composerWrap || document.querySelector(".composer");
+  if (!wrap) return;
+  let row = wrap.querySelector(".npc-chips");
+  if (!row) { row = el("div", { class: "npc-chips" }); wrap.prepend(row); }
+  const accept = async (npc) => {
+    try {
+      await api(`/api/conversations/${currentConversation.id}/npcs/accept`, { body: { npc } });
+      row.remove();
+      toast(`✨ ${npc.name} rejoint la partie ✓`);
+      await refreshAll();
+      await renderChat(currentConversation.id);
+    } catch (e) { toast(e.message, "err"); }
+  };
+  row.replaceChildren(
+    el("span", { class: "npc-hint" }, "💡 PNJ repérés :"),
+    ...npcs.map((n) => el("button", { class: "chip-btn", title: n.description ? esc(n.description) : undefined, onclick: () => accept(n) }, esc(n.name))),
+    el("button", { class: "mini-btn", title: "Fermer la suggestion", onclick: () => row.remove() }, "Ignorer"),
+  );
+}
+
+async function npcSuggestModal() {
+  const list = el("div", { class: "npc-list" });
+  const status = el("div", { class: "assist-status", hidden: true });
+  const retryBtn = el("button", { class: "mini-btn", hidden: true, onclick: run }, "↻ Régénérer");
+  let busy = false;
+  const cancelBtn = el("button", { class: "btn btn-ghost" }, "Fermer");
+  const { close } = openModal({
+    title: "✨ Proposer un PNJ",
+    body: el("div", {},
+      el("p", { class: "modal-note" }, "L'IA relit la scène récente et propose des personnages secondaires qui y apparaissent. Clique sur « Ajouter » pour créer leur carte et les mettre en scène."),
+      el("div", { class: "quest-actions" }, el("button", { class: "btn btn-primary btn-sm", onclick: run }, ICONS.sparkles, "Analyser la scène"), retryBtn, status),
+      list,
+    ),
+    footer: [cancelBtn],
+  });
+  cancelBtn.addEventListener("click", close);
+  async function run() {
+    if (busy) return;
+    busy = true;
+    status.hidden = false;
+    status.textContent = "✨ L'IA relit la scène…";
+    retryBtn.hidden = true;
+    try {
+      const r = await api(`/api/conversations/${currentConversation.id}/npcs/suggest`, { body: {} });
+      const npcs = r.npcs || [];
+      retryBtn.hidden = !npcs.length;
+      status.textContent = npcs.length ? "Propositions ✓ — ajoute celles qui te plaisent." : "Aucun PNJ distinct repéré dans la scène récente.";
+      list.replaceChildren(...npcs.map((n) => {
+        const card = el("div", { class: "npc-card" },
+          el("div", { class: "npc-card-head" },
+            el("div", { class: "avatar avatar-md init-avatar", style: { display: "grid", placeItems: "center", background: `linear-gradient(135deg, hsl(${nameHue(n.name)} 65% 45%), hsl(${(nameHue(n.name) + 50) % 360} 75% 26%))`, color: "#fff", fontWeight: 800 } }, (n.name || "?").charAt(0).toUpperCase()),
+            el("div", {},
+              el("strong", {}, esc(n.name)),
+              n.role ? el("small", {}, esc(n.role)) : null,
+            ),
+          ),
+          n.description ? el("p", { class: "npc-desc" }, esc(n.description)) : null,
+          n.personality ? el("p", { class: "npc-perso" }, esc(n.personality)) : null,
+          el("button", { class: "btn btn-primary btn-sm", onclick: async () => {
+            try {
+              await api(`/api/conversations/${currentConversation.id}/npcs/accept`, { body: { npc: n } });
+              close();
+              toast(`✨ ${n.name} rejoint la partie ✓`);
+              await refreshAll();
+              await renderChat(currentConversation.id);
+            } catch (e) { toast(e.message, "err"); }
+          } }, "＋ Ajouter à la partie"),
+        );
+        return card;
+      }));
+    } catch (e) { status.hidden = true; toast(e.message, "err"); }
+    finally { busy = false; }
+  }
+}
+
 function scrollToBottom(scroll, force = false) {
   requestAnimationFrame(() => {
     scroll.scrollTop = scroll.scrollHeight;
@@ -1815,7 +1981,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal, field } from "./ui.js?v=41";
+import { openModal, field } from "./ui.js?v=43";
 void applyTheme;
 void fmtTime;
 void currentConversation;

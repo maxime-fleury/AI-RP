@@ -294,8 +294,12 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const body = await readJson(req);
       const files = Array.isArray(body.files) ? body.files.map(String).filter(Boolean) : [];
       if (!files.length) return json({ removed: 0, bytes: 0 });
+      // safety net: snapshot the DB before anything is deleted, so a purge can
+      // be undone from the backups (the danger is in the confirmed deletes)
+      const backup = runBackup(true);
+      console.log(`[purge] 🗑 ${files.length} fichier(s) — sauvegarde ${backup || "du jour déjà existante"}`);
       const r = purgeOrphans(files);
-      return json(r);
+      return json({ ...r, backup });
     }
     if (p === "/api/backup" && method === "POST") {
       const file = runBackup(true);
@@ -376,7 +380,11 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
           if (res.status === "imported" && res.card) imported.push(messageView(res.card));
         }
       }
-      return json({ imported, duplicates: report.filter((r) => r.status === "duplicate").map((r) => r.name), report });
+      // safety net: snapshot the DB before the batch touches anything — the
+      // import is bulk-writing, so a bad card must be undoable from backups
+      const backup = runBackup(true);
+      if (imported.length) console.log(`[import] 📥 ${imported.length} carte(s) — sauvegarde ${backup || "du jour déjà existante"}`);
+      return json({ imported, duplicates: report.filter((r) => r.status === "duplicate").map((r) => r.name), report, backup });
     }
     if (p === "/api/cards/scan" && method === "POST") {
       const body = await readJson(req);
@@ -916,6 +924,105 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       deleteConversation(convId);
       try { fs.rmSync(path.join(IMAGES_DIR, "conversations", String(convId)), { recursive: true, force: true }); } catch { /* ignore */ }
       return json({ ok: true });
+    }
+    // story chapters: POST closes the current stretch — the model titles and
+    // summarizes it, a display-only marker lands in the thread (meta.chapter,
+    // skipped when building the model input) and the summary is injected in the
+    // system prompt (see buildSystemPrompt "Chapitres précédents").
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "chapter" && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      let cs: Record<string, any> = {};
+      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+      const chapters = Array.isArray(cs.chapters) ? cs.chapters : [];
+      const sinceId = Number(cs.chapter_msg_id || 0);
+      const all = listMessages(conv.id).filter((m) => {
+        try { const meta = JSON.parse(m.meta || "{}"); return !meta.chapter; } catch { return true; }
+      });
+      const fresh = sinceId ? all.filter((m) => m.id > sinceId) : all;
+      if (fresh.length < CHAPTER_MIN_MESSAGES) return json({ created: false, reason: "threshold" });
+      const proposed = await suggestChapter(conv.title || "Partie", fresh);
+      if (!proposed) return json({ created: false, error: "L'analyse du chapitre a échoué — vérifie la connexion au modèle." }, 502);
+      const n = chapters.length + 1;
+      const marker = createMessage({
+        conversation_id: conv.id, role: "assistant", name: "",
+        content: `📖 Chapitre ${n} — ${proposed.title}\n\n${proposed.summary}`,
+        meta: JSON.stringify({ chapter: true }),
+      });
+      chapters.push({ n, title: proposed.title, summary: proposed.summary, at: Date.now(), msg_id: marker.id });
+      cs.chapters = chapters;
+      cs.chapter_msg_id = marker.id;
+      updateConversation(conv.id, { settings: JSON.stringify(cs) });
+      console.log(`[chapters] 📖 Chapitre ${n} « ${proposed.title} » — ${fresh.length} messages`);
+      return json({ created: true, chapter: { n, title: proposed.title, summary: proposed.summary }, marker: messageView(marker) });
+    }
+    // dynamic NPCs: suggest secondary characters from the recent fiction
+    // (POST .../npcs/suggest), then add an approved one to the cast
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "npcs" && parts[4] === "suggest" && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const npcs = await suggestNpcs(conv, listMessages(conv.id));
+      console.log(`[npcs] 💡 conversation #${conv.id} — ${npcs.length} proposition(s)`);
+      return json({ npcs });
+    }
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "npcs" && parts[4] === "accept" && method === "POST") {
+      const body = await readJson(req);
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const npc = body?.npc || {};
+      const name = String(npc.name || "").trim().slice(0, 80);
+      if (!name) return json({ error: "Nom de PNJ manquant" }, 400);
+      const card = createCard({
+        name,
+        description: String(npc.description || "").trim().slice(0, 2000),
+        personality: String(npc.personality || "").trim().slice(0, 2000),
+        scenario: String(npc.role || "").trim().slice(0, 500),
+        tags: "[]",
+      });
+      let cast: number[] = [];
+      try { cast = (JSON.parse(conv.cast || "[]") as number[]).map(Number); } catch { /* ignore */ }
+      if (!cast.includes(card.id)) cast.push(card.id);
+      updateConversation(conv.id, { cast: JSON.stringify(cast) });
+      console.log(`[npcs] ➕ carte #${card.id} « ${card.name} » ajoutée à la partie #${conv.id}`);
+      return json({ card: messageView(card) });
+    }
+    // per-game statistics: counts, wordage, speaker frequency, activity span
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "stats" && method === "GET") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const msgs = listMessages(conv.id);
+      const words = (t: string) => (t || "").trim() ? (t.trim().match(/\S+/g) || []).length : 0;
+      const speaker = new Map<string, number>();
+      let userMsgs = 0, assistantMsgs = 0, totalWords = 0, totalChars = 0, images = 0, bookmarks = 0;
+      let firstTs = 0, lastTs = 0;
+      for (const m of msgs) {
+        const c = m.content || "";
+        totalWords += words(c);
+        totalChars += c.length;
+        if (m.role === "user") userMsgs++; else assistantMsgs++;
+        if (m.meta) {
+          try {
+            const meta = JSON.parse(m.meta as string);
+            if (meta.image) images++;
+            if (meta.bookmark) bookmarks++;
+          } catch { /* ignore */ }
+        }
+        const name = m.role === "user" ? (conv.persona_id ? "Joueur" : "Moi") : m.name || "Narrateur";
+        speaker.set(name, (speaker.get(name) || 0) + 1);
+        if (!firstTs || m.created_at < firstTs) firstTs = m.created_at;
+        if (m.created_at > lastTs) lastTs = m.created_at;
+      }
+      const speakers = [...speaker.entries()]
+        .map(([name, count]) => ({ name, count }))
+        .sort((a, b) => b.count - a.count);
+      const spanDays = firstTs ? Math.round((lastTs - firstTs) / 86_400_000) : 0;
+      return json({
+        messages: msgs.length, user_msgs: userMsgs, assistant_msgs: assistantMsgs,
+        words: totalWords, chars: totalChars,
+        avg_words: msgs.length ? Math.round(totalWords / msgs.length) : 0,
+        images, bookmarks, first_ts: firstTs, last_ts: lastTs, days: spanDays,
+        speakers,
+      });
     }
     // quest journal: POST {refresh:true} asks the LLM to extract the current
     // objectives from the conversation; POST {quests:[...]} saves them (manual
@@ -1766,6 +1873,80 @@ async function generateCardAssist(idea: string): Promise<CardAssistFields> {
     console.warn("[cards/assist] JSON invalide:", String(e?.message ?? e).slice(0, 120));
   }
   return out;
+}
+
+// ─── story chapters & dynamic NPCs ───────────────────────────────────────────
+// Chapters: closed automatically every CHAPTER_MIN_MESSAGES turns; the marker
+// message is display-only (skipped in buildMessages) and summaries feed the
+// system prompt. NPCs: proposed from the fiction, approved into the cast.
+const CHAPTER_MIN_MESSAGES = 10;
+
+type NpcSuggestion = { name: string; description: string; personality: string; role: string };
+const NPC_FMT = '{"npcs":[{"name":"Prénom","description":"2 phrases visuelles","personality":"traits en une phrase","role":"fonction dans la scène"}]}';
+
+async function llmJson(prompt: string, sys: string, maxTokens = 700, temperature = 0.7): Promise<Record<string, unknown> | null> {
+  const provider = getProvider();
+  let model = defaultModelFor(provider.id);
+  if (!model) {
+    try {
+      const models = await provider.models();
+      model = models[0] ?? "";
+    } catch { /* offline */ }
+  }
+  if (!model) return null;
+  try {
+    const text = await provider.complete({
+      messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
+      model, temperature, maxTokens, noThinking: true, signal: AbortSignal.timeout(120_000),
+    });
+    return parseCardAssistJson(text || "");
+  } catch (e) {
+    console.warn(`[llm-json] échec: ${String(e?.message ?? e).slice(0, 140)}`);
+    return null;
+  }
+}
+
+function transcriptFor(msgs: MessageRow[], max = 60): string {
+  const kept = msgs.filter((m) => {
+    try { const meta = JSON.parse(m.meta || "{}"); return !meta.chapter; } catch { return true; }
+  }).slice(-max);
+  return kept.map((m) => `${m.role === "user" ? "Joueur" : m.name || "Narrateur"} : ${(m.content || "").replace(/\s+/g, " ").slice(0, 300)}`).join("\n");
+}
+
+async function suggestChapter(title: string, msgs: MessageRow[]): Promise<{ title: string; summary: string } | null> {
+  const sys = [
+    `Tu es le maître de jeu d'un roleplay « ${title.slice(0, 60)} ». On te confie une tranche de partie pour en faire un chapitre.`,
+    "Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : {\"title\": \"titre évocateur de 2-6 mots\", \"summary\": \"résumé de 3 à 5 phrases des événements et des enjeux restés ouverts\"}.",
+    "Le titre ne contient pas le mot chapitre. Résumé au présent, en français, prêt à relire en reprenant la partie. JSON complet, non tronqué.",
+  ].join(" ");
+  const p = await llmJson(transcriptFor(msgs), sys);
+  const t = String(p?.title ?? "").trim().slice(0, 80);
+  const s = String(p?.summary ?? "").trim().slice(0, 1200);
+  return t && s ? { title: t, summary: s } : null;
+}
+
+async function suggestNpcs(conv: ConversationRow, msgs: MessageRow[]): Promise<NpcSuggestion[]> {
+  let castNames: string[] = [];
+  try { castNames = (JSON.parse(conv.cast || "[]") as number[]).map((id) => getCard(Number(id))?.name ?? "").filter(Boolean); } catch { /* ignore */ }
+  const sys = [
+    "Tu suis une partie de roleplay et repères les personnages secondaires qui émergent de la fiction.",
+    `Personnages déjà en carte (à ignorer) : ${castNames.join(", ") || "aucun"}.`,
+    "Ne propose QUE des personnages réellement évoqués par les derniers échanges (un tavernier, une garde, un rival…), jamais le narrateur ni le joueur.",
+    `Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : ${NPC_FMT}. 0 à 3 entrées. Noms propres, descriptions neutres et concrètes. JSON complet, non tronqué.`,
+  ].join(" ");
+  const p = await llmJson(transcriptFor(msgs, 24), sys, 900, 0.8);
+  const list = Array.isArray(p?.npcs) ? p.npcs : [];
+  const norm = (s: string) => String(s).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+  const taken = new Set(castNames.map(norm));
+  return list
+    .map((x: any) => ({
+      name: String(x?.name ?? "").trim().slice(0, 80),
+      description: String(x?.description ?? "").trim().slice(0, 1500),
+      personality: String(x?.personality ?? "").trim().slice(0, 1200),
+      role: String(x?.role ?? "").trim().slice(0, 400),
+    }))
+    .filter((n) => n.name && n.description && !taken.has(norm(n.name)))
+    .slice(0, 3);
 }
 
 // ─── quest journal ────────────────────────────────────────────────────────────

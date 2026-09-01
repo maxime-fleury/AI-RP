@@ -1,6 +1,6 @@
-import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=41";
-import { el, esc, toast, actionToast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=41";
-import { renderChat } from "./chat.js?v=41";
+import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=43";
+import { el, esc, toast, actionToast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=43";
+import { renderChat } from "./chat.js?v=43";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -94,9 +94,22 @@ export function applyCustom() {
   }
 }
 
+const THEME_CYCLE = ["auto", "glass", "anime"];
+const THEME_LABELS = { auto: "🌙 Auto (nuit → anime)", glass: "🌌 Thème néon", anime: "🌸 Thème anime" };
 export function applyTheme(theme) {
-  document.documentElement.dataset.theme = theme === "anime" ? "anime" : "glass";
-  localStorage.setItem("ai-rp-theme", JSON.stringify(theme === "anime" ? "anime" : "glass"));
+  const h = new Date().getHours();
+  const effective = theme === "auto" ? (h >= 20 || h < 8 ? "anime" : "glass") : theme;
+  document.documentElement.dataset.theme = effective;
+  localStorage.setItem("ai-rp-theme", JSON.stringify(theme));
+}
+// 'auto' re-evaluates as the day/night boundary passes (and on window focus)
+setInterval(() => {
+  const t = getThemeChoice();
+  if (t === "auto") applyTheme("auto");
+}, 60_000);
+window.addEventListener("focus", () => { if (getThemeChoice() === "auto") applyTheme("auto"); });
+function getThemeChoice() {
+  try { return JSON.parse(localStorage.getItem("ai-rp-theme") || '"glass"'); } catch { return "glass"; }
 }
 
 // ─── sidebar ──────────────────────────────────────────────────────────────────
@@ -126,13 +139,13 @@ function renderSidebar(active) {
       el("span", {}, providerLabel()),
     ),
   );
-  const themeBtn = el("button", { class: "theme-toggle", onclick: () => {
-    const next = document.documentElement.dataset.theme === "anime" ? "glass" : "anime";
+  const themeBtn = el("button", { class: "theme-toggle", title: "Cycle : auto / néon / anime", onclick: () => {
+    const cur = getThemeChoice();
+    const next = THEME_CYCLE[(THEME_CYCLE.indexOf(cur) + 1) % THEME_CYCLE.length] || "auto";
     applyTheme(next);
     renderSidebar(active);
   } },
-    document.documentElement.dataset.theme === "anime" ? "🎨 " : "🌙 ",
-    document.documentElement.dataset.theme === "anime" ? "Thème néon" : "Thème anime",
+    THEME_LABELS[getThemeChoice()] || THEME_LABELS.glass,
   );
   sb.replaceChildren(
     el("div", { class: "brand" },
@@ -331,7 +344,7 @@ function shortcutsHelp() {
 }
 let shortcutCapturing = false; // set while the settings editor awaits a keypress
 function fireShortcut(k) {
-  import("./chat.js?v=41").then((m) => m.chatShortcut(k)).catch(() => {});
+  import("./chat.js?v=43").then((m) => m.chatShortcut(k)).catch(() => {});
 }
 document.addEventListener("keydown", (e) => {
   if (shortcutCapturing) return; // the settings key-capture owns this press
