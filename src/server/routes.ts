@@ -10,7 +10,7 @@ import {
   listCards, getCard, createCard, updateCard, deleteCard,
   listPersonas, getPersona, createPersona, updatePersona, deletePersona,
   listConversations, getConversation, createConversation, updateConversation, deleteConversation,
-  listMessages, getMessage, createMessage, updateMessage, deleteMessage, touchConversation,
+  listMessages, getMessage, createMessage, updateMessage, deleteMessage, deleteMessagesAfter, touchConversation,
   listTrashedResources, restoreTrashed, permanentDeleteTrashed,
   lastMessageOf,
   listLocations, createLocation, updateLocation, deleteLocation,
@@ -1024,6 +1024,155 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         speakers,
       });
     }
+    // story checkpoints & rewind (RE:ZERO-style): mark a point in the thread,
+    // then rewind to it. The doomed stretch becomes a restorable abandoned
+    // branch, the world state IS restored to the checkpoint (strict), and a
+    // condensed loop summary is kept for the narrator's memories (sliders).
+    // ── checkpoint (stack semantics: only the top can be popped)
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "checkpoint" && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const last = lastMessageOf(conv.id);
+      if (!last) return json({ error: "La partie est vide — rien à marquer." }, 400);
+      const body = await readJson(req);
+      let cs: Record<string, any> = {};
+      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+      const checkpoints = Array.isArray(cs.checkpoints) ? cs.checkpoints : [];
+      // the snapshot keeps the fiction state that is rewound on return;
+      // the memory sliders are settings, NOT fiction, so they're excluded
+      checkpoints.push({
+        n: checkpoints.length + 1,
+        msg_id: last.id,
+        note: String(body.note || "").trim().slice(0, 120),
+        at: Date.now(),
+        snapshot: {
+          memory_json: conv.memory_json,
+          summary: conv.summary,
+          summary_msg_id: conv.summary_msg_id,
+          cast: conv.cast,
+          group_mode: conv.group_mode,
+          chapters: Array.isArray(cs.chapters) ? cs.chapters : [],
+          chapter_msg_id: cs.chapter_msg_id ?? 0,
+          quests: cs.quests ?? [],
+          scene_state: cs.scene_state ?? null,
+          scene_updated_at: cs.scene_updated_at ?? 0,
+        },
+      });
+      cs.checkpoints = checkpoints;
+      updateConversation(conv.id, { settings: JSON.stringify(cs) });
+      console.log(`[checkpoint] 📌 #${checkpoints.length} « ${checkpoints[checkpoints.length - 1].note || "point de retour"} » — msg #${last.id}`);
+      return json({ created: true, count: checkpoints.length, checkpoint: checkpoints[checkpoints.length - 1] });
+    }
+    // ── rewind to the top checkpoint
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "return" && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      let cs: Record<string, any> = {};
+      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+      const checkpoints = Array.isArray(cs.checkpoints) ? cs.checkpoints : [];
+      const top = checkpoints[checkpoints.length - 1];
+      if (!top) return json({ error: "Aucun checkpoint — marque-en un d'abord." }, 400);
+      const snap = top.snapshot || {};
+      const fromId = Number(top.msg_id || 0);
+      const doomed = listMessages(conv.id).filter((m) => m.id > fromId);
+      if (!doomed.length) return json({ error: "Le checkpoint est déjà au fil le plus récent." }, 400);
+      const backup = runBackup(true); // safety net before the confirmed deletion
+      // 1) restorable branch: the doomed stretch + its images, kept as abandoned
+      const abandoned = await forkTail(conv, doomed, fromId);
+      // 2) restore the world state to the checkpoint (strict RE:ZERO)
+      const removed = deleteMessagesAfter(conv.id, fromId);
+      for (const rm of removed) {
+        let meta: any = {};
+        try { meta = JSON.parse(rm.meta || "{}"); } catch { /* ignore */ }
+        if (meta.image) {
+          try { fs.rmSync(path.join(IMAGES_DIR, "conversations", String(conv.id), path.basename(meta.image)), { force: true }); } catch { /* ignore */ }
+        }
+      }
+      const restoredCs: Record<string, any> = {
+        ...cs,
+        chapter_msg_id: snap.chapter_msg_id ?? cs.chapter_msg_id ?? 0,
+        quests: Array.isArray(snap.quests) ? snap.quests : [],
+        scene_state: snap.scene_state ?? null,
+        scene_updated_at: snap.scene_updated_at ?? 0,
+      };
+      restoredCs.chapters = Array.isArray(snap.chapters) ? snap.chapters : [];
+      // 3) condensed loop summary (narrator memory). Offline model → placeholder.
+      const loop = await summarizeLoop(conv.title || "Partie", doomed);
+      const loops = Array.isArray(cs.loops) ? cs.loops : [];
+      loops.push({ n: loops.length + 1, checkpoint_n: top.n, at: Date.now(), branch: abandoned?.id ?? null, note: top.note || "", ...loop });
+      restoredCs.loops = loops;
+      // 4) pop the checkpoint (the one before becomes accessible next time)
+      restoredCs.checkpoints = checkpoints.slice(0, -1);
+      const lastKept = getMessage(fromId);
+      updateConversation(conv.id, {
+        settings: JSON.stringify(restoredCs),
+        memory_json: String(snap.memory_json ?? ""),
+        summary: String(snap.summary ?? ""),
+        summary_msg_id: Number(snap.summary_msg_id || 0),
+        cast: String(snap.cast || "[]"),
+        group_mode: Number(snap.group_mode ?? conv.group_mode),
+        last_message: lastKept?.content?.slice(0, 200) ?? conv.last_message,
+      });
+      // 5) display-only rewind marker
+      const marker = createMessage({
+        conversation_id: conv.id, role: "assistant", name: "",
+        content: `🔁 Retour au point ${top.n}${top.note ? ` — ${top.note}` : ""}`,
+        meta: JSON.stringify({ rewind: true }),
+      });
+      console.log(`[rewind] 🔁 partie #${conv.id} → point ${top.n} (msg #${fromId}) — ${doomed.length} message(s) tronqué(s), boucle #${loops.length}`);
+      return json({
+        ok: true, truncated: doomed.length, loop: loops[loops.length - 1],
+        branch: abandoned ? { id: abandoned.id, title: abandoned.title } : null,
+        backup,
+      });
+    }
+    // ── loop journal
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "loops" && method === "GET") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      let cs: Record<string, any> = {};
+      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+      return json({ checkpoints: Array.isArray(cs.checkpoints) ? cs.checkpoints : [], loops: Array.isArray(cs.loops) ? cs.loops : [] });
+    }
+    // per-game lorebook (dynamic canon): facts built during play, kept in the
+    // conversation settings, injected like world lore (trigger-matched). GET
+    // lists; POST {entries:[...]} saves the full list; /suggest asks the model
+    // to propose entries from the recent fiction.
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "lore" && parts[4] === "suggest" && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const entries = await suggestLore(conv, listMessages(conv.id));
+      console.log(`[lore] 🧭 conversation #${conv.id} — ${entries.length} proposition(s)`);
+      return json({ entries });
+    }
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "lore" && method === "GET") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      let cs: Record<string, any> = {};
+      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+      return json({ entries: Array.isArray(cs.lore_entries) ? cs.lore_entries : [] });
+    }
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "lore" && method === "POST") {
+      const convId = Number(parts[2]);
+      const conv = getConversation(convId);
+      if (!conv) return json({ error: "not found" }, 404);
+      const body = await readJson(req);
+      const entries = (Array.isArray(body?.entries) ? body.entries : [])
+        .map((e: any) => ({
+          key: String(e?.key || `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`).slice(0, 40),
+          name: String(e?.name || "").trim().slice(0, 120),
+          triggers: String(e?.triggers || "").trim().slice(0, 300),
+          content: String(e?.content || "").trim().slice(0, 2000),
+          enabled: e?.enabled === false || e?.enabled === 0 ? 0 : 1,
+          at: e?.at ?? Date.now(),
+        }))
+        .filter((x: any) => x.name || x.content);
+      let cs: Record<string, any> = {};
+      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+      cs.lore_entries = entries;
+      updateConversation(convId, { settings: JSON.stringify(cs) });
+      return json({ entries });
+    }
     // quest journal: POST {refresh:true} asks the LLM to extract the current
     // objectives from the conversation; POST {quests:[...]} saves them (manual
     // status edits). Stored in the conversation settings, never in the prompt.
@@ -1908,9 +2057,98 @@ async function llmJson(prompt: string, sys: string, maxTokens = 700, temperature
 
 function transcriptFor(msgs: MessageRow[], max = 60): string {
   const kept = msgs.filter((m) => {
-    try { const meta = JSON.parse(m.meta || "{}"); return !meta.chapter; } catch { return true; }
+    try { const meta = JSON.parse(m.meta || "{}"); return !meta.chapter && !meta.rewind; } catch { return true; }
   }).slice(-max);
   return kept.map((m) => `${m.role === "user" ? "Joueur" : m.name || "Narrateur"} : ${(m.content || "").replace(/\s+/g, " ").slice(0, 300)}`).join("\n");
+}
+
+/**
+ * Preserve a doomed stretch of a conversation as a restorable abandoned branch
+ * (RE:ZERO rewind keeps the timeline around). Images are copied with remapped
+ * ids, exactly like the "Régénérer en variante" fork. Returns the branch.
+ */
+async function forkTail(src: ConversationRow, doomed: MessageRow[], fromId: number): Promise<ConversationRow | null> {
+  if (!doomed.length) return null;
+  void fromId;
+  let cs: Record<string, unknown> = {};
+  try { cs = JSON.parse(src.settings || "{}"); } catch { /* ignore */ }
+  // the backup copy keeps the world state it left behind, but its checkpoint
+  // & loop stacks belong to the parent — a reopen is just a record to replay
+  delete cs.checkpoints;
+  delete cs.loops;
+  const branch = createConversation({
+    title: (src.title || "Partie") + " · boucle",
+    world_id: src.world_id, persona_id: src.persona_id, scenario_id: src.scenario_id,
+    cast: src.cast, group_mode: src.group_mode, settings: JSON.stringify(cs),
+    memory_json: src.memory_json, summary: src.summary, summary_msg_id: src.summary_msg_id,
+    parent_id: src.id, branch_kind: "abandoned",
+  });
+  const imgSrcDir = path.join(IMAGES_DIR, "conversations", String(src.id));
+  const imgDstDir = path.join(IMAGES_DIR, "conversations", String(branch.id));
+  for (const m of doomed) {
+    const meta = messageView({ ...m }).meta as any;
+    const newMid = createMessage({
+      conversation_id: branch.id, role: m.role, name: m.name, content: m.content,
+      segments: m.segments, meta: "{}",
+    }).id;
+    if (meta?.image) {
+      const file = path.basename(meta.image);
+      const srcImg = path.join(imgSrcDir, file);
+      if (fs.existsSync(srcImg)) {
+        fs.mkdirSync(imgDstDir, { recursive: true });
+        fs.copyFileSync(srcImg, path.join(imgDstDir, file));
+        meta.image = `/images/conversations/${branch.id}/${file}`;
+      }
+    }
+    delete meta.suggestions;
+    updateMessage(newMid, { meta: JSON.stringify(meta) });
+  }
+  updateConversation(branch.id, { last_message: doomed[doomed.length - 1].content.slice(0, 200) });
+  return branch;
+}
+
+/** Condense a doomed stretch into a narrator loop-summary (~3000 tokens budget). */
+async function summarizeLoop(title: string, doomed: MessageRow[]): Promise<{ title: string; summary: string }> {
+  const fallback = { title: "Boucle", summary: "Une tentative aboutit à une impasse. Les détails de ce trajet ont été écrasés par le retour." };
+  const sys = [
+    `Tu es le narrateur d'un roleplay RE:ZERO. « ${title.slice(0, 60)} ». On te confie une tranche de partie qui a été brutalisée par un retour dans le temps, pour la condenser en souvenir.`,
+    "Ce souvenir doit tenir DANS ~3000 tokens, donc RESUME : garde l'essentiel des actions, des choix du joueur et de leurs conséquences, mais écrase les détails.",
+    "Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : {\"title\": \"intitulé court du souvenir (2-5 mots)\", \"summary\": \"résumé concis de 4 à 8 phrases, au présent, focalisé sur les choix et leurs issues\"}. JSON complet, non tronqué.",
+  ].join(" ");
+  const transcript = transcriptFor(doomed, 200);
+  if (!transcript.trim()) return fallback;
+  try {
+    const p = await llmJson(transcript, sys, 900, 0.7);
+    const t = String(p?.title ?? "").trim().slice(0, 80);
+    const s = String(p?.summary ?? "").trim().slice(0, 2000);
+    if (t && s) return { title: t, summary: s };
+  } catch { /* offline */ }
+  return fallback;
+}
+
+async function suggestLore(conv: ConversationRow, msgs: MessageRow[]): Promise<{ name: string; triggers: string; content: string }[]> {
+  const LORE_FMT = '{"entries":[{"name":"faction ou lieu ou personne","triggers":"mots-clés (séparés par des virgules) qui signalent ce fait","content":"2 à 4 phrases fixes du canon, sans pronoms personnels de la scène"}]}';
+  const sys = [
+    `Tu es le conservateur du canon d'un roleplay « ${(conv.title || "").slice(0, 60)} ».`,
+    "À partir de la fiction ci-dessous, extrais 2 à 5 faits STABLES et toujours vrais de ce monde (relations, lieux, organisations, identités, règles), jamais des émotions de scène ni des actions ponctuelles.",
+    "Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : " + LORE_FMT,
+    "Les triggers doivent être de courts mots-clés de scène (prénoms, lieux, concepts) qui déclencheront l'injection du fait dans le prompt du modèle.",
+    "JSON complet, non tronqué.",
+  ].join(" ");
+  const transcript = transcriptFor(msgs.slice(-14), 280);
+  if (!transcript.trim()) return [];
+  try {
+    const p = await llmJson(transcript, sys, 900, 0.7);
+    const raw = Array.isArray(p?.entries) ? p.entries : [];
+    return raw
+      .map((e: any) => ({
+        name: String(e?.name ?? "").trim().slice(0, 120),
+        triggers: String(e?.triggers ?? "").trim().slice(0, 300),
+        content: String(e?.content ?? "").trim().slice(0, 2000),
+      }))
+      .filter((x) => x.name && x.content);
+  } catch { /* offline */ }
+  return [];
 }
 
 async function suggestChapter(title: string, msgs: MessageRow[]): Promise<{ title: string; summary: string } | null> {

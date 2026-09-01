@@ -1,6 +1,6 @@
-import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=43";
-import { el, esc, toast, actionToast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=43";
-import { renderChat } from "./chat.js?v=43";
+import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=45";
+import { el, esc, toast, actionToast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=45";
+import { renderChat } from "./chat.js?v=45";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -344,7 +344,7 @@ function shortcutsHelp() {
 }
 let shortcutCapturing = false; // set while the settings editor awaits a keypress
 function fireShortcut(k) {
-  import("./chat.js?v=43").then((m) => m.chatShortcut(k)).catch(() => {});
+  import("./chat.js?v=45").then((m) => m.chatShortcut(k)).catch(() => {});
 }
 document.addEventListener("keydown", (e) => {
   if (shortcutCapturing) return; // the settings key-capture owns this press

@@ -286,6 +286,29 @@ export function buildSystemPrompt(ctx: CastContext): string {
     }
   } catch { /* ignore */ }
 
+  // time loops (RE:ZERO sliders): the narrator may keep a condensed memory of
+  // rewound stretches, and/or the player persona may be aware of the loops
+  try {
+    const cs = JSON.parse(ctx.conversation.settings || "{}");
+    const narratorMem = Number(cs.loop_mem_narrator ?? 0);
+    const playerMem = Number(cs.loop_mem_player ?? 0);
+    const loops = Array.isArray(cs.loops) ? cs.loops : [];
+    if (narratorMem > 0 && loops.length) {
+      parts.push(`## Boucles précédentes (mémoire du temps)\n${loopMemoryText(loops)}\n`);
+    }
+    if (narratorMem > 0 || playerMem > 0) {
+      const pn = ctx.persona?.name ?? "le joueur";
+      const rules: string[] = [];
+      if (playerMem >= 1) rules.push(`- ${pn} s'est déjà trouvé·e dans cette période ; il/elle garde le souvenir précis des boucles précédentes, en secret.`);
+      if (playerMem >= 2) rules.push("- Les autres personnages savent qu'une situation s'est déjà répétée et peuvent s'en souvenir à leur tour.");
+      if (narratorMem === 1) rules.push("- RÈGLE : le narrateur ne fait JAMAIS référence aux boucles tant que le joueur n'en parle pas explicitement.");
+      if (narratorMem === 2) rules.push("- RÈGLE : le narrateur peut faire des allusions discrètes aux boucles (déjà-vu, familiarité troublante) sans jamais révéler le mécanisme de retour.");
+      if (narratorMem === 3) rules.push("- RÈGLE : le narrateur assume le retour dans le temps — il réfère les choix des boucles, joue la tension de leurs échecs, mais n'en dit jamais rien aux autres personnages.");
+      if (playerMem === 0 && narratorMem >= 2) rules.push("- Important : le joueur comme les personnages ignorent le retour ; garde-le comme un secret de narration.");
+      if (rules.length) parts.push(`## Mémoire des boucles (instructions)\n${rules.join("\n")}\n`);
+    }
+  } catch { /* ignore */ }
+
   const personaName = ctx.persona?.name ?? "le joueur";
   parts.push(`## Format d'écriture (important)
 - Le narrateur raconte UNIQUEMENT l'histoire, en narration entre astérisques : *Le vent soulevait la poussière.*
@@ -302,20 +325,23 @@ export function buildSystemPrompt(ctx: CastContext): string {
 
 export function buildMessages(ctx: CastContext, history: MessageRow[]): { system: string; messages: { role: "user" | "assistant"; content: string }[] } {
   // lorebook triggers are matched against the recent exchange (the last few
-  // messages), so entries activate exactly when the fiction mentions them
-  if (ctx.world && !ctx.lore) {
+  // messages), so entries activate exactly when the fiction mentions them.
+  // World lore and per-game lore (dynamic canon) are merged into ctx.lore.
+  if (!ctx.lore) {
     const recent = history.slice(-6).map((m) => m.content).join("\n");
-    const active = activeLorebook(ctx.world.id, recent);
+    const active: LorebookRow[] = [];
+    if (ctx.world) active.push(...activeLorebook(ctx.world.id, recent));
+    active.push(...activeConvLore(ctx.conversation.settings || "{}", recent));
     if (active.length) ctx.lore = active;
   }
   const system = buildSystemPrompt(ctx);
   const personaName = ctx.persona?.name ?? "Moi";
   const messages: { role: "user" | "assistant"; content: string }[] = [];
   for (const m of history) {
-    // chapter markers are display-only: never part of the model input
+    // chapter & rewind markers are display-only: never part of the model input
     try {
       const meta = JSON.parse(m.meta || "{}");
-      if (meta.chapter) continue;
+      if (meta.chapter || meta.rewind) continue;
     } catch { /* broken meta → treat as normal */ }
     if (m.role === "user") {
       messages.push({ role: "user", content: m.content });
@@ -343,6 +369,48 @@ export function summarizeSystem(): string {
 export function estimateTokens(text: string): number {
   // rough heuristic (~4 chars/token for French) — used for context budgeting
   return Math.ceil((text.length || 1) / 4);
+}
+
+/**
+ * Loop summaries (rewound stretches) the narrator may reference. Selected from
+ * the most recent loops until the ≈3000-token budget is reached — condensed
+ * summaries, never raw transcripts.
+ */
+export const LOOP_MEMORY_CHAR_BUDGET = 12_000; // ≈3000 tokens en français
+export function loopMemoryText(loops: { title?: string; summary?: string; checkpoint_n?: number }[], maxChars = LOOP_MEMORY_CHAR_BUDGET): string {
+  const labels: string[] = [];
+  let used = 0;
+  for (const lp of [...(loops || [])].reverse()) {
+    const label = `● ${lp.title || "Boucle"} : ${(lp.summary || "").trim()}`;
+    const need = label.length + 1;
+    if (used + need > maxChars && labels.length) break; // older loops compress away
+    labels.unshift(label);
+    used += need;
+  }
+  return labels.join("\n");
+}
+
+// per-game canonical facts (settings.lore_entries), trigger-matched against the
+// recent exchange — same shape as the world lorebook, injected through ctx.lore
+export function activeConvLore(settings: string, recentText: string): LorebookRow[] {
+  let cs: Record<string, any> = {};
+  try { cs = JSON.parse(settings || "{}"); } catch { return []; }
+  const entries = Array.isArray(cs.lore_entries) ? cs.lore_entries : [];
+  if (!entries.length || !recentText.trim()) return [];
+  const lower = recentText.toLowerCase();
+  return entries
+    .filter((e: any) => e && e.enabled !== 0)
+    .filter((e: any) => {
+      const triggers = String(e?.triggers || "")
+        .split(",").map((t: string) => t.trim().toLowerCase()).filter(Boolean);
+      return triggers.some((t: string) => lower.includes(t));
+    })
+    .map((e: any) => ({
+      id: 0, world_id: 0, name: String(e?.name || "").trim(),
+      triggers: String(e?.triggers || "").trim(),
+      content: String(e?.content || "").trim(),
+      priority: 1, enabled: 1, created_at: Number(e?.at ?? Date.now()),
+    }));
 }
 
 // ─── Segment parsing (narration / dialogue split) ─────────────────────────────

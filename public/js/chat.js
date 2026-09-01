@@ -1,6 +1,6 @@
-import { api, apiFetch, readSseStream } from "./api.js?v=43";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=43";
-import { store, refreshAll, navigate, applyTheme } from "./app.js?v=43";
+import { api, apiFetch, readSseStream } from "./api.js?v=45";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=45";
+import { store, refreshAll, navigate, applyTheme } from "./app.js?v=45";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -84,7 +84,7 @@ export async function renderChat(convIdRaw) {
   if (convIdRaw === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=43");
+    const { newGameWizard } = await import("./app.js?v=45");
     newGameWizard(pre);
     return;
   }
@@ -302,6 +302,10 @@ export async function renderChat(convIdRaw) {
   const questBtn = el("button", { title: "Journal de quêtes", onclick: () => questModal(conv) }, "🗡"); // invisible triggers, surfaced via the menu
   const statsBtn = el("button", { title: "Statistiques", onclick: () => statsModal(convId) }, "📊");
   const npcBtn = el("button", { title: "Proposer un PNJ", onclick: () => npcSuggestModal() }, "✨");
+  const checkpointBtn = el("button", { title: "Marquer un checkpoint", onclick: () => checkpointModal() }, "📌");
+  const returnBtn = el("button", { title: "Revenir au checkpoint (rewind)", onclick: () => rewindModal() }, "🔁");
+  const loopsBtn = el("button", { title: "Journal des boucles", onclick: () => loopsModal() }, "📔");
+  const loreBtn = el("button", { title: "Canon de la partie", onclick: () => loreModal() }, "📚");
   const menu = el("div", { class: "header-menu", hidden: true, role: "menu" });
   const closeHeaderMenu = () => { menu.hidden = true; };
   const menuSection = (title, pairs) => {
@@ -323,7 +327,8 @@ export async function renderChat(convIdRaw) {
     ...menuSection("🎬 Scène & mémoire", [[sceneBtn, "État de la scène"], [memoryBtn, "Mémoire structurée"], [dmBtn, "Directives du maître de jeu"], [branchesBtn, "Variantes"], [validateBtn, "Vérifier la cohérence"]]),
     ...menuSection("🔎 Fil & sélection", [[searchBtn, "Rechercher"], [bookmarkFilterBtn, "Favoris seulement"], [selectBtn, "Sélectionner plusieurs messages"]]),
     ...menuSection("📤 Export", [[mdBtn, "Exporter en Markdown"], [copyThreadBtn, "Copier le fil"], [galleryBtn, "Galerie d'illustrations"], [exportBtn, "Exporter en ZIP"]]),
-    ...menuSection("🛠 Partie", [[npcBtn, "Proposer un PNJ"], [questBtn, "Journal de quêtes"], [statsBtn, "Statistiques"], [settingsBtn, "Réglages de la partie"], [delBtn, "Archiver la partie"]]),
+    ...menuSection("🕘 Boucles de temps", [[checkpointBtn, "Marquer un checkpoint"], [returnBtn, "Revenir au checkpoint"], [loopsBtn, "Journal des boucles"]]),
+    ...menuSection("🛠 Partie", [[loreBtn, "Canon de la partie"], [npcBtn, "Proposer un PNJ"], [questBtn, "Journal de quêtes"], [statsBtn, "Statistiques"], [settingsBtn, "Réglages de la partie"], [delBtn, "Archiver la partie"]]),
   );
   const header = el("div", { class: "chat-header" }, backBtn, titleBlock, castStrip, groupBtn, menuBtn, menu);
 
@@ -452,6 +457,8 @@ export async function renderChat(convIdRaw) {
     { cmd: "/ooc", desc: "Question hors-jeu au modèle" },
     { cmd: "/narrate", desc: "Forcer le narrateur à raconter la scène" },
     { cmd: "/card", desc: "État de la partie (lieu, enjeux, objectifs)" },
+    { cmd: "/checkpoint", desc: "Marquer un point de retour (avec une note optionnelle)" },
+    { cmd: "/return", desc: "Revenir au dernier checkpoint (rewind)" },
   ];
   let slashIdx = 0;
   const slashMenu = el("div", { class: "slash-menu", hidden: true });
@@ -625,6 +632,7 @@ export async function renderChat(convIdRaw) {
     textarea.value = "";
     textarea.style.height = "auto";
     if (slash) {
+      if (slash.action) { await slash.action(); return; }
       if (!slash.prompt) return toast(slash.display); // invalid dice syntax → hint only
       await doStream(slash.display, { prompt: slash.prompt });
     } else {
@@ -750,6 +758,27 @@ export async function renderChat(convIdRaw) {
           ),
     );
 
+    // ── Mémoire des boucles (RE:ZERO) ──
+    // narrator axis: how much the writer may reference rewound stretches.
+    // player axis: whether the persona / characters know the loops happened.
+    const loopSlider = (label, min, max, value, labels) => {
+      const lbl = el("span", { class: "slider-lbl" }, labels[value] ?? String(value));
+      const input = el("input", { type: "range", min, max, step: 1, value, "aria-label": label });
+      input.addEventListener("input", () => { lbl.textContent = labels[Number(input.value)] ?? input.value; });
+      return { wrap: el("div", { class: "loop-slider" },
+        el("div", { class: "modal-line" },
+          el("div", { class: "ml-txt" }, el("strong", {}, label), el("small", {}, labels.map((l, i) => (i === Number(input.value) ? null : l)).filter(Boolean).slice(0, 2).join(" · "))),
+          lbl,
+        ),
+        input,
+      ), input };
+    };
+    const loopNarr = loopSlider("Mémoire du Narrateur", 0, 3, Number(convSettings.loop_mem_narrator ?? 0),
+      ["0 · Amnésie (ignorant)", "1 · Sait, n'en parle pas", "2 · Allusions discrètes", "3 · RE:ZERO assumé"]);
+    const loopPlayer = loopSlider("Mémoire du joueur & PNJ", 0, 2, Number(convSettings.loop_mem_player ?? 0),
+      ["0 · Personne ne le sait", "1 · Le perso se souvient (secret)", "2 · Souvenir partagé"]);
+    const loopHint = el("p", { class: "modal-note" }, "Agit quand tu marques un checkpoint et que tu reviens dessus : la tentative abandonnée devient une « boucle » que le Narrateur peut (ou non) garder en mémoire.");
+
     const body = el("div", { class: "conv-settings" },
       el("div", { class: "modal-section" }, "Modèle & génération"),
       el("div", { class: "row" }, provider.wrap, model.wrap),
@@ -763,6 +792,8 @@ export async function renderChat(convIdRaw) {
         el("div", { class: "ml-txt" }, el("strong", {}, "Faire jouer tous les personnages"), el("small", {}, "Groupe : chacun réagit à la scène · Solo : un personnage principal")),
         seg,
       )),
+      el("div", { class: "modal-section" }, "Mémoire des boucles (retour temporel)"),
+      loopNarr.wrap, loopPlayer.wrap, loopHint,
       el("div", { class: "modal-section" }, "Personnages en scène"),
       castBox,
       el("p", { class: "modal-note" }, "Ces réglages ne valent que pour cette partie. L'historique au-delà de la mémoire est résumé automatiquement par le modèle."),
@@ -790,6 +821,8 @@ export async function renderChat(convIdRaw) {
           context_max_messages: Number(ctxMax.input.value),
           validate_auto: autoValCb.querySelector("input").checked,
           dice_enabled: diceCb.querySelector("input").checked,
+          loop_mem_narrator: Number(loopNarr.input.value),
+          loop_mem_player: Number(loopPlayer.input.value),
         };
         await api(`/api/conversations/${convId}`, { method: "PATCH", body: { settings, cast: [...castIds], group_mode: groupMode } });
         store.settings.provider = provider.input.value;
@@ -1124,7 +1157,13 @@ function parseSlash(raw) {
     const q = rest ? ` La question du joueur : ${rest}` : "";
     return { display: `🗂 État de la partie${rest ? " : " + rest : ""}`, prompt: `[Demande du joueur] Fais le point sur l'état de la partie : personnages présents, lieu, situation en cours, objectifs et enjeux${q}. Réponds en 6-10 lignes concises, entièrement dans la fiction, sans liste numérotée.` };
   }
-  return { display: `⚠️ Commande inconnue : ${cmd} — disponibles : /dice, /ooc, /narrate, /card`, prompt: "" };
+  if (cmd === "/checkpoint") {
+    return { display: `📌 Checkpoint${rest ? " — " + rest : ""}`, prompt: "", action: () => checkpointModal(rest) };
+  }
+  if (cmd === "/return") {
+    return { display: "🔁 Retour au checkpoint", prompt: "", action: async () => rewindModal() };
+  }
+  return { display: `⚠️ Commande inconnue : ${cmd} — disponibles : /dice, /ooc, /narrate, /card, /checkpoint, /return`, prompt: "" };
 }
 
 // interpellation: ask the narrator or a specific character to speak
@@ -1366,12 +1405,16 @@ function openFindings(findings) {
 function renderMessage(m) {
   const isMe = m.role === "user";
   const isChapter = !isMe && m.meta?.chapter;
+  const isRewind = !isMe && m.meta?.rewind;
+  const marker = isChapter || isRewind;
   const segs = m.segments || [];
   const body = el("div", { class: "body" });
   if (isChapter) {
     const [head, ...rest] = (m.content || "").split("\n\n");
     body.append(el("div", { class: "chapter-head" }, esc(head || "")));
     if (rest.length) body.append(el("div", { class: "chapter-summary" }, esc(rest.join("\n\n"))));
+  } else if (isRewind) {
+    body.append(el("div", { class: "rewind-head" }, esc(m.content)));
   } else if (isMe) {
     body.append(el("div", {}, esc(m.content)));
   } else if (segs.length) {
@@ -1381,19 +1424,19 @@ function renderMessage(m) {
   } else if (m.content) {
     for (const b of splitBlocks(m.content)) body.append(el("div", {}, formatBody(b)));
   }
-  const bubble = el("div", { class: "bubble" + (m.bubbleClass ? " " + m.bubbleClass : "") + (isChapter ? " chapter-bubble" : ""), ...(!isChapter ? { title: "Double-clic pour modifier" } : {}) },
-    isMe || isChapter ? null : el("div", { class: "who" }, esc(m.name || "Narrateur")),
+  const bubble = el("div", { class: "bubble" + (m.bubbleClass ? " " + m.bubbleClass : "") + (marker ? " chapter-bubble rewind-bubble" : ""), ...(!marker ? { title: "Double-clic pour modifier" } : {}) },
+    isMe || marker ? null : el("div", { class: "who" }, esc(m.name || "Narrateur")),
     body,
   );
   // double-click → inline edit (Enter valide, Échap annule)
   const midStr = String(m.id || "");
-  if (!isChapter && !midStr.startsWith("tmp-") && !midStr.startsWith("pending")) {
+  if (!marker && !midStr.startsWith("tmp-") && !midStr.startsWith("pending")) {
     bubble.addEventListener("dblclick", (e) => {
       if (e.target.closest("button, a, img")) return;
       startEdit(m, body, bubble);
     });
   }
-  if (!isChapter && !isMe && m.meta?.image) {
+  if (!marker && !isMe && m.meta?.image) {
     const illu = el("div", { class: "msg-illu" },
       el("img", { src: m.meta.image, alt: "illustration" }),
       el("div", { class: "illu-meta" },
@@ -1412,15 +1455,15 @@ function renderMessage(m) {
     );
     bubble.append(illu);
   }
-  if (!isChapter && !isMe && m.id && !String(m.id).startsWith("pending")) {
+  if (!marker && !isMe && m.id && !String(m.id).startsWith("pending")) {
     bubble.append(el("div", { class: "msg-actions" }, ...messageActions(m.id)));
   }
   // private note (visible only to the player, never sent to the model)
-  if (!isChapter && m.meta?.note && !String(m.id).startsWith("pending")) {
+  if (!marker && m.meta?.note && !String(m.id).startsWith("pending")) {
     bubble.append(el("div", { class: "msg-note" }, "📌 " + esc(m.meta.note)));
   }
   // emoji reactions (kept server-side in meta.reactions)
-  if (!isChapter && m.id && !String(m.id).startsWith("pending")) {
+  if (!marker && m.id && !String(m.id).startsWith("pending")) {
     const list = Array.isArray(m.meta?.reactions) ? m.meta.reactions : [];
     const reacts = el("div", { class: "reactions" });
     for (const r of ["👍", "❤️", "😂"]) {
@@ -1443,8 +1486,8 @@ function renderMessage(m) {
     }
     bubble.append(reacts);
   }
-  const avatar = isChapter ? null : avatarFor(m);
-  const node = el("div", { class: `msg${isMe ? " me" : ""}${isChapter ? " chapter" : ""}${selectedIds.has(m.id) ? " sel" : ""}`, dataset: { mid: m.id, role: m.role } }, avatar, bubble);
+  const avatar = marker ? null : avatarFor(m);
+  const node = el("div", { class: `msg${isMe ? " me" : ""}${marker ? " chapter" : ""}${selectedIds.has(m.id) ? " sel" : ""}`, dataset: { mid: m.id, role: m.role } }, avatar, bubble);
   if (selectionMode && m.id && !String(m.id).startsWith("pending")) {
     const cb = el("input", { type: "checkbox", class: "sel-cb", "aria-label": "Sélectionner ce message", ...(selectedIds.has(m.id) ? { checked: "" } : {}) });
     cb.addEventListener("change", () => {
@@ -1867,6 +1910,157 @@ async function statsModal(convId) {
   );
 }
 
+// ─── time loops: checkpoints & rewind (RE:ZERO) ──────────────────────────────
+// Mark a point of return; rewind to it strictly (state restored, doomed stretch
+// shelved as an abandoned branch); the loop journal lists every rewind.
+async function checkpointModal(note) {
+  const conv = currentConversation;
+  if (busy) { toast("Attends la fin de la génération.", "err"); return; }
+  const input = el("input", { class: "field", placeholder: "Note optionnelle (ex : avant le duel, au café…)", value: note || "" });
+  const okBtn = el("button", { class: "btn btn-primary" }, "📌 Marquer le checkpoint");
+  const { close } = openModal({
+    title: "📌 Marquer un checkpoint",
+    sub: "Le fil actuel devient un point de retour. Tu pourras y revenir après (rewind), et l'histoire en cours sera conservée en boucle.",
+    body: input,
+    footer: [el("button", { class: "btn btn-ghost", onclick: close }, "Annuler"), okBtn],
+  });
+  okBtn.addEventListener("click", async () => {
+    okBtn.disabled = true;
+    try {
+      const r = await api(`/api/conversations/${conv.id}/checkpoint`, { body: { note: input.value } });
+      toast(`📌 Checkpoint ${r.checkpoint.n} marqué ✓`);
+      close();
+    } catch (e) { toast(e.message, "err"); okBtn.disabled = false; }
+  });
+}
+
+async function rewindModal() {
+  const conv = currentConversation;
+  if (busy) { toast("Attends la fin de la génération.", "err"); return; }
+  const okBtn = el("button", { class: "btn btn-danger" }, "🔁 Revenir au checkpoint");
+  const { close } = openModal({
+    title: "🔁 Revenir au checkpoint",
+    sub: "Le fil depuis le dernier checkpoint sera TRONQUÉ (conserve une boucle de secours relançable). L'état du monde, la mémoire, les quêtes et l'état de scène REVIENNENT à leur valeur du checkpoint.",
+    body: el("p", { class: "modal-note" }, "Le Narrateur garde une mémoire condensée de cette tentative — active-la via les réglages de la partie (mémoire des boucles). Cette action est enregistrée dans le journal des boucles."),
+    footer: [el("button", { class: "btn btn-ghost", onclick: close }, "Annuler"), okBtn],
+  });
+  okBtn.addEventListener("click", async () => {
+    okBtn.disabled = true;
+    okBtn.textContent = "🔁 Retour en cours…";
+    try {
+      const r = await api(`/api/conversations/${conv.id}/return`, { body: {} });
+      toast(`🔁 Retour effectué — boucle n°${r.loop.n} archivée ✓`);
+      close();
+      await refreshAll();
+      renderChat(conv.id);
+    } catch (e) { toast(e.message, "err"); okBtn.disabled = false; okBtn.textContent = "🔁 Revenir au checkpoint"; }
+  });
+}
+
+async function loopsModal() {
+  const conv = currentConversation;
+  const list = el("div", { class: "loop-list" }, el("p", { class: "modal-note" }, "Chargement…"));
+  const { close } = openModal({ title: "📔 Journal des boucles", sub: conv.title, body: list, footer: [el("button", { class: "btn btn-ghost", onclick: close }, "Fermer")], wide: true });
+  let d;
+  try { d = await api(`/api/conversations/${conv.id}/loops`); }
+  catch (e) { list.replaceChildren(el("p", { class: "modal-note" }, esc(e.message))); return; }
+  list.replaceChildren(
+    ...(d.loops || []).slice().reverse().map((lp) => {
+      const when = new Date(lp.at).toLocaleString("fr-FR", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+      return el("div", { class: "loop-card" },
+        el("div", { class: "loop-head" },
+          el("strong", {}, `🔁 Boucle n°${lp.n} · ${lp.checkpoint_n ? `depuis le point ${lp.checkpoint_n}` : ""}`),
+          el("small", {}, `${when}${lp.branch ? " · une copie de secours existe" : ""}`),
+        ),
+        el("div", { class: "loop-title" }, esc(lp.title || "")),
+        el("p", { class: "loop-desc" }, esc(lp.summary || "")),
+        lp.note ? el("div", { class: "loop-note" }, "📌 " + esc(lp.note)) : null,
+        lp.branch
+          ? el("div", { class: "loop-actions" }, el("button", { class: "btn btn-ghost btn-sm", onclick: () => { close(); location.hash = `#/chat/${lp.branch}`; } }, "↪ Rouvrir cette boucle"))
+          : null,
+      );
+    }),
+  );
+  if (!d.loops?.length) list.append(el("div", { class: "empty" }, el("div", { class: "big" }, "📔"), el("h3", {}, "Aucune boucle"), el("p", {}, "Marque un checkpoint puis reviens-y : la tentative abandonnée sera consignée ici.")));
+}
+
+// ─── per-game lorebook (dynamic canon) ────────────────────────────────────────
+// Facts the player pins as canon during play. Stored in the conversation
+// settings (settings.lore_entries), injected into the system prompt when a
+// trigger matches the recent fiction — exactly like a world lorebook.
+async function loreModal() {
+  const conv = currentConversation;
+  const body = el("div", { class: "lore-body" }, el("p", { class: "modal-note" }, "Chargement…"));
+  const suggestBtn = el("button", { class: "btn btn-ghost btn-sm", disabled: true }, "✨ Proposer depuis la fiction");
+  const okBtn = el("button", { class: "btn btn-primary" }, "💾 Enregistrer");
+  const { close } = openModal({
+    title: "📚 Canon de la partie",
+    sub: `${conv.title} · ces faits fixes du monde sont injectés dans le prompt quand leurs motifs apparaissent dans la fiction.`,
+    body,
+    footer: [suggestBtn, el("button", { class: "btn btn-ghost", onclick: close }, "Annuler"), okBtn],
+    wide: true,
+  });
+  let entries = [];
+  try {
+    const d = await api(`/api/conversations/${conv.id}/lore`);
+    entries = d.entries || [];
+  } catch (e) { body.replaceChildren(el("p", { class: "modal-note" }, esc(e.message))); return; }
+  const render = () => {
+    body.replaceChildren(
+      el("div", { class: "lore-list" },
+        ...entries.map((e, i) => {
+          const name = el("input", { class: "field", placeholder: "Nom (ex : Guilde des Ombres)", value: e.name });
+          const trig = el("input", { class: "field", placeholder: "Motifs, séparés par des virgules (ex : guilde, ombre)", value: e.triggers });
+          const content = el("textarea", { class: "field", rows: 2, placeholder: "Fait canonique, en 2-4 phrases", value: e.content });
+          name.addEventListener("input", () => { e.name = name.value; });
+          trig.addEventListener("input", () => { e.triggers = trig.value; });
+          content.addEventListener("input", () => { e.content = content.value; });
+          const delBtn = el("button", { class: "btn btn-ghost btn-sm", title: "Supprimer", onclick: () => { entries.splice(i, 1); render(); } }, "🗑");
+          const onBtn = el("button", { class: "btn btn-ghost btn-sm", title: e.enabled === 0 ? "Activé" : "Désactivé", onclick: () => { e.enabled = e.enabled === 0 ? 1 : 0; render(); } }, e.enabled === 0 ? "⛔" : "✅");
+          return el("div", { class: "lore-card", "data-disabled": e.enabled === 0 },
+            el("div", { class: "lore-head" }, name, el("div", { class: "lore-btns" }, onBtn, delBtn)),
+            trig,
+            content,
+          );
+        }),
+      ),
+      entries.length ? null : el("div", { class: "empty" }, el("div", { class: "big" }, "📚"), el("h3", {}, "Aucun canon défini"), el("p", {}, "Pose des faits fixes, ou fais-les proposer par le modèle depuis la fiction.")),
+      el("button", { class: "btn btn-ghost btn-sm", onclick: () => {
+        entries.push({ key: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, name: "", triggers: "", content: "", enabled: 1, at: Date.now() });
+        render();
+      } }, "＋ Ajouter un fait"),
+    );
+    const dirty = entries.some((x) => !x.name || !x.content);
+    okBtn.disabled = dirty;
+  };
+  suggestBtn.addEventListener("click", async () => {
+    const wasDirty = entries.some((x) => !x.name || !x.content);
+    if (wasDirty) { toast("Enregistre d'abord l'état en cours.", "err"); return; }
+    suggestBtn.disabled = true;
+    suggestBtn.textContent = "✨ Analyse de la fiction…";
+    try {
+      const r = await api(`/api/conversations/${conv.id}/lore/suggest`, { body: {} });
+      const fresh = r.entries || [];
+      if (!fresh.length) { toast("Aucun fait stable détecté.", "err"); return; }
+      const known = new Set(entries.map((x) => (x.name || "").toLowerCase()));
+      entries = [...entries, ...fresh.filter((x) => !known.has((x.name || "").toLowerCase())).map((x) => ({ ...x, enabled: 1, at: Date.now() }))];
+      render();
+      toast(`✨ ${fresh.length} fait(s) proposé(s) — relis-les avant d'enregistrer.`);
+    } catch (e) { toast(e.message, "err"); }
+    finally { suggestBtn.disabled = false; suggestBtn.textContent = "✨ Proposer depuis la fiction"; }
+  });
+  okBtn.addEventListener("click", async () => {
+    const clean = entries.filter((x) => x.name.trim() && x.content.trim());
+    okBtn.disabled = true;
+    try {
+      await api(`/api/conversations/${conv.id}/lore`, { body: { entries: clean } });
+      toast(`📚 ${clean.length} fait(s) canonique(s) enregistré(s) ✓`);
+      close();
+    } catch (e) { toast(e.message, "err"); okBtn.disabled = false; }
+  });
+  render();
+}
+
 // ─── story chapters (automatic) ──────────────────────────────────────────────
 // After every completed turn we ask the server to close a chapter once enough
 // messages have piled up; the marker lands in the thread and the summary is
@@ -1981,7 +2175,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal, field } from "./ui.js?v=43";
+import { openModal, field } from "./ui.js?v=45";
 void applyTheme;
 void fmtTime;
 void currentConversation;

@@ -515,6 +515,15 @@ export function deleteMessage(id: number): void {
   db.query("DELETE FROM messages WHERE id = ?").run(id);
 }
 
+/** Delete every message strictly after `minId` in a conversation, returning them. */
+export function deleteMessagesAfter(conversationId: number, minId: number): MessageRow[] {
+  const rows = db.query(
+    "SELECT * FROM messages WHERE conversation_id = ? AND id > ? ORDER BY id",
+  ).all(conversationId, minId) as MessageRow[];
+  db.query("DELETE FROM messages WHERE conversation_id = ? AND id > ?").run(conversationId, minId);
+  return rows;
+}
+
 export function lastMessageOf(conversationId: number): MessageRow | null {
   return db.query("SELECT * FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 1").get(conversationId) as MessageRow | null;
 }
