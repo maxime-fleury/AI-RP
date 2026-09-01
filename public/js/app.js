@@ -1,6 +1,6 @@
-import { api, apiForm, uploadFiles, setToken } from "./api.js?v=30";
-import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=30";
-import { renderChat } from "./chat.js?v=30";
+import { api, apiForm, uploadFiles, setToken } from "./api.js?v=33";
+import { el, esc, toast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=33";
+import { renderChat } from "./chat.js?v=33";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -205,7 +205,7 @@ document.addEventListener("keydown", (e) => {
   else if (k === "n") { e.preventDefault(); newGameWizard(); }
   else if (inChat && (k === "r" || k === "g" || k === "/")) {
     e.preventDefault();
-    import("./chat.js?v=30").then((m) => m.chatShortcut(k)).catch(() => {});
+    import("./chat.js?v=33").then((m) => m.chatShortcut(k)).catch(() => {});
   }
 });
 
@@ -955,9 +955,23 @@ async function renderSettings() {
       ),
     ),
   );
+  // quick navigation between the sections
+  const tocItem = (id, label) => el("a", { href: `#`, class: "chip-btn slim", onclick: (e) => {
+    e.preventDefault();
+    document.getElementById(`sec-${id}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  } }, label);
+  container.append(el("div", { class: "settings-toc" },
+    tocItem("ia", "🤖 IA"),
+    tocItem("narr", "🎭 Narrateurs"),
+    tocItem("tts", "🔊 Voix"),
+    tocItem("img", "🖼 Images"),
+    tocItem("app", "🎨 Apparence"),
+    tocItem("backup", "💾 Sauvegarde"),
+    tocItem("storage", "📦 Stockage"),
+  ));
 
   // ── IA ──
-  container.append(el("div", { class: "section-title" }, "IA conversationnelle"));
+  container.append(el("div", { class: "section-title", id: "sec-ia" }, "IA conversationnelle"));
   const providerSel = field("Fournisseur", s.provider || "lmstudio", {
     type: "select", options: [["lmstudio", "LM Studio (local)"], ["openrouter", "OpenRouter (cloud)"]],
   });
@@ -965,16 +979,29 @@ async function renderSettings() {
   const orKey = field("Clé API OpenRouter", s.openrouter_key || "", { type: "password", placeholder: "sk-or-v1-…" });
   const lmModel = field("Modèle LM Studio", s.lmstudio_model || "", { placeholder: "Chargement…" });
   const orModel = field("Modèle OpenRouter", s.openrouter_model || "", { placeholder: "Ex: anthropic/claude-3.7-sonnet" });
-  const narrStyle = field("Style du narrateur", s.narrator_style || "epique", {
-    type: "select",
-    options: [
-      ["epique", "Épique (défaut)"],
-      ["neutre", "Neutre"],
-      ["sarcastique", "Sarcastique"],
-      ["cynique", "Cynique"],
-      ["en_colere", "En colère"],
-      ["nagatoro", "Nagatoro (taquin)"],
-    ],
+  // ── narrator style presets (built-ins + user overrides, editable below) ──
+  const BUILTIN_NARRATOR = {
+    neutre: { label: "Neutre", prompt: "Sobre, direct et factuel : tu décris sans t'impliquer." },
+    epique: { label: "Épique", prompt: "Grandiose, lyrique et dramatique : chaque scène devient une épopée." },
+    sarcastique: { label: "Sarcastique", prompt: "Sarcastique et mordant : tu commentes les actions du joueur avec ironie et piques bien placées." },
+    cynique: { label: "Cynique", prompt: "Cynique et désabusé : le monde est dur, injuste, et tu le fais sentir à chaque phrase." },
+    en_colere: { label: "En colère", prompt: "En colère : la narration est tendue, brutale, presque rageuse. Les descriptions frappent fort." },
+    nagatoro: { label: "Nagatoro (taquin)", prompt: "Taquin et espiègle, comme Nagatoro : tu provoques gentiment le joueur avec des piques affectueuses, un sourire malicieux et beaucoup d'assurance." },
+  };
+  const narrMap = {}; // key → { label, prompt, custom, dirty }
+  for (const [k, v] of Object.entries(BUILTIN_NARRATOR)) narrMap[k] = { ...v, custom: false, dirty: false };
+  try {
+    for (const [k, v] of Object.entries((s.narrator_presets || {}))) {
+      if (v?.prompt) narrMap[k] = { label: (v.label || (BUILTIN_NARRATOR[k]?.label ?? k)), prompt: v.prompt, custom: !BUILTIN_NARRATOR[k], dirty: false };
+    }
+  } catch { /* ignore */ }
+  const narrOptions = () => Object.entries(narrMap).map(([k, v]) => [k, v.label + (k === "epique" ? " (défaut)" : "") + (v.custom ? " ⭐" : "")]);
+  const narrStyle = field("Style du narrateur", s.narrator_style || "epique", { type: "select", options: narrOptions() });
+  // live preview of the active style under the select
+  const stylePreview = el("p", { class: "style-preview" }, narrMap[narrStyle.input.value]?.prompt || "");
+  narrStyle.input.addEventListener("change", () => {
+    const p = narrMap[narrStyle.input.value];
+    stylePreview.textContent = p ? p.prompt : "";
   });
 
   const refreshModels = async () => {
@@ -1001,13 +1028,104 @@ async function renderSettings() {
     el("div", { class: "row" }, lmUrl.wrap, orKey.wrap),
     el("div", { class: "row" }, lmModel.wrap, orModel.wrap),
     el("div", { class: "row" }, llmTimeout.wrap),
+    stylePreview,
     el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "12px" } },
       "LM Studio : lance le serveur local (onglet Developer → Start Server, port 1234). OpenRouter : colle ta clé API — les deux peuvent être utilisés et le choix se fait au lancement de partie. Le style du narrateur s'applique aux nouvelles réponses.",
     ),
   ));
 
+  // ── Presets du narrateur (éditeur compact, replié par défaut) ──
+  const refreshNarrOptions = () => {
+    const cur = narrStyle.input.value;
+    narrStyle.input.replaceChildren(...narrOptions().map(([v, l]) => el("option", { value: v, ...(v === cur ? { selected: "" } : {}) }, l)));
+    const p = narrMap[cur];
+    if (stylePreview) stylePreview.textContent = p ? p.prompt : "";
+    if (editSelect) editSelect.input.replaceChildren(...narrOptions().map(([v, l]) => el("option", { value: v, ...(v === editKey ? { selected: "" } : {}) }, l)));
+  };
+  let editKey = s.narrator_style || "epique";
+  const editSelect = field("Narrateur à modifier", editKey, { type: "select", options: narrOptions() });
+  const renameInput = el("input", { class: "narr-label-input", placeholder: "Nouveau nom…", hidden: true });
+  const promptTa = el("textarea", { class: "narr-prompt-input", rows: 4, placeholder: "Instructions pour ce style de narrateur…" });
+  const dirtyFlag = el("span", { class: "narr-dirty", hidden: true }, "non enregistré");
+  const useKey = el("button", { class: "btn btn-ghost btn-sm", onclick: () => {
+    if (!narrMap[editKey]) return;
+    narrStyle.input.value = editKey;
+    refreshNarrOptions();
+    toast(`Style actif : ${narrMap[editKey].label} ✓`);
+  } }, "✓ Utiliser ce style");
+  const loadEdit = () => {
+    const p = narrMap[editKey];
+    if (!p) return;
+    promptTa.value = p.prompt;
+    renameInput.value = p.label;
+    renameInput.hidden = true;
+    dirtyFlag.hidden = !p.dirty;
+  };
+  editSelect.input.addEventListener("change", () => { editKey = editSelect.input.value; loadEdit(); });
+  promptTa.addEventListener("input", () => {
+    const p = narrMap[editKey]; if (!p) return;
+    p.prompt = promptTa.value; p.dirty = true;
+    dirtyFlag.hidden = false;
+    refreshNarrOptions();
+  });
+  renameInput.addEventListener("input", () => {
+    const p = narrMap[editKey]; if (!p) return;
+    p.label = renameInput.value.trim() || p.label; p.dirty = true;
+    dirtyFlag.hidden = false;
+    refreshNarrOptions();
+  });
+  const newPresetBtn = el("button", { class: "btn btn-ghost btn-sm", onclick: (e) => {
+    e.preventDefault(); e.stopPropagation();
+    let n = 1;
+    while (narrMap[`perso_${n}`]) n++;
+    narrMap[`perso_${n}`] = { label: `Personnalisé ${n}`, prompt: "Tu racontes avec un style unique à inventer.", custom: true, dirty: true };
+    editKey = `perso_${n}`;
+    refreshNarrOptions();
+    loadEdit();
+  } }, ICONS.plus, "Ajouter");
+  loadEdit();
+  container.append(el("div", { class: "section-title", id: "sec-narr" }, "Narrateurs"));
+  container.append(el("details", { class: "card narr-collapse" },
+    el("summary", { class: "narr-summary", title: "Cliquer pour déplier" },
+      el("span", { class: "narr-summary-main" },
+        "🎭 Presets du narrateur",
+        el("span", { class: "narr-count" }, String(Object.keys(narrMap).length) + " styles"),
+      ),
+      newPresetBtn,
+      el("span", { class: "narr-chev" }, "▾"),
+    ),
+    el("div", { class: "narr-editor" },
+      el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", margin: "6px 0 12px" } },
+        "Choisis un narrateur, modifie son texte (injecté dans le prompt système), renomme-le ou supprime-le. Les presets ⭐ sont les tiens ; les préréglages peuvent être modifiés puis réinitialisés.",
+      ),
+      el("div", { class: "row" }, editSelect.wrap, useKey),
+      el("div", { class: "narr-rename-row" },
+        renameInput,
+        el("button", { class: "mini-btn", title: "Renommer (Entrée pour valider)", onclick: () => {
+          renameInput.hidden = false;
+          renameInput.focus();
+          renameInput.select();
+        } }, "✏️ Renommer"),
+        el("button", { class: "mini-btn", title: "Restaurer le texte d'origine", onclick: () => {
+          if (BUILTIN_NARRATOR[editKey]) {
+            narrMap[editKey] = { ...BUILTIN_NARRATOR[editKey], custom: false, dirty: false };
+            loadEdit(); refreshNarrOptions();
+          }
+        } }, "↺ Réinitialiser"),
+        el("button", { class: "mini-btn", style: { color: "var(--danger)" }, title: "Supprimer ce preset", onclick: () => {
+          if (!narrMap[editKey]?.custom) return toast("Les presets de base ne se suppriment pas — modifie-les ou réinitialise-les.", "err");
+          delete narrMap[editKey];
+          editKey = "epique";
+          refreshNarrOptions(); loadEdit();
+        } }, ICONS.trash, "Supprimer"),
+        dirtyFlag,
+      ),
+      promptTa,
+    ),
+  ));
+
   // ── TTS ──
-  container.append(el("div", { class: "section-title" }, "Voix (TTS)"));
+  container.append(el("div", { class: "section-title", id: "sec-tts" }, "Voix (TTS)"));
   const ttsOn = checkbox("tts_enabled", s.tts_enabled !== false, "Activer la synthèse vocale");
   const ttsLang = field("Langue des voix", s.tts_language || "fr", { type: "select", options: [["fr", "Français"], ["en", "English"]] });
   const narrator = field("Voix du narrateur", s.tts_voice_narrateur || "jean", { type: "select", options: voicesOptions(ttsLang.input.value) });
@@ -1054,7 +1172,10 @@ async function renderSettings() {
     el("div", { class: "row" }, ttsOn.wrap, autoplay.wrap),
     el("div", { class: "row" }, ttsLang.wrap, lsd.wrap, maxSeg.wrap),
     el("div", { class: "row" }, narrator.wrap, defChar.wrap),
-    stripBox,
+    el("details", { class: "voice-collapse" },
+      el("summary", {}, "🎧 Écouter toutes les voix"),
+      stripBox,
+    ),
     el("div", { style: { marginTop: "14px" } },
       el("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
         try {
@@ -1067,7 +1188,7 @@ async function renderSettings() {
   ));
 
   // ── Images ──
-  container.append(el("div", { class: "section-title" }, "Images (Koji)"));
+  container.append(el("div", { class: "section-title", id: "sec-img" }, "Images (Koji)"));
   const imgSteps = field("Étapes de génération", s.image_steps || 28, { type: "number", min: 8, max: 60, step: 1 });
   const imgCfg = field("Guidance", s.image_cfg || 7, { type: "number", min: 3, max: 15, step: 0.5 });
   const imgRef = field("Fidélité au portrait (img2img)", s.image_ref_strength ?? 0.55, {
@@ -1093,7 +1214,7 @@ async function renderSettings() {
   ));
 
   // ── Apparence & sécurité ──
-  container.append(el("div", { class: "section-title" }, "Apparence & sécurité"));
+  container.append(el("div", { class: "section-title", id: "sec-app" }, "Apparence & sécurité"));
   const accentCur = localStorage.getItem("ai-rp-accent") || getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#ff7ad9";
   const accentWrap = el("label", { class: "fl-field" },
     el("input", { type: "color", value: accentCur }),
@@ -1133,7 +1254,7 @@ async function renderSettings() {
   ));
 
   // ── Backup / restore ──
-  container.append(el("div", { class: "section-title" }, "Sauvegarde"));
+  container.append(el("div", { class: "section-title", id: "sec-backup" }, "Sauvegarde"));
   const fileInput = el("input", { type: "file", accept: ".json,application/json", hidden: true });
   fileInput.addEventListener("change", async () => {
     const file = fileInput.files?.[0];
@@ -1172,7 +1293,7 @@ async function renderSettings() {
   ));
 
   // ── Stockage & backups auto ──
-  container.append(el("div", { class: "section-title" }, "Stockage & sauvegardes auto"));
+  container.append(el("div", { class: "section-title", id: "sec-storage" }, "Stockage & sauvegardes auto"));
   const storageCard = el("div", { class: "card", style: { padding: "18px 22px" } }, el("div", { class: "storage-line" }, "⏳ lecture du disque…"));
   const renderStorage = async () => {
     try {
@@ -1210,7 +1331,7 @@ async function renderSettings() {
   renderStorage();
   container.append(storageCard);
 
-  container.append(el("div", { style: { marginTop: "24px", display: "flex", justifyContent: "flex-end" } },
+  container.append(el("div", { class: "settings-save" },
     el("button", { class: "btn btn-primary", style: { padding: "12px 30px" }, onclick: async () => {
       try {
         await api("/api/settings", {
@@ -1222,6 +1343,9 @@ async function renderSettings() {
             openrouter_key: orKey.input.value.trim(),
             openrouter_model: orModel.input.value.trim(),
             narrator_style: narrStyle.input.value,
+            narrator_presets: Object.fromEntries(
+              Object.entries(narrMap).map(([k, v]) => [k, { label: v.label, prompt: v.prompt }]),
+            ),
             tts_enabled: ttsOn.input.checked,
             tts_language: ttsLang.input.value,
             tts_voice_narrateur: narrator.input.value,

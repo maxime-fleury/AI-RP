@@ -556,17 +556,17 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
 .fl-field { position: relative; display: block; margin: 0; text-transform: none; letter-spacing: normal; font-weight: 400; font-size: inherit; }
 .fl-field > input, .fl-field > select, .fl-field > textarea { padding: 22px 12px 8px; min-height: 47px; }
 .fl-field > textarea { padding-top: 24px; }
+/* floating labels are ALWAYS floated (labels stay readable above the input
+   whatever its state; placeholders fill the field); focus only changes color */
 .fl-label {
-  position: absolute; left: 13px; top: 23px; z-index: 1; pointer-events: none;
+  position: absolute; left: 13px; top: 7px; z-index: 1; pointer-events: none;
   max-width: calc(100% - 26px); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  font-size: 13.5px; font-weight: 500; letter-spacing: normal; text-transform: none; color: var(--text-dim);
-  transition: top .16s ease, font-size .16s ease, color .16s ease;
+  font-size: 10px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--text-dim);
+  transition: color .16s ease;
 }
-.fl-field > :focus ~ .fl-label,
-.fl-field > input:not(:placeholder-shown) ~ .fl-label,
-.fl-field > textarea:not(:placeholder-shown) ~ .fl-label,
-.fl-field > select ~ .fl-label {
-  top: 7px; font-size: 10px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; color: var(--accent);
+.fl-field > :focus ~ .fl-label {
+  color: var(--accent);
 }
 
 /* ─── AI scenario generation ─────────────────────────────────────────────── */
@@ -937,3 +937,98 @@ body.custom-bg {
 .onb-line .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; }
 .onb-link { font-weight: 700; }
 .onb-cta { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; padding: 8px 26px 26px; }
+
+/* ─── narrator preset manager (settings) ─────────────────────────────────── */
+.narr-presets { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+.narr-preset {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 12px 14px;
+  background: rgba(255,255,255,.03);
+}
+.narr-preset.custom { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent); }
+.narr-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.narr-head strong { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); font-family: ui-monospace, monospace; }
+.narr-dirty { font-size: 10.5px; color: var(--warn, #f1c40f); font-style: italic; }
+.narr-fields { display: flex; flex-direction: column; gap: 8px; }
+.narr-label-input, .narr-prompt-input {
+  width: 100%; box-sizing: border-box;
+  background: var(--input-bg); border: 1px solid var(--border); border-radius: 10px;
+  color: var(--text); padding: 9px 12px; font-size: 13px; line-height: 1.5;
+  resize: vertical;
+}
+.narr-label-input:focus, .narr-prompt-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+.narr-label-input { max-width: 260px; font-weight: 600; }
+
+/* ─── settings page polish ────────────────────────────────────────────────── */
+.settings-toc {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  margin: 4px 0 18px;
+  position: sticky; top: 10px; z-index: 5;
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--bg, #0d0a18) 82%, transparent);
+  backdrop-filter: blur(10px);
+  border-radius: 14px;
+  border: 1px solid var(--border);
+}
+.style-preview {
+  margin: 10px 2px 0;
+  padding: 9px 13px;
+  border-left: 3px solid var(--accent);
+  background: rgba(255,255,255,.03);
+  border-radius: 0 10px 10px 0;
+  font-size: 12.5px; font-style: italic; color: var(--text-dim);
+  line-height: 1.5;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.settings-save {
+  margin-top: 24px; display: flex; justify-content: flex-end;
+  position: sticky; bottom: 14px; z-index: 5;
+  pointer-events: none;
+}
+.settings-save .btn { pointer-events: auto; box-shadow: 0 8px 28px rgba(0,0,0,.45); }
+
+/* narrator preset editor (collapsed card) */
+.narr-collapse { padding: 0 !important; overflow: hidden; }
+.narr-summary {
+  display: flex; align-items: center; gap: 10px;
+  padding: 15px 18px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.narr-summary::-webkit-details-marker { display: none; }
+.narr-summary:hover { background: rgba(255,255,255,.03); }
+.narr-summary-main { display: flex; align-items: baseline; gap: 10px; font-weight: 700; }
+.narr-count {
+  font-size: 11px; font-weight: 600; color: var(--text-dim);
+  background: rgba(255,255,255,.06); border: 1px solid var(--border);
+  padding: 2px 9px; border-radius: 99px;
+}
+.narr-chev { margin-left: auto; color: var(--text-dim); transition: transform .2s ease; }
+.narr-collapse[open] .narr-chev { transform: rotate(180deg); }
+.narr-collapse[open] .narr-summary { border-bottom: 1px solid var(--border); }
+.narr-editor { padding: 16px 18px 18px; display: flex; flex-direction: column; gap: 12px; }
+.narr-rename-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.narr-label-input {
+  max-width: 260px; box-sizing: border-box;
+  background: var(--input-bg); border: 1px solid var(--border); border-radius: 10px;
+  color: var(--text); padding: 8px 12px; font-size: 13px; font-weight: 600;
+}
+.narr-prompt-input {
+  width: 100%; box-sizing: border-box;
+  background: var(--input-bg); border: 1px solid var(--border); border-radius: 10px;
+  color: var(--text); padding: 10px 12px; font-size: 13px; line-height: 1.55;
+  resize: vertical;
+}
+.narr-label-input:focus, .narr-prompt-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+.voice-collapse { border: 1px dashed var(--border); border-radius: 12px; margin-top: 14px; }
+.voice-collapse summary {
+  padding: 10px 14px; cursor: pointer; list-style: none;
+  font-size: 13px; font-weight: 600; color: var(--text-dim);
+  display: flex; align-items: center; gap: 8px;
+}
+.voice-collapse summary::-webkit-details-marker { display: none; }
+.voice-collapse summary:hover { color: var(--text); }
+.voice-collapse[open] summary { border-bottom: 1px dashed var(--border); }
+.voice-collapse .voice-samples { padding: 12px 14px; margin: 0; }

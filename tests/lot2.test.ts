@@ -45,3 +45,31 @@ describe("features: storage / backup / context budget / img2img request", async 
   // (img2img is integration-tested live: the route spawns the real Python
   // sidecar, which would hang a unit test for minutes)
 });
+describe("narrator presets", async () => {
+  const { db, prompt } = await loadApp();
+
+  test("built-ins resolve; overrides + custom keys win", () => {
+    // default: 6 built-ins
+    const defs = prompt.narratorPresets();
+    expect(Object.keys(defs).length).toBe(6);
+    expect(defs.nagatoro.custom).toBe(false);
+
+    // override a built-in prompt + add a custom key
+    db.setSetting("narrator_presets", {
+      epique: { label: "Épique", prompt: "Prompt modifié par l'utilisateur." },
+      sombre: { label: "Sombre", prompt: "Tout est gris et lourd." },
+    });
+    const merged = prompt.narratorPresets();
+    expect(merged.epique.prompt).toBe("Prompt modifié par l'utilisateur.");
+    expect(merged.epique.custom).toBe(false); // still a built-in → resettable
+    expect(merged.sombre.custom).toBe(true);
+    expect(merged.neutre.prompt.length).toBeGreaterThan(0); // unaffected
+  });
+
+  test("system prompt embeds the active preset text", () => {
+    db.setSetting("narrator_style", "sombre");
+    const conv = db.createConversation({ title: "C" });
+    const sys = prompt.buildSystemPrompt({ world: null, persona: null, cards: [], scenario: null, conversation: conv });
+    expect(sys).toContain("Tout est gris et lourd.");
+  });
+});

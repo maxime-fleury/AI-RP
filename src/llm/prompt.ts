@@ -5,6 +5,49 @@
 import type { CardRow, ConversationRow, MessageRow, PersonaRow, ScenarioRow, WorldRow } from "../server/db";
 import { getSetting } from "../server/db";
 
+export interface NarratorPreset {
+  label: string;
+  prompt: string;
+  /** false = built-in (re-editable, resettable); true = created by the user. */
+  custom: boolean;
+}
+
+const BUILTIN_NARRATOR_PRESETS: Record<string, Omit<NarratorPreset, "custom">> = {
+  neutre: { label: "Neutre", prompt: "Sobre, direct et factuel : tu décris sans t'impliquer." },
+  epique: { label: "Épique", prompt: "Grandiose, lyrique et dramatique : chaque scène devient une épopée." },
+  sarcastique: { label: "Sarcastique", prompt: "Sarcastique et mordant : tu commentes les actions du joueur avec ironie et piques bien placées." },
+  cynique: { label: "Cynique", prompt: "Cynique et désabusé : le monde est dur, injuste, et tu le fais sentir à chaque phrase." },
+  en_colere: { label: "En colère", prompt: "En colère : la narration est tendue, brutale, presque rageuse. Les descriptions frappent fort." },
+  nagatoro: { label: "Nagatoro (taquin)", prompt: "Taquin et espiègle, comme Nagatoro : tu provoques gentiment le joueur avec des piques affectueuses, un sourire malicieux et beaucoup d'assurance." },
+};
+
+/**
+ * All narrator presets: built-ins seeded with their defaults, overridden or
+ * extended by the user's `narrator_presets` setting (key → { label, prompt },
+ * plus custom keys). The system prompt resolves the active style by key.
+ */
+export function narratorPresets(): Record<string, NarratorPreset> {
+  const out: Record<string, NarratorPreset> = {};
+  for (const [k, v] of Object.entries(BUILTIN_NARRATOR_PRESETS)) {
+    out[k] = { ...v, custom: false };
+  }
+  try {
+    const overrides = (getSetting("narrator_presets", {}) ?? {}) as Record<string, Partial<NarratorPreset>>;
+    for (const [k, v] of Object.entries(overrides)) {
+      if (!v?.prompt) continue;
+      const builtin = k in BUILTIN_NARRATOR_PRESETS;
+      out[k] = {
+        label: v.label?.trim() || (builtin ? out[k].label : k),
+        prompt: v.prompt.trim(),
+        custom: !builtin,
+      };
+    }
+  } catch {
+    /* malformed setting → fall back to built-ins */
+  }
+  return out;
+}
+
 export interface CastContext {
   world?: WorldRow | null;
   persona?: PersonaRow | null;
@@ -33,17 +76,11 @@ export function buildSystemPrompt(ctx: CastContext): string {
     );
   }
 
-  // narrator voice preset (settings) — overrides the world narration style
-  const NARRATOR_STYLES: Record<string, string> = {
-    neutre: "Sobre, direct et factuel : tu décris sans t'impliquer.",
-    epique: "Grandiose, lyrique et dramatique : chaque scène devient une épopée.",
-    sarcastique: "Sarcastique et mordant : tu commentes les actions du joueur avec ironie et piques bien placées.",
-    cynique: "Cynique et désabusé : le monde est dur, injuste, et tu le fais sentir à chaque phrase.",
-    en_colere: "En colère : la narration est tendue, brutale, presque rageuse. Les descriptions frappent fort.",
-    nagatoro: "Taquin et espiègle, comme Nagatoro : tu provoques gentiment le joueur avec des piques affectueuses, un sourire malicieux et beaucoup d'assurance.",
-  };
+  // narrator voice preset (settings) — overrides the world narration style.
+  // Presets live in narrator_presets (settings) : custom keys + overrides of
+  // the built-ins, seeded with the defaults below.
   const styleKey = String(getSetting("narrator_style", "epique"));
-  const styleDesc = NARRATOR_STYLES[styleKey] ?? NARRATOR_STYLES.epique;
+  const styleDesc = narratorPresets()[styleKey]?.prompt ?? narratorPresets().epique.prompt;
   parts.push(`## Style du narrateur\n${styleDesc}\n`);
 
   if (persona) {
