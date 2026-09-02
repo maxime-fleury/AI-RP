@@ -76,7 +76,11 @@ PORT=3210 bun src/index.ts
 - **Contexte** : tours gardés en mémoire configurables par partie, avec un **cap
   global par monde** (Réglages du monde) pour protéger les petits modèles ;
   budget tokens ≈ affiché dans les réglages de partie (source : partie/monde).
-- **Sauvegarde** : backup SQLite automatique chaque jour (`data/backups/`, 7
+- **Reprise (Previously on…)** : quand tu rouvres une partie restée en pause, un
+  bandeau propose (ou affiche) le récap de la session précédente écrit par le
+  narrateur, avec un storyboard de 1 à 3 scènes générées par Koji en arrière-
+  plan (défilement en direct). Le récap est aussi injecté dans le prompt pour
+  garder la mémoire entre les sessions.- **Sauvegarde** : backup SQLite automatique chaque jour (`data/backups/`, 7
   jours de rotation), backup manuel + état du disque (illustrations/base)
   dans Réglages → Stockage, en plus de l'export/restauration JSON.
 

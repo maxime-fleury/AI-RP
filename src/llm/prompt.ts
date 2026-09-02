@@ -286,6 +286,18 @@ export function buildSystemPrompt(ctx: CastContext): string {
     }
   } catch { /* ignore */ }
 
+  // session recap ("Previously on…"): the model-written summary of the last
+  // session (see POST …/recap), injected so cross-session context survives even
+  // when the kept history window can't hold the whole story
+  try {
+    const cs = JSON.parse(ctx.conversation.settings || "{}");
+    const recap = cs.recap;
+    if (recap && typeof recap.text === "string" && recap.text.trim()) {
+      const label = recap.title ? ` (${String(recap.title).trim()})` : "";
+      parts.push(`## Récap de la session précédente${label}\n${recap.text.trim()}\n`);
+    }
+  } catch { /* ignore */ }
+
   // time loops (RE:ZERO sliders): the narrator may keep a condensed memory of
   // rewound stretches, and/or the player persona may be aware of the loops
   try {

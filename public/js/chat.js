@@ -17,6 +17,27 @@ let selectionMode = false;
 const selectedIds = new Set();
 let selectionBarRef = null; // wired by renderChat
 let selectionExitRef = null; // wired by renderChat (the ☑ button)
+// "Previously on…" recap banner (module-level: one chat open at a time)
+let recapBanner = null; // { node, timer, commit }
+function clearRecapBanner() {
+  // teardown/re-render: stop polling and drop the node WITHOUT a "seen" commit,
+  // so the banner may come back when the conversation is reopened
+  if (recapBanner?.timer) clearInterval(recapBanner.timer);
+  recapBanner = null;
+}
+function dismissRecapBanner() {
+  // the player acted (✕ or sent a message): commit "seen"/"asked" markers
+  const b = recapBanner;
+  clearRecapBanner();
+  b?.commit?.();
+  b?.node?.remove();
+}
+function recapLocal(convId) {
+  try { return JSON.parse(localStorage.getItem("innsekai.recap." + convId) || "{}") || {}; } catch { return {}; }
+}
+function recapSaveLocal(convId, patch) {
+  try { localStorage.setItem("innsekai.recap." + convId, JSON.stringify({ ...recapLocal(convId), ...patch })); } catch { /* private mode */ }
+}
 function paintSelectionBar() {
   const bar = selectionBarRef;
   if (!bar) return;
@@ -80,6 +101,7 @@ async function dmSave(convId, dm, pending) {
 }
 // ─── render ───────────────────────────────────────────────────────────────────
 export async function renderChat(convIdRaw) {
+  clearRecapBanner(); // a new render supersedes any previous recap banner/poll
   // support #/chat/new?world=&scenario=
   if (convIdRaw === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
@@ -437,16 +459,143 @@ export async function renderChat(convIdRaw) {
   };
   paintThread();
   initMiniSheets(scroll);
-  // resume banner: when reopening a long game, show where the story stopped
+  // ── "Previously on…" banner ──
+  // On reopening a party after an idle break, surface the recap of the last
+  // session (with its storyboard) if one is stored and not yet seen; otherwise,
+  // if enough new story accumulated since the last recap, offer to generate
+  // one. Falls back to the chapter stop-marker banner when there is nothing to
+  // recap.
   let cs0 = {};
   try { cs0 = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
   const chapters0 = Array.isArray(cs0.chapters) ? cs0.chapters : [];
-  if (chapters0.length) {
+  const recap0 = cs0.recap && typeof cs0.recap === "object" && !Array.isArray(cs0.recap) ? cs0.recap : null;
+  const story0 = (conv.messages || []).filter((m) => !m.meta?.chapter && !m.meta?.rewind);
+  const lastStory0 = story0[story0.length - 1] || null;
+  const RECAP_MIN_NEW = 6; // keep in sync with the server (RECAP_MIN_MESSAGES)
+  const RECAP_IDLE_MS = 10 * 60 * 1000; // an idle party = a "session break"
+  const sinceId0 = recap0?.last_msg_id || 0;
+  const fresh0 = story0.filter((m) => m.id > sinceId0).length;
+  const lastId0 = lastStory0?.id || 0;
+  const local0 = recapLocal(conv.id);
+  let recapMode = null; // "show" (stored recap not seen yet) | "ask" (offer to generate)
+  if (recap0 && recap0.at !== local0.seenAt) recapMode = "show";
+  else if (fresh0 >= RECAP_MIN_NEW && lastStory0 && Date.now() - lastStory0.created_at >= RECAP_IDLE_MS && lastId0 > (local0.askFromId || 0)) recapMode = "ask";
+  if (!recapMode && chapters0.length) {
     const last = chapters0[chapters0.length - 1];
     scroll.insertBefore(el("div", { class: "chapter-resume" },
       el("strong", {}, `📖 Chapitre ${last.n} — ${esc(last.title || "")}`),
       el("p", {}, esc(last.summary || "")),
     ), toBottom);
+  }
+  if (recapMode) {
+    let data = recapMode === "show" ? recap0 : null;
+    let generating = false;
+    const banner = el("div", { class: "recap-banner" });
+    const contentEl = el("div", { class: "recap-content" });
+    banner.append(contentEl);
+    const closeBtn = (title) => el("button", { class: "btn btn-ghost btn-icon", title, onclick: dismissRecapBanner }, "✕");
+    const idleNote = () => {
+      const t = timeAgo(lastStory0.created_at);
+      const base = `La partie s'est arrêtée ${t || "récemment"}`;
+      if (fresh0 <= 0) return base + ".";
+      return `${base} — ${fresh0} nouveau${fresh0 > 1 ? "x" : ""} message${fresh0 > 1 ? "s" : ""} depuis le dernier récap.`;
+    };
+    const shotCard = (s) => {
+      const fig = (mid, ...kids) => el("figure", { class: "recap-shot" }, mid, el("figcaption", { class: "shot-cap" }, esc(s.caption || "")));
+      if (s.status === "done" && s.image) {
+        return fig(el("img", { src: s.image, alt: s.caption || "", loading: "lazy" }));
+      }
+      if (s.status === "pending") return fig(el("div", { class: "shot-pending" }, "🎨", "Storyboard en cours…"));
+      return fig(el("div", { class: "shot-err" },
+        "🎨 échec",
+        el("button", { class: "mini-btn", title: "Relancer la génération", onclick: async (e) => {
+          e.target.disabled = true;
+          try { await api(`/api/conversations/${conv.id}/recap/shots`, { method: "POST", body: {} }); } catch { /* will retry via poll */ }
+          e.target.disabled = false;
+          startPoll();
+        } }, "↻ Réessayer"),
+      ));
+    };
+    const paint = () => {
+      if (!data) {
+        contentEl.replaceChildren(
+          el("div", { class: "recap-head" },
+            el("span", { class: "recap-icon" }, "🎬"),
+            el("div", { class: "grow" },
+              el("strong", {}, generating ? "Le narrateur résume la session…" : "Reprendre la partie"),
+              el("small", {}, generating ? "Écriture du « Previously on… » (quelques secondes)." : idleNote()),
+            ),
+            closeBtn("Fermer"),
+          ),
+          el("div", { class: "recap-actions" },
+            generating
+              ? el("span", { class: "recap-busy" }, "⏳ Écriture en cours…")
+              : el("button", { class: "btn btn-primary btn-sm", onclick: askRecap }, "✨ Générer le récap"),
+            generating ? null : el("span", { class: "hint" }, "Résumé narratif du narrateur + storyboard illustré (1 à 3 scènes)."),
+          ),
+        );
+        return;
+      }
+      const shots = Array.isArray(data.shots) ? data.shots : [];
+      contentEl.replaceChildren(
+        el("div", { class: "recap-head" },
+          el("span", { class: "recap-icon" }, "🎬"),
+          el("div", { class: "grow" },
+            el("strong", {}, `Previously on… — ${esc(data.title || "Partie")}`),
+            el("small", {}, timeAgo(data.at) || "Session précédente"),
+          ),
+          closeBtn("Fermer"),
+        ),
+        el("p", { class: "recap-text" }, esc(data.text || "")),
+        shots.length ? el("div", { class: "recap-shots" }, ...shots.map(shotCard)) : null,
+      );
+    };
+    const startPoll = () => {
+      if (recapBanner?.timer) clearInterval(recapBanner.timer);
+      const timer = setInterval(async () => {
+        if (recapBanner?.node !== banner || !banner.isConnected) { clearInterval(timer); if (recapBanner?.node === banner) recapBanner = null; return; }
+        try {
+          const r = await api(`/api/conversations/${conv.id}/recap`);
+          const d = r.recap;
+          if (!d) return;
+          data = d;
+          paint();
+          const shots = Array.isArray(d.shots) ? d.shots : [];
+          if (!shots.some((s) => s.status === "pending")) { clearInterval(timer); if (recapBanner) recapBanner.timer = null; }
+        } catch { /* offline — keep polling */ }
+      }, 6000);
+      if (recapBanner) recapBanner.timer = timer;
+    };
+    const askRecap = async () => {
+      generating = true;
+      paint();
+      try {
+        const r = await api(`/api/conversations/${conv.id}/recap`, { method: "POST", body: {} });
+        if (!r.created) {
+          generating = false;
+          paint();
+          toast(r.reason === "threshold" ? "Pas encore assez de messages pour un récap." : (r.error || "Récap indisponible."), "warn");
+          return;
+        }
+        data = r.recap;
+        generating = false;
+        cs0.recap = r.recap; // keep the local conversation state coherent
+        paint();
+        if ((data.shots || []).some((s) => s.status === "pending")) startPoll();
+      } catch (e) {
+        generating = false;
+        paint();
+        toast(e.message || "Échec du récap.", "err");
+      }
+    };
+    const commit = () => {
+      if (data) recapSaveLocal(conv.id, { seenAt: data.at, askFromId: 0 });
+      else recapSaveLocal(conv.id, { askFromId: lastId0 || Date.now() });
+    };
+    scroll.insertBefore(banner, toBottom);
+    recapBanner = { node: banner, timer: null, commit };
+    paint();
+    if (data && (data.shots || []).some((s) => s.status === "pending")) startPoll();
   }
 
   // composer
@@ -839,6 +988,7 @@ export async function renderChat(convIdRaw) {
 // ─── streaming a turn ─────────────────────────────────────────────────────────
 async function doStream(content, opts = {}) {
   if (!currentConversation || !currentCtx) return;
+  dismissRecapBanner(); // the player is playing on — the "Previously on…" has served its purpose
   const { scroll, textarea, sendBtn, stopBtn } = currentCtx;
   busy = true;
   sendBtn.disabled = true;

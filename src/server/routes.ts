@@ -973,6 +973,57 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       console.log(`[chapters] 📖 Chapitre ${n} « ${proposed.title} » — ${fresh.length} messages`);
       return json({ created: true, chapter: { n, title: proposed.title, summary: proposed.summary }, marker: messageView(marker) });
     }
+    // session recap ("Previously on…"): GET returns the stored recap, POST
+    // writes a fresh one once enough story accumulated since the last recap,
+    // POST …/recap/shots re-queues the storyboard rendering of the current one
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "recap" && parts[4] === "shots" && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const { cs, recap } = recapOf(conv);
+      if (!recap) return json({ created: false, reason: "no-recap" });
+      let queued = 0;
+      for (const s of recap.shots ?? []) {
+        if (s.status !== "done") { s.status = "pending"; delete s.error; queued++; }
+      }
+      if (queued) {
+        cs.recap = recap;
+        updateConversation(conv.id, { settings: JSON.stringify(cs) });
+        void renderRecapShots(conv.id).catch((e) => console.warn("[recap] images:", String(e?.message ?? e).slice(0, 160)));
+      }
+      return json({ ok: true, queued, recap });
+    }
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "recap" && method === "GET") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      return json({ recap: recapOf(conv).recap });
+    }
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "recap" && !parts[4] && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const { cs, recap } = recapOf(conv);
+      const sinceId = Number(recap?.last_msg_id ?? 0);
+      const fresh = storyMessages(listMessages(conv.id)).filter((m) => m.id > sinceId);
+      if (fresh.length < RECAP_MIN_MESSAGES) {
+        return json({ created: false, reason: "threshold", needed: RECAP_MIN_MESSAGES, have: fresh.length });
+      }
+      const proposed = await suggestRecap(conv.title || "Partie", fresh);
+      if (!proposed) {
+        return json({ created: false, error: "Le récap n'a pas pu être rédigé — vérifie la connexion au modèle." }, 502);
+      }
+      const data: RecapData = {
+        title: proposed.title,
+        text: proposed.text,
+        at: Date.now(),
+        last_msg_id: fresh[fresh.length - 1].id,
+        shots: proposed.shots.map((s) => ({ caption: s.caption, prompt: s.prompt, status: "pending" as const })),
+      };
+      cs.recap = data;
+      updateConversation(conv.id, { settings: JSON.stringify(cs) });
+      console.log(`[recap] 🎬 « ${data.title} » (#${conv.id}) — ${fresh.length} messages, ${data.shots.length} shot(s)`);
+      // storyboard rendering runs in the background — never blocks the response
+      void renderRecapShots(conv.id).catch((e) => console.warn("[recap] images:", String(e?.message ?? e).slice(0, 160)));
+      return json({ created: true, recap: data });
+    }
     // dynamic NPCs: suggest secondary characters from the recent fiction
     // (POST .../npcs/suggest), then add an approved one to the cast
     if (parts[1] === "conversations" && parts[2] && parts[3] === "npcs" && parts[4] === "suggest" && method === "POST") {
@@ -2203,6 +2254,114 @@ async function suggestChapter(title: string, msgs: MessageRow[]): Promise<{ titl
   const t = String(p?.title ?? "").trim().slice(0, 80);
   const s = String(p?.summary ?? "").trim().slice(0, 1200);
   return t && s ? { title: t, summary: s } : null;
+}
+
+// ─── session recap ("Previously on…") ────────────────────────────────────────
+// When a party is reopened after an idle break with enough new story since the
+// last recap, the narrator writes a short recap and proposes a 1-3 shot
+// storyboard. The recap lives in conversation settings (settings.recap) — never
+// in the message list — so no message-level logic needs to know about it; it is
+// injected into the system prompt (buildSystemPrompt « Récap de la session
+// précédente ») so cross-session context survives the context window. The
+// storyboard PNGs are rendered in the background by the local Koji pipeline
+// (deterministic seeds → GPU cache) and stored on each shot as they finish.
+const RECAP_MIN_MESSAGES = 6; // story messages since the last recap
+const RECAP_MAX_SHOTS = 3;
+
+type RecapShot = { caption: string; prompt: string; image?: string; seed?: number; status: "pending" | "done" | "error"; error?: string };
+type RecapData = { title: string; text: string; at: number; last_msg_id: number; shots: RecapShot[] };
+
+function recapOf(conv: ConversationRow): { cs: any; recap: RecapData | null } {
+  let cs: any = {};
+  try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  const r = cs.recap;
+  return { cs, recap: r && typeof r === "object" && !Array.isArray(r) ? r : null };
+}
+
+/** Messages that belong to the story (display-only markers such as chapters or rewind notes excluded). */
+function storyMessages(msgs: MessageRow[]): MessageRow[] {
+  return msgs.filter((m) => {
+    try { const meta = JSON.parse(m.meta || "{}"); return !meta.chapter && !meta.rewind; } catch { return true; }
+  });
+}
+
+async function suggestRecap(title: string, msgs: MessageRow[]): Promise<{ title: string; text: string; shots: { caption: string; prompt: string }[] } | null> {
+  const sys = [
+    `Tu es le narrateur d'un roleplay « ${title.slice(0, 60)} ». La session précédente vient de s'arrêter ; le joueur va reprendre la partie.`,
+    "Rédige le « Previously on… » : un résumé court et vivant qui replace le joueur dans l'histoire.",
+    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : {"title":"titre court de la session (2-5 mots)","recap":"résumé narratif de 4 à 8 phrases, au présent, à la voix du narrateur : ce qui s\'est passé, où l\'on en est, les enjeux restés ouverts","shots":[{"caption":"légende française du moment clé, une phrase","prompt":"prompt d\'illustration en anglais, tags danbooru pour un modèle anime : sujet, décor, lumière, composition — jamais de texte ni de mot français"}]}.',
+    `1 à ${RECAP_MAX_SHOTS} shots au maximum, pour des scènes PAYSAGE larges et visuelles ; chaque prompt décrit un moment précis et auto-suffisant, pas un plan abstrait.`,
+    "Ne mentionne jamais l'IA, l'assistant ni le mot récap. JSON complet, non tronqué.",
+  ].join(" ");
+  const p = await llmJson(transcriptFor(msgs, 120), sys, 1400, 0.8);
+  const t = String(p?.title ?? "").trim().slice(0, 100);
+  const text = String(p?.recap ?? p?.text ?? "").trim().slice(0, 2000);
+  if (!t || !text) return null;
+  const shots = Array.isArray(p?.shots)
+    ? p.shots
+        .map((s: any) => ({
+          caption: String(s?.caption ?? "").trim().slice(0, 200),
+          prompt: String(s?.prompt ?? "").trim().slice(0, 900),
+        }))
+        .filter((s) => s.caption && s.prompt)
+        .slice(0, RECAP_MAX_SHOTS)
+    : [];
+  return { title: t, text, shots };
+}
+
+/** Deterministic per conversation+shot seed, so re-renders hit the image cache. */
+function recapShotSeed(convId: number, i: number): number {
+  const x = Math.imul(convId + 1, 2654435761) ^ Math.imul(i + 1, 40503);
+  return (x >>> 0) % 2_147_483_647;
+}
+
+/**
+ * Render the storyboard of the current recap in the background, one shot at a
+ * time (the GPU is shared with scene illustrations). Each finished shot is
+ * persisted into settings.recap so the UI can poll GET …/recap for progress.
+ * Never throws: shot-level failures are recorded on the shot itself.
+ */
+async function renderRecapShots(convId: number): Promise<void> {
+  const conv = getConversation(convId);
+  if (!conv) return;
+  const { recap } = recapOf(conv);
+  if (!recap || !Array.isArray(recap.shots)) return;
+  if (!recap.shots.some((s) => s.status !== "done")) return;
+  const steps = Number(getSetting("image_steps", 28));
+  const cfg = Number(getSetting("image_cfg", 7));
+  let i = 0;
+  for (const shot of recap.shots) {
+    const idx = i++;
+    if (shot.status === "done") continue;
+    shot.status = "pending"; // (re)queued — also covers the retry endpoint
+    try {
+      const res = await generateAndSave(`conversations/${convId}`, {
+        prompt: `masterpiece, best quality, anime illustration, highly detailed, vibrant colors, ${shot.prompt.trim()}`,
+        negative: NEGATIVE_PROMPT,
+        steps, cfg,
+        width: 1152, height: 768, // storyboard shots are landscape
+        seed: recapShotSeed(convId, idx),
+      });
+      shot.image = res.url;
+      shot.seed = res.seed;
+      shot.status = "done";
+      delete shot.error;
+      console.log(`[recap] 🎨 shot ${idx + 1}/${recap.shots.length} (#${convId}) ok`);
+    } catch (e) {
+      shot.status = "error";
+      shot.error = String(e?.message ?? e).slice(0, 200);
+      console.warn(`[recap] shot ${idx + 1}/${recap.shots.length} (#${convId}) échec: ${shot.error}`);
+    }
+    // persist — but only if the recap hasn't been replaced meanwhile
+    const cur = getConversation(convId);
+    if (!cur) return; // conversation deleted mid-render
+    const curR = recapOf(cur);
+    if (curR.recap && curR.recap.at === recap.at && Array.isArray(curR.recap.shots) && curR.recap.shots[idx]) {
+      Object.assign(curR.recap.shots[idx], shot);
+      curR.cs.recap = curR.recap;
+      updateConversation(convId, { settings: JSON.stringify(curR.cs) });
+    }
+  }
 }
 
 async function suggestNpcs(conv: ConversationRow, msgs: MessageRow[]): Promise<NpcSuggestion[]> {
