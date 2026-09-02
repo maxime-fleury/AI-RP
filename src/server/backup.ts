@@ -132,15 +132,15 @@ export function runBackup(force = false): string | null {
   const dest = path.join(BACKUPS_DIR, `app-${stamp}.db`);
   if (fs.existsSync(dest) && !force) return null;
   try {
-    // flush the WAL into the main DB so the copy is complete even mid-write
-    try { db.query("PRAGMA wal_checkpoint(TRUNCATE)").get(); } catch { /* busy — proceed */ }
-    // atomic: write a temp file, then rename over the destination
+    // VACUUM INTO writes a consistent snapshot (committed WAL data included)
+    // into a fresh file, so a busy/locked live connection can never yield a
+    // truncated backup. Write to a temp file, then rename atomically.
     const tmp = dest + ".tmp";
-    fs.copyFileSync(DB_PATH, tmp);
+    db.exec(`VACUUM INTO '${tmp.replace(/'/g, "''")}'`);
     fs.renameSync(tmp, dest);
     // checksum sidecar so a restore can verify integrity
     const hasher = new Bun.CryptoHasher("sha256");
-    hasher.update(fs.readFileSync(DB_PATH));
+    hasher.update(fs.readFileSync(dest));
     fs.writeFileSync(dest + ".sha256", hasher.digest("hex"));
   } catch (e) {
     console.error("[backup] failed:", e);
@@ -154,6 +154,7 @@ export function runBackup(force = false): string | null {
     .reverse();
   for (const f of files.slice(KEEP)) {
     try { fs.unlinkSync(path.join(BACKUPS_DIR, f)); } catch { /* ignore */ }
+    try { fs.unlinkSync(path.join(BACKUPS_DIR, f + ".sha256")); } catch { /* ignore */ }
   }
   console.log(`[backup] saved ${path.basename(dest)}`);
   return dest;

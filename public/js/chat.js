@@ -1,6 +1,6 @@
 import { api, apiFetch, readSseStream } from "./api.js?v=45";
 import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=45";
-import { store, refreshAll, navigate, applyTheme } from "./app.js?v=45";
+import { store, refreshAll, refreshConversations, navigate, applyTheme } from "./app.js?v=45";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -2170,7 +2170,9 @@ async function npcSuggestModal() {
 
 function scrollToBottom(scroll, force = false) {
   requestAnimationFrame(() => {
-    scroll.scrollTop = scroll.scrollHeight;
+    if (force || scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 180) {
+      scroll.scrollTop = scroll.scrollHeight;
+    }
   });
 }
 

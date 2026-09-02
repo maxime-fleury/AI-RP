@@ -1634,7 +1634,7 @@ function cardModal(existing) {
   let lastSeed = null;
   let genBusy = false;
   let everGen = false;
-  avatarInput.addEventListener("change", () => { const file = avatarInput.files?.[0]; if (!file || file.size > 5 * 1024 * 1024) return toast("Avatar limité à 5 Mo", "err"); const reader = new FileReader(); reader.onload = () => { avatarData = String(reader.result); avatarServer = null; lastSeed = null; sameSeedBtn.hidden = true; varyBtn.hidden = true; avatarStatus.textContent = ""; avatarPreview.replaceWith(el("img", { src: avatarData, class: "avatar avatar-lg" })); updatePreview(); }; reader.readAsDataURL(file); });
+  avatarInput.addEventListener("change", () => { const file = avatarInput.files?.[0]; if (!file || file.size > 5 * 1024 * 1024) return toast("Avatar limité à 5 Mo", "err"); const reader = new FileReader(); reader.onload = () => { avatarData = String(reader.result); avatarServer = null; lastSeed = null; sameSeedBtn.hidden = true; varyBtn.hidden = true; avatarStatus.textContent = ""; const next = el("img", { src: avatarData, class: "avatar avatar-lg" }); avatarPreview.replaceWith(next); avatarPreview = next; updatePreview(); }; reader.readAsDataURL(file); });
   async function genAvatar(mode) {
     if (genBusy) return;
     if (!name.input.value.trim() && !desc.input.value.trim() && !perso.input.value.trim() && !scenario.input.value.trim() && !tags.input.value.trim()) return toast("Remplis au moins un champ du personnage pour générer un avatar.", "err");
@@ -1655,7 +1655,8 @@ function cardModal(existing) {
         },
       });
       avatarServer = r.image; lastSeed = r.seed; avatarData = null;
-      avatarPreview.replaceWith(el("img", { src: avatarServer, class: "avatar avatar-lg" }));
+      const next = el("img", { src: avatarServer, class: "avatar avatar-lg" });
+      avatarPreview.replaceWith(next); avatarPreview = next;
       avatarStatus.textContent = "seed " + r.seed;
       sameSeedBtn.hidden = false; varyBtn.hidden = false;
       everGen = true;

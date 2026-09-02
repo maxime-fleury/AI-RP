@@ -79,17 +79,23 @@ describe("branches, backups & coherence check", async () => {
 
   test("runBackup writes an atomic db copy + checksum", async () => {
     const { runBackup } = await import("../src/server/backup");
-    const { DATA_DIR } = await import("../src/server/paths");
     const dest = runBackup(true);
     expect(dest).not.toBeNull();
     const fs = await import("node:fs");
     const path = await import("node:path");
     expect(fs.existsSync(dest!)).toBe(true);
     expect(fs.existsSync(dest! + ".sha256")).toBe(true);
-    // checksum matches the live DB content
+    // checksum verifies the backup file itself hasn't been tampered with
     const hasher = new Bun.CryptoHasher("sha256");
-    hasher.update(fs.readFileSync(path.join(DATA_DIR, "app.db")));
+    hasher.update(fs.readFileSync(dest!));
     expect(fs.readFileSync(dest! + ".sha256", "utf8").trim()).toBe(hasher.digest("hex"));
+    // the backup is a consistent, openable snapshot (VACUUM INTO, not a raw
+    // file copy — byte equality with live app.db is not expected in WAL mode)
+    const { Database } = await import("bun:sqlite");
+    const copy = new Database(dest!, { readonly: true });
+    const [{ n }] = copy.query("SELECT count(*) AS n FROM worlds").all() as any[];
+    copy.close();
+    expect(Number(n)).toBe(db.listWorlds().length);
   });
 
   test("coherence validate fails gracefully without a model", async () => {

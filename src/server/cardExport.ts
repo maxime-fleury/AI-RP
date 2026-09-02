@@ -46,7 +46,7 @@ export function placeholderPng(size = 256, rgb: [number, number, number] = [43, 
 /** Inject a "chara" tEXt chunk right before IEND (standard ST card position). */
 export function withCharaChunk(png: Uint8Array, charaJson: string): Buffer {
   const buf = Buffer.from(png);
-  const iend = buf.indexOf(Buffer.from([0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44])); // ...IEND
+  const iend = buf.lastIndexOf(Buffer.from([0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44])); // ...IEND
   if (iend < 0) return buf;
   const payload = Buffer.from(`chara\0${Buffer.from(charaJson, "utf8").toString("base64")}`, "utf8");
   return Buffer.concat([buf.subarray(0, iend), chunk("tEXt", payload), buf.subarray(iend)]);

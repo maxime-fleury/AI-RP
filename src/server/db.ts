@@ -459,11 +459,11 @@ export function updateConversation(id: number, c: Partial<ConversationRow>): Con
   for (const [k, v] of Object.entries(c)) if (v !== undefined) clean[k] = v;
   const merged = { ...cur, ...clean, id };
   db.query(
-    `UPDATE conversations SET title=?, world_id=?, persona_id=?, scenario_id=?, cast=?, group_mode=?, pinned=?, archived=?, settings=?, last_message=?, summary=?, summary_msg_id=?, memory_json=?, branch_kind=?, updated_at=? WHERE id=?`,
+    `UPDATE conversations SET title=?, world_id=?, persona_id=?, scenario_id=?, cast=?, group_mode=?, pinned=?, archived=?, settings=?, last_message=?, summary=?, summary_msg_id=?, memory_json=?, parent_id=?, branch_kind=?, updated_at=? WHERE id=?`,
   ).run(
     merged.title, merged.world_id, merged.persona_id, merged.scenario_id, merged.cast,
     merged.group_mode, merged.pinned, merged.archived, merged.settings, merged.last_message,
-    merged.summary, merged.summary_msg_id, merged.memory_json ?? "", merged.branch_kind ?? "main", now(), id,
+    merged.summary, merged.summary_msg_id, merged.memory_json ?? "", merged.parent_id ?? null, merged.branch_kind ?? "main", now(), id,
   );
   return getConversation(id);
 }

@@ -144,10 +144,13 @@ export interface ImageResult {
 
 export async function generateImage(req: ImageRequest): Promise<ImageResult> {
   if (!(await ensureImageServer())) throw new Error(lastError || "Serveur d'images indisponible.");
+  // generous timeout: GPU inference can take minutes, but a deadlocked sidecar
+  // must not hold the caller's connection open forever
   const res = await fetch(`${BASE}/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),
+    signal: AbortSignal.timeout(300_000),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");

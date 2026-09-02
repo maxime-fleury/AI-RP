@@ -38,7 +38,7 @@ async function readJson(req: Request): Promise<any> {
   try {
     return JSON.parse(text);
   } catch {
-    throw new Error("JSON invalide");
+    throw new HttpError(400, "JSON invalide");
   }
 }
 
@@ -62,6 +62,13 @@ function json(body: unknown, status = 200): Response {
     status,
     headers: { "Content-Type": "application/json; charset=utf-8" },
   });
+}
+
+/** An error that maps to a specific HTTP status (client errors → 4xx, not 500). */
+class HttpError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
 }
 
 function sseStream(
@@ -302,6 +309,17 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       return json({ ...r, backup });
     }
     if (p === "/api/backup" && method === "POST") {
+      const body = await readJson(req);
+      // same verb serves two intents: restore (a backup payload) or create a file
+      const backup =
+        body && typeof body === "object"
+          ? body.backup && typeof body.backup === "object"
+            ? body.backup
+            : Array.isArray(body.worlds)
+              ? body
+              : null
+          : null;
+      if (backup) return restoreBackup(backup);
       const file = runBackup(true);
       return json({ ok: Boolean(file), file });
     }
@@ -339,6 +357,9 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const imported: any[] = [];
       const report: ImportResult[] = [];
       let totalBytes = 0;
+      // safety net: snapshot the DB before the batch touches anything — the
+      // import is bulk-writing, so a bad card must be undoable from backups
+      const backup = runBackup(true);
       // returns true when the whole batch must be rejected (total too big)
       const account = (name: string, n: number): boolean => {
         totalBytes += n;
@@ -380,9 +401,6 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
           if (res.status === "imported" && res.card) imported.push(messageView(res.card));
         }
       }
-      // safety net: snapshot the DB before the batch touches anything — the
-      // import is bulk-writing, so a bad card must be undoable from backups
-      const backup = runBackup(true);
       if (imported.length) console.log(`[import] 📥 ${imported.length} carte(s) — sauvegarde ${backup || "du jour déjà existante"}`);
       return json({ imported, duplicates: report.filter((r) => r.status === "duplicate").map((r) => r.name), report, backup });
     }
@@ -645,7 +663,6 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const world = getWorld(scenario.world_id);
       const theme = body.theme || scenario.name || "un nouveau départ";
       const { intro } = await generateScenarioIntro(world, body.genre, theme);
-      updateScenario(scenario.id, { intro });
       return json(updateScenario(scenario.id, { intro }));
     }
 
@@ -1736,62 +1753,87 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         cards: listCards(),
         personas: listPersonas(),
         conversations,
+        timeline_events: listWorlds().flatMap((w) => listTimeline(w.id)),
       });
     }
-    // restore a backup (creates fresh rows, remaps foreign keys)
-    if (p === "/api/backup" && method === "POST") {
-      const body = await readJson(req);
-      const b = body.backup ?? body;
-      const worldIds = new Map<number, number>();
-      for (const w of b.worlds ?? []) {
-        const nw = createWorld(w);
-        worldIds.set(Number(w.id), nw.id);
-      }
-      const scenIds = new Map<number, number>();
-      for (const s of b.scenarios ?? []) {
-        const ns = createScenario({ ...s, world_id: worldIds.get(Number(s.world_id)) ?? s.world_id });
-        scenIds.set(Number(s.id), ns.id);
-      }
-      const cardIds = new Map<number, number>();
-      for (const c of b.cards ?? []) {
-        const nc = createCard(c);
-        cardIds.set(Number(c.id), nc.id);
-      }
-      const personaIds = new Map<number, number>();
-      for (const po of b.personas ?? []) {
-        const np = createPersona(po);
-        personaIds.set(Number(po.id), np.id);
-      }
-      let conversations = 0;
-      for (const c of b.conversations ?? []) {
-        const conv = createConversation({
-          title: c.title ?? "Partie restaurée",
-          world_id: c.world_id ? (worldIds.get(Number(c.world_id)) ?? null) : null,
-          persona_id: c.persona_id ? (personaIds.get(Number(c.persona_id)) ?? null) : null,
-          scenario_id: c.scenario_id ? (scenIds.get(Number(c.scenario_id)) ?? null) : null,
-          cast: JSON.stringify((Array.isArray(c.cast) ? c.cast : []).map((id: number) => cardIds.get(Number(id)) ?? id)),
-          group_mode: c.group_mode ? 1 : 0,
-          settings: JSON.stringify(c.settings ?? {}),
-        });
-        for (const m of c.messages ?? []) {
-          createMessage({
-            conversation_id: conv.id, role: m.role ?? "assistant", name: m.name ?? "",
-            content: m.content ?? "", segments: JSON.stringify(m.segments ?? "[]"),
-            meta: JSON.stringify(m.meta ?? {}),
-          });
-        }
-        conversations++;
-      }
-      return json({
-        ok: true,
-        worlds: (b.worlds ?? []).length, scenarios: (b.scenarios ?? []).length,
-        cards: (b.cards ?? []).length, personas: (b.personas ?? []).length, conversations,
+// restore a backup (creates fresh rows, remaps foreign keys)
+function restoreBackup(b: any): Response {
+  const worldIds = new Map<number, number>();
+  for (const w of b.worlds ?? []) {
+    const nw = createWorld(w);
+    worldIds.set(Number(w.id), nw.id);
+  }
+  const scenIds = new Map<number, number>();
+  for (const s of b.scenarios ?? []) {
+    const ns = createScenario({ ...s, world_id: worldIds.get(Number(s.world_id)) ?? s.world_id });
+    scenIds.set(Number(s.id), ns.id);
+  }
+  const cardIds = new Map<number, number>();
+  for (const c of b.cards ?? []) {
+    const nc = createCard(c);
+    cardIds.set(Number(c.id), nc.id);
+  }
+  const personaIds = new Map<number, number>();
+  for (const po of b.personas ?? []) {
+    const np = createPersona(po);
+    personaIds.set(Number(po.id), np.id);
+  }
+  let conversations = 0;
+  const convIds = new Map<number, number>();
+  const msgIds = new Map<number, number>();
+  for (const c of b.conversations ?? []) {
+    const conv = createConversation({
+      title: c.title ?? "Partie restaurée",
+      world_id: c.world_id ? (worldIds.get(Number(c.world_id)) ?? null) : null,
+      persona_id: c.persona_id ? (personaIds.get(Number(c.persona_id)) ?? null) : null,
+      scenario_id: c.scenario_id ? (scenIds.get(Number(c.scenario_id)) ?? null) : null,
+      cast: JSON.stringify((Array.isArray(c.cast) ? c.cast : []).map((id: number) => cardIds.get(Number(id)) ?? id)),
+      group_mode: c.group_mode ? 1 : 0,
+      settings: JSON.stringify(c.settings ?? {}),
+    });
+    convIds.set(Number(c.id), conv.id);
+    for (const m of c.messages ?? []) {
+      const nm = createMessage({
+        conversation_id: conv.id, role: m.role ?? "assistant", name: m.name ?? "",
+        content: m.content ?? "", segments: JSON.stringify(m.segments ?? "[]"),
+        meta: JSON.stringify(m.meta ?? {}),
       });
+      if (m.id != null) msgIds.set(Number(m.id), nm.id);
     }
+    conversations++;
+  }
+  // second pass: restore branch links — a parent can appear after its child
+  for (const c of b.conversations ?? []) {
+    const newId = convIds.get(Number(c.id));
+    if (newId === undefined) continue;
+    const patch: any = { parent_id: c.parent_id != null ? (convIds.get(Number(c.parent_id)) ?? null) : null };
+    if (typeof c.branch_kind === "string") patch.branch_kind = c.branch_kind;
+    updateConversation(newId, patch);
+  }
+  // timeline events: remap world / conversation / message ids
+  let timelineEvents = 0;
+  for (const e of b.timeline_events ?? []) {
+    createTimelineEvent({
+      world_id: worldIds.get(Number(e.world_id)) ?? 0,
+      conversation_id: e.conversation_id != null ? (convIds.get(Number(e.conversation_id)) ?? null) : null,
+      message_id: e.message_id != null ? (msgIds.get(Number(e.message_id)) ?? null) : null,
+      label: e.label ?? "",
+    });
+    timelineEvents++;
+  }
+  return json({
+    ok: true,
+    worlds: (b.worlds ?? []).length, scenarios: (b.scenarios ?? []).length,
+    cards: (b.cards ?? []).length, personas: (b.personas ?? []).length, conversations,
+    timeline_events: timelineEvents,
+  });
+}
+
 
     return json({ error: "Not found" }, 404);
   } catch (e: any) {
-    return json({ error: String(e?.message ?? e) }, 500);
+    const status = e instanceof HttpError ? e.status : 500;
+    return json({ error: String(e?.message ?? e) }, status);
   }
 }
 
@@ -2588,7 +2630,7 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
   const maxTokens = Number(settings.max_tokens ?? preset?.maxTokens ?? getSetting("max_tokens", 2048));
 
   // server-side trace of every generation (see the console while playing)
-  const genLabel = (userText || directive || content || "").replace(/\s+/g, " ").trim().slice(0, 90);
+  const genLabel = (userText || directive || "").replace(/\s+/g, " ").trim().slice(0, 90);
   const genStart = Date.now();
   console.log(`\n[chat] ▶  Génération lancée — partie #${convId} « ${conv.title || "sans titre"} »`);
   console.log(`[chat]    message : ${genLabel || "(directive)"}`);
