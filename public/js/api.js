@@ -85,7 +85,12 @@ export async function readSseStream(res, onEvent, onClose) {
           else if (line.startsWith("data:")) data += line.slice(5).trim();
         }
         if (data) {
-          try { onEvent(event, JSON.parse(data)); } catch { onEvent(event, { raw: data }); }
+          // parse first, dispatch once: if onEvent itself throws (a handler
+          // bug), that is NOT a JSON failure — re-calling it with {raw} would
+          // double-process an already-handled event (e.g. a second "done")
+          let parsed;
+          try { parsed = JSON.parse(data); } catch { parsed = { raw: data }; }
+          onEvent(event, parsed);
         }
       }
     }

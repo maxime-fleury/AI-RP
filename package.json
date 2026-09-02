@@ -10,7 +10,8 @@
     "check": "bun build src/index.ts --outdir /tmp/innsekai-build --target=bun && bun test"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "typescript": "5"
   },
   "dependencies": {}
 }

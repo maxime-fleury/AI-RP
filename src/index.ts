@@ -62,7 +62,7 @@ function serveFile(filePath: string, rootDir?: string): Response | null {
   });
 }
 
-function handler(req: Request): Response {
+function handler(req: Request): Response | Promise<Response> {
   const url = new URL(req.url);
   const p = url.pathname;
 

@@ -441,13 +441,15 @@ export function getConversation(id: number): ConversationRow | null {
 
 export function createConversation(c: Partial<ConversationRow>): ConversationRow {
   const t = now();
+  const createdAt = Number(c.created_at) > 0 ? Number(c.created_at) : t;
+  const updatedAt = Number(c.updated_at) > 0 ? Number(c.updated_at) : t;
   const r = db.query(
-    `INSERT INTO conversations (title, world_id, persona_id, scenario_id, cast, group_mode, settings, last_message, memory_json, parent_id, branch_kind, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO conversations (title, world_id, persona_id, scenario_id, cast, group_mode, pinned, archived, settings, last_message, summary, summary_msg_id, memory_json, parent_id, branch_kind, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     c.title ?? "Nouvelle partie", c.world_id ?? null, c.persona_id ?? null, c.scenario_id ?? null,
-    c.cast ?? "[]", c.group_mode ?? 0, c.settings ?? "{}", c.last_message ?? "",
-    c.memory_json ?? "", c.parent_id ?? null, c.branch_kind ?? "main", t, t,
+    c.cast ?? "[]", c.group_mode ?? 0, c.pinned ?? 0, c.archived ?? 0, c.settings ?? "{}", c.last_message ?? "",
+    c.summary ?? "", c.summary_msg_id ?? 0, c.memory_json ?? "", c.parent_id ?? null, c.branch_kind ?? "main", createdAt, updatedAt,
   );
   return getConversation(Number(r.lastInsertRowid))!;
 }
@@ -458,12 +460,15 @@ export function updateConversation(id: number, c: Partial<ConversationRow>): Con
   const clean: any = {};
   for (const [k, v] of Object.entries(c)) if (v !== undefined) clean[k] = v;
   const merged = { ...cur, ...clean, id };
+  // bump the sort key on ordinary edits; callers may pass an explicit value
+  // (backup restore) to keep the original chronology
+  const bumpedAt = c.updated_at === undefined ? now() : Number(c.updated_at) || now();
   db.query(
     `UPDATE conversations SET title=?, world_id=?, persona_id=?, scenario_id=?, cast=?, group_mode=?, pinned=?, archived=?, settings=?, last_message=?, summary=?, summary_msg_id=?, memory_json=?, parent_id=?, branch_kind=?, updated_at=? WHERE id=?`,
   ).run(
     merged.title, merged.world_id, merged.persona_id, merged.scenario_id, merged.cast,
     merged.group_mode, merged.pinned, merged.archived, merged.settings, merged.last_message,
-    merged.summary, merged.summary_msg_id, merged.memory_json ?? "", merged.parent_id ?? null, merged.branch_kind ?? "main", now(), id,
+    merged.summary, merged.summary_msg_id, merged.memory_json ?? "", merged.parent_id ?? null, merged.branch_kind ?? "main", bumpedAt, id,
   );
   return getConversation(id);
 }
@@ -491,12 +496,14 @@ export function getMessage(id: number): MessageRow | null {
 }
 
 export function createMessage(m: Partial<MessageRow>): MessageRow {
+  const t = now();
+  const createdAt = Number(m.created_at) > 0 ? Number(m.created_at) : t;
   const r = db.query(
     `INSERT INTO messages (conversation_id, role, name, content, segments, audio, meta, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     m.conversation_id, m.role ?? "assistant", m.name ?? "", m.content ?? "", m.segments ?? "[]",
-    m.audio ?? "[]", m.meta ?? "{}", now(),
+    m.audio ?? "[]", m.meta ?? "{}", createdAt,
   );
   return getMessage(Number(r.lastInsertRowid))!;
 }
@@ -545,7 +552,7 @@ export function getLocation(id: number): LocationRow | null {
 export function createLocation(l: Partial<LocationRow>): LocationRow {
   const r = db.query(
     "INSERT INTO locations (world_id, name, description, x, y, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-  ).run(l.world_id ?? 0, l.name ?? "場所", l.description ?? "", l.x ?? 50, l.y ?? 50, now());
+  ).run(l.world_id ?? 0, l.name ?? "Lieu", l.description ?? "", l.x ?? 50, l.y ?? 50, now());
   return getLocation(Number(r.lastInsertRowid))!;
 }
 

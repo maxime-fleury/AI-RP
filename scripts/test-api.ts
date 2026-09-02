@@ -5,7 +5,7 @@
  */
 const BASE = `http://localhost:${process.env.PORT ?? 3210}`;
 
-async function api(path, opts = {}) {
+async function api(path: string, opts: { method?: string; body?: unknown } = {}) {
   const res = await fetch(BASE + path, {
     method: opts.method || (opts.body ? "POST" : "GET"),
     headers: { "Content-Type": "application/json" },
@@ -18,7 +18,7 @@ async function api(path, opts = {}) {
   return data;
 }
 
-const log = (...a) => console.log("•", ...a);
+const log = (...a: unknown[]) => console.log("•", ...a);
 
 // 1. settings
 log("settings:", await api("/api/settings"));
@@ -71,6 +71,7 @@ const res = await fetch(`${BASE}/api/conversations/${conv.id}/stream`, {
 });
 let full = "";
 let sawDone = false;
+if (!res.body) throw new Error("Réponse sans corps SSE");
 const reader = res.body.getReader();
 const decoder = new TextDecoder();
 let buffer = "";
@@ -85,8 +86,8 @@ while (true) {
     const evt = block.match(/^event: (.*)$/m)?.[1] || "message";
     const data = block.match(/^data: (.*)$/m)?.[1];
     if (evt === "delta" && data) full += JSON.parse(data).text;
-    if (evt === "done") { sawDone = true; log("  done, segments:", JSON.parse(data).message.segments?.length); }
-    if (evt === "error") throw new Error("SSE error: " + JSON.parse(data).message);
+    if (evt === "done" && data) { sawDone = true; log("  done, segments:", JSON.parse(data).message.segments?.length); }
+    if (evt === "error" && data) throw new Error("SSE error: " + JSON.parse(data).message);
   }
 }
 log("assistant text:", full.slice(0, 80) + "…");

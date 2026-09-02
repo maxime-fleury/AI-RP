@@ -57,11 +57,101 @@ function publicSettings(): Record<string, unknown> {
   return settings;
 }
 
+/** Typed chat-message builder — stops `role` literals from widening to string. */
+function chatMsg(role: ChatMessage["role"], content: string): ChatMessage {
+  return { role, content };
+}
+
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "Content-Type": "application/json; charset=utf-8" },
   });
+}
+
+// ─── embedded media (illustrations, avatars) in JSON exports ─────────────────
+// The DB only stores URL paths (/images/…, /uploads/…). To make an export
+// self-contained, every referenced file is embedded base64-side, and restore
+// re-creates the files (remapping conversation-scoped URLs to the fresh ids).
+
+/** Resolve a stored media URL to a file path, confined to the media roots. */
+function mediaFileFor(url: string): string | null {
+  let root: string;
+  let rel: string;
+  if (url.startsWith("/images/")) { root = IMAGES_DIR; rel = url.slice("/images/".length); }
+  else if (url.startsWith("/uploads/")) { root = UPLOADS_DIR; rel = url.slice("/uploads/".length); }
+  else return null;
+  const resolved = path.resolve(root, rel);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) return null; // confinement
+  return resolved;
+}
+
+/** Recursively collect every /images|/uploads URL string in an export payload. */
+function collectMediaUrls(node: unknown, out: Set<string>): void {
+  if (typeof node === "string") {
+    if (node.startsWith("/images/") || node.startsWith("/uploads/")) out.add(node);
+    return;
+  }
+  if (Array.isArray(node)) {
+    for (const v of node) collectMediaUrls(v, out);
+    return;
+  }
+  if (node && typeof node === "object") {
+    for (const v of Object.values(node)) collectMediaUrls(v, out);
+  }
+}
+
+/**
+ * Embed the media files referenced by a parsed backup payload ({url: base64}).
+ * Conversation-scoped image URLs are remapped to the restored conversation ids
+ * (and written at that path), and the restored messages' meta is rewritten to
+ * match — so fork / rewind-delete / new illustrations keep working on the
+ * restored party as if it had always lived under its fresh id.
+ */
+function restoreMedia(b: any, convIds: Map<number, number>): number {
+  let restored = 0;
+  const remapUrl = (url: string): string => {
+    const m = /^\/images\/conversations\/(\d+)\//.exec(url);
+    if (!m) return url;
+    const oldId = Number(m[1]);
+    const newId = convIds.get(oldId);
+    if (newId === undefined || newId === oldId) return url;
+    return `/images/conversations/${newId}/${url.slice(m[0].length)}`;
+  };
+  for (const [url, data] of Object.entries(b.media ?? {})) {
+    const b64 = typeof data === "string" ? data : (data as any)?.b64 ?? (data as any)?.data;
+    if (typeof b64 !== "string" || !b64) continue;
+    const file = mediaFileFor(remapUrl(url));
+    if (!file) continue;
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, Buffer.from(b64, "base64"));
+      restored++;
+    } catch (e: any) {
+      console.warn(`[restore] média ignoré (${url}) : ${e?.message ?? e}`);
+    }
+  }
+  // align the URLs stored in restored messages with the fresh conversation ids
+  for (const c of b.conversations ?? []) {
+    const oldId = Number(c.id);
+    const newId = convIds.get(oldId);
+    if (newId === undefined || newId === oldId) continue;
+    const oldPrefix = `/images/conversations/${oldId}/`;
+    const newPrefix = `/images/conversations/${newId}/`;
+    for (const m of listMessages(newId)) {
+      let meta: any;
+      try { meta = JSON.parse(m.meta || "{}"); } catch { continue; }
+      const rewrite = (v: any): any => {
+        if (typeof v === "string") return v.startsWith(oldPrefix) ? newPrefix + v.slice(oldPrefix.length) : v;
+        if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) v[i] = rewrite(v[i]); return v; }
+        if (v && typeof v === "object") { for (const k of Object.keys(v)) v[k] = rewrite(v[k]); return v; }
+        return v;
+      };
+      const next = JSON.stringify(rewrite(meta));
+      if (next !== m.meta) updateMessage(m.id, { meta: next });
+    }
+  }
+  return restored;
 }
 
 /** An error that maps to a specific HTTP status (client errors → 4xx, not 500). */
@@ -203,7 +293,7 @@ async function generateScenarioIntro(
   return { name: title || `Scénario ${g.label}`, intro: rest || trimmed };
 }
 
-function conversationView(id: number) {
+function conversationView(id: number): any {
   const conv = getConversation(id);
   if (!conv) return null;
   const world = conv.world_id ? getWorld(conv.world_id) : null;
@@ -351,55 +441,63 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       return json({ ok });
     }
 
-    // import cards — per-file report (importé / doublon / invalide) + limits
+    // import cards — per-file report (importé / doublon / invalide) + limits.
+    // Atomic batches: EVERY file is validated (count, per-type limit, total
+    // size) BEFORE the first write, so an oversized batch is rejected whole —
+    // a mid-batch 413 used to leave the earlier files imported already.
     if (p === "/api/import" && method === "POST") {
       const ct = req.headers.get("content-type") || "";
       const imported: any[] = [];
       const report: ImportResult[] = [];
-      let totalBytes = 0;
       // safety net: snapshot the DB before the batch touches anything — the
       // import is bulk-writing, so a bad card must be undoable from backups
       const backup = runBackup(true);
-      // returns true when the whole batch must be rejected (total too big)
-      const account = (name: string, n: number): boolean => {
-        totalBytes += n;
-        return totalBytes > MAX_TOTAL_BYTES;
-      };
+      const pending: { name: string; bytes: Uint8Array }[] = [];
       if (ct.includes("multipart/form-data")) {
         const form = await req.formData();
-        const files = form.getAll("files");
-        if (files.length > MAX_IMPORT_FILES) return json({ error: `Maximum ${MAX_IMPORT_FILES} fichiers par import` }, 413);
-        for (const f of files) {
+        const entries = form.getAll("files");
+        if (entries.length > MAX_IMPORT_FILES) return json({ error: `Maximum ${MAX_IMPORT_FILES} fichiers par import` }, 413);
+        for (const f of entries) {
           if (typeof f === "string") continue;
-          const bytes = new Uint8Array(await f.arrayBuffer());
-          if (!sizeLimitFor(f.name)) {
-            report.push({ status: "invalid", name: f.name, reason: "Format non reconnu (PNG ou JSON attendu)" });
-            continue;
-          }
-          if (account(f.name, bytes.byteLength)) return json({ error: "Import trop volumineux (maximum 50 Mo au total)" }, 413);
-          const res = importFile(f.name, bytes);
-          report.push(res);
-          if (res.status === "imported" && res.card) imported.push(messageView(res.card));
+          pending.push({ name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) });
         }
       } else {
         const body = await readJson(req);
-        const files: { name: string; base64: string }[] = body.files ?? [];
-        if (!Array.isArray(files) || files.length > MAX_IMPORT_FILES) {
+        const entries: { name?: string; base64?: string }[] = body.files ?? [];
+        if (!Array.isArray(entries) || entries.length > MAX_IMPORT_FILES) {
           return json({ error: `Maximum ${MAX_IMPORT_FILES} fichiers par import` }, 413);
         }
-        for (const f of files) {
+        for (const f of entries) {
           if (!f || typeof f.base64 !== "string") continue;
           const raw = atob(f.base64);
-          if (!sizeLimitFor(f.name)) {
-            report.push({ status: "invalid", name: String(f.name || "?"), reason: "Format non reconnu (PNG ou JSON attendu)" });
-            continue;
-          }
-          if (account(f.name, raw.length)) return json({ error: "Import trop volumineux (maximum 50 Mo au total)" }, 413);
-          const bytes = Uint8Array.from(raw, (c) => c.charCodeAt(0));
-          const res = importFile(f.name, bytes);
-          report.push(res);
-          if (res.status === "imported" && res.card) imported.push(messageView(res.card));
+          pending.push({ name: String(f.name ?? "?"), bytes: Uint8Array.from(raw, (c) => c.charCodeAt(0)) });
         }
+      }
+      // pass 1 — validate everything (format + per-file limit + batch total)
+      let totalBytes = 0;
+      const valid: { name: string; bytes: Uint8Array }[] = [];
+      for (const f of pending) {
+        const limit = sizeLimitFor(f.name);
+        if (!limit) {
+          report.push({ status: "invalid", name: f.name, reason: "Format non reconnu (PNG ou JSON attendu)" });
+          continue;
+        }
+        if (f.bytes.byteLength > limit) {
+          report.push({ status: "invalid", name: f.name, reason: `Fichier trop volumineux (${(f.bytes.byteLength / 1024 / 1024).toFixed(1)} Mo > limite ${Math.round(limit / 1024 / 1024)} Mo)` });
+          continue;
+        }
+        totalBytes += f.bytes.byteLength;
+        valid.push(f);
+      }
+      if (totalBytes > MAX_TOTAL_BYTES) {
+        // nothing has been written yet — reject the whole batch
+        return json({ error: "Import trop volumineux (maximum 50 Mo au total)" }, 413);
+      }
+      // pass 2 — import (only after the whole batch passed validation)
+      for (const f of valid) {
+        const res = importFile(f.name, f.bytes);
+        report.push(res);
+        if (res.status === "imported" && res.card) imported.push(messageView(res.card));
       }
       if (imported.length) console.log(`[import] 📥 ${imported.length} carte(s) — sauvegarde ${backup || "du jour déjà existante"}`);
       return json({ imported, duplicates: report.filter((r) => r.status === "duplicate").map((r) => r.name), report, backup });
@@ -614,7 +712,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       }
       const zip = zipFiles(files);
       const name = encodeURIComponent(world.name.replace(/[^\p{L}\p{N} _-]+/gu, "").slice(0, 40));
-      return new Response(zip, {
+      return new Response(zip as unknown as BodyInit, {
         headers: {
           "Content-Type": "application/zip",
           "Content-Disposition": `attachment; filename*=UTF-8''${name}.zip`,
@@ -788,7 +886,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
           mes_example: card.mes_example || "",
           system_prompt: card.system_prompt || "",
           post_history_instructions: card.post_history_instructions || "",
-          creator: "Freebuff Innsekai",
+          creator: "Innsekai",
           character_version: "1.0",
           alternate_greetings: [],
           tags: [],
@@ -799,7 +897,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       if (avatarFile && fs.existsSync(avatarFile)) png = new Uint8Array(fs.readFileSync(avatarFile));
       else png = placeholderPng(256, [43, 24, 66]);
       const out = withCharaChunk(png, chara);
-      return new Response(out, {
+      return new Response(out as unknown as BodyInit, {
         headers: {
           "Content-Type": "image/png",
           "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(card.name)}.png`,
@@ -1118,7 +1216,8 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     if (parts[1] === "conversations" && parts[2] && parts[3] === "stats" && method === "GET") {
       const conv = getConversation(Number(parts[2]));
       if (!conv) return json({ error: "not found" }, 404);
-      const msgs = listMessages(conv.id);
+      // display-only markers (chapters, rewind notes) are not story messages
+      const msgs = storyMessages(listMessages(conv.id));
       const words = (t: string) => (t || "").trim() ? (t.trim().match(/\S+/g) || []).length : 0;
       const speaker = new Map<string, number>();
       let userMsgs = 0, assistantMsgs = 0, totalWords = 0, totalChars = 0, images = 0, bookmarks = 0;
@@ -1507,7 +1606,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       }
       const zip = zipFiles(files);
       const name = encodeURIComponent((conv.title || "partie").replace(/[^\p{L}\p{N} _-]+/gu, "").slice(0, 60));
-      return new Response(zip, {
+      return new Response(zip as unknown as BodyInit, {
         headers: {
           "Content-Type": "application/zip",
           "Content-Disposition": `attachment; filename*=UTF-8''${name}.zip`,
@@ -1690,7 +1789,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const body = await readJson(req);
       const m = getMessage(mid);
       const conv = getConversation(convId);
-      if (!conv || !m) return json({ error: "not found" }, 404);
+      if (!conv || !m || m.conversation_id !== convId) return json({ error: "not found" }, 404);
       const meta = JSON.parse(m.meta || "{}");
       // meta-only updates (favoris, notes privées…) never touch content
       if (body.meta && typeof body.meta === "object" && !Array.isArray(body.meta)) {
@@ -1706,8 +1805,13 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       if (m.role === "assistant") {
         updates.segments = JSON.stringify(parseSegmentsFor(conv, content));
       }
-      // content changed → the old response suggestions no longer match
+      // content changed → the old response suggestions no longer match, and for
+      // user messages the model-facing rewrite (meta.prompt/directive) is stale
       delete meta.suggestions;
+      if (m.role === "user") {
+        delete meta.prompt;
+        delete meta.directive;
+      }
       updates.meta = JSON.stringify(meta);
       updateMessage(mid, updates);
       return json(messageView(getMessage(mid)!));
@@ -1732,8 +1836,12 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] === "bulk-delete" && method === "POST") {
       const convId = Number(parts[2]);
       const body = await readJson(req);
-      const ids = Array.isArray(body.ids) ? body.ids.map(Number).filter(Boolean) : [];
-      if (!ids.length) return json({ error: "aucun message sélectionné" }, 400);
+      const requested = Array.isArray(body.ids) ? body.ids.map(Number).filter(Boolean) : [];
+      if (!requested.length) return json({ error: "aucun message sélectionné" }, 400);
+      // only messages that actually belong to this conversation (no cross-party deletes)
+      const owned = new Set(listMessages(convId).map((m) => m.id));
+      const ids = requested.filter((id) => owned.has(id));
+      if (!ids.length) return json({ error: "aucun message sélectionné dans cette partie" }, 404);
       for (const mid of ids) {
         deleteMessage(mid);
       }
@@ -1742,9 +1850,10 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       return json({ ok: true, removed: ids.length });
     }
     if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] && parts[5] === "reactions" && (method === "POST" || method === "DELETE")) {
+      const convId = Number(parts[2]);
       const mid = Number(parts[4]);
       const m = getMessage(mid);
-      if (!m) return json({ error: "not found" }, 404);
+      if (!m || m.conversation_id !== convId) return json({ error: "not found" }, 404);
       const body = await readJson(req);
       const emoji = String(body.emoji || "").trim();
       if (!emoji) return json({ error: "emoji manquant" }, 400);
@@ -1767,7 +1876,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const mid = Number(parts[4]);
       const conv = getConversation(convId);
       const m = getMessage(mid);
-      if (!conv || !m) return json({ error: "not found" }, 404);
+      if (!conv || !m || m.conversation_id !== convId) return json({ error: "not found" }, 404);
       const body = await readJson(req);
       const world = conv.world_id ? getWorld(conv.world_id) : null;
       let cast: any[] = [];
@@ -1853,9 +1962,11 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         let settings: unknown = {};
         try { cast = JSON.parse(c.cast); } catch { /* ignore */ }
         try { settings = JSON.parse(c.settings); } catch { /* ignore */ }
-        return { ...c, cast, settings, messages: listMessages(c.id) };
+        // parse the JSON-stringified columns (segments, meta) so the backup file
+        // is clean JSON — restoring it must not double-encode them
+        return { ...c, cast, settings, messages: listMessages(c.id).map(messageView) };
       });
-      return json({
+      const payload: any = {
         app: "innsekai",
         version: 1,
         exported_at: new Date().toISOString(),
@@ -1865,7 +1976,23 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         personas: listPersonas(),
         conversations,
         timeline_events: listWorlds().flatMap((w) => listTimeline(w.id)),
-      });
+      };
+      // make the export self-contained: embed every referenced illustration /
+      // avatar as base64, so a restore brings the images back too
+      const urls = new Set<string>();
+      collectMediaUrls(payload, urls);
+      const media: Record<string, string> = {};
+      for (const u of urls) {
+        const file = mediaFileFor(u);
+        if (!file) continue;
+        try {
+          const st = fs.statSync(file);
+          if (!st.isFile()) continue;
+          media[u] = fs.readFileSync(file).toString("base64");
+        } catch { /* vanished between scan and read */ }
+      }
+      if (Object.keys(media).length) payload.media = media;
+      return json(payload);
     }
 // restore a backup (creates fresh rows, remaps foreign keys)
 function restoreBackup(b: any): Response {
@@ -1892,6 +2019,13 @@ function restoreBackup(b: any): Response {
   let conversations = 0;
   const convIds = new Map<number, number>();
   const msgIds = new Map<number, number>();
+  // Accept both clean JSON (arrays/objects — current exports) and legacy rows
+  // (JSON-stringified columns) without re-encoding them a second time.
+  const normalize = (v: unknown, fallback: unknown): unknown => {
+    if (v == null) return fallback;
+    if (typeof v !== "string") return v;
+    try { return JSON.parse(v); } catch { return v; } // plain text (summary…) stays as-is
+  };
   for (const c of b.conversations ?? []) {
     const conv = createConversation({
       title: c.title ?? "Partie restaurée",
@@ -1900,25 +2034,43 @@ function restoreBackup(b: any): Response {
       scenario_id: c.scenario_id ? (scenIds.get(Number(c.scenario_id)) ?? null) : null,
       cast: JSON.stringify((Array.isArray(c.cast) ? c.cast : []).map((id: number) => cardIds.get(Number(id)) ?? id)),
       group_mode: c.group_mode ? 1 : 0,
-      settings: JSON.stringify(c.settings ?? {}),
+      settings: JSON.stringify(normalize(c.settings, {}) ?? {}),
+      // fidelity: memory, summary, flags and timestamps survive the round-trip
+      memory_json: typeof c.memory_json === "string" ? c.memory_json : JSON.stringify(c.memory_json ?? ""),
+      summary: String(c.summary ?? ""),
+      summary_msg_id: Number(c.summary_msg_id) || 0,
+      pinned: c.pinned ? 1 : 0,
+      archived: c.archived ? 1 : 0,
+      last_message: String(c.last_message ?? ""),
+      created_at: c.created_at,
+      updated_at: c.updated_at,
     });
     convIds.set(Number(c.id), conv.id);
     for (const m of c.messages ?? []) {
       const nm = createMessage({
         conversation_id: conv.id, role: m.role ?? "assistant", name: m.name ?? "",
-        content: m.content ?? "", segments: JSON.stringify(m.segments ?? "[]"),
-        meta: JSON.stringify(m.meta ?? {}),
+        content: m.content ?? "",
+        segments: JSON.stringify(normalize(m.segments, []) ?? []),
+        meta: JSON.stringify(normalize(m.meta, {}) ?? {}),
+        created_at: m.created_at,
       });
       if (m.id != null) msgIds.set(Number(m.id), nm.id);
     }
     conversations++;
   }
-  // second pass: restore branch links — a parent can appear after its child
+  // second pass: restore branch links (a parent can appear after its child),
+  // remap the summary high-water mark and keep the restored timestamps
   for (const c of b.conversations ?? []) {
     const newId = convIds.get(Number(c.id));
     if (newId === undefined) continue;
-    const patch: any = { parent_id: c.parent_id != null ? (convIds.get(Number(c.parent_id)) ?? null) : null };
+    const restored = getConversation(newId);
+    const patch: any = {
+      parent_id: c.parent_id != null ? (convIds.get(Number(c.parent_id)) ?? null) : null,
+      updated_at: restored?.updated_at,
+    };
     if (typeof c.branch_kind === "string") patch.branch_kind = c.branch_kind;
+    const oldSummaryMsg = Number(c.summary_msg_id) || 0;
+    if (oldSummaryMsg > 0 && msgIds.has(oldSummaryMsg)) patch.summary_msg_id = msgIds.get(oldSummaryMsg);
     updateConversation(newId, patch);
   }
   // timeline events: remap world / conversation / message ids
@@ -1932,11 +2084,15 @@ function restoreBackup(b: any): Response {
     });
     timelineEvents++;
   }
+  const media = restoreMedia(b, convIds);
   return json({
     ok: true,
     worlds: (b.worlds ?? []).length, scenarios: (b.scenarios ?? []).length,
     cards: (b.cards ?? []).length, personas: (b.personas ?? []).length, conversations,
-    timeline_events: timelineEvents,
+    timeline_events: timelineEvents, media,
+    // duplicate restores of the same file intentionally re-create everything
+    // (ids are remapped) — the UI warns about that before restoring
+    note: "ids ré-attribués — restaurer deux fois le même fichier duplique les données",
   });
 }
 
@@ -2635,13 +2791,13 @@ function summarizeOverflow(convId: number, conv: ConversationRow, newMsgs: Messa
   const oldMem = parseMemory(conv.memory_json);
   const oldText = !oldMem && conv.summary && !conv.summary.startsWith(SUMMARY_PREFIX) ? conv.summary : "";
   const chat: ChatMessage[] = [
-    { role: "system", content: summarizeSystem() },
+    chatMsg("system", summarizeSystem()),
     ...(oldMem
-      ? [{ role: "user", content: `Mémoire structurée actuelle à compléter (garde ce qui reste vrai) :\n${JSON.stringify(oldMem)}` }]
+      ? [chatMsg("user", `Mémoire structurée actuelle à compléter (garde ce qui reste vrai) :\n${JSON.stringify(oldMem)}`)]
       : oldText
-        ? [{ role: "user", content: `Résumé actuel à compléter :\n${oldText}` }]
+        ? [chatMsg("user", `Résumé actuel à compléter :\n${oldText}`)]
         : []),
-    ...newMsgs.slice(-30).map((m) => ({ role: m.role === "user" ? "user" : "assistant", content: m.content.slice(0, 1500) })),
+    ...newMsgs.slice(-30).map((m) => chatMsg(m.role === "user" ? "user" : "assistant", m.content.slice(0, 1500))),
   ];
   const job = createJob({ type: "summary", status: "running", progress: 0, conversation_id: convId, payload: JSON.stringify({ messages: newMsgs.length }) });
   provider
@@ -2867,9 +3023,9 @@ async function generateSuggestions(ctx: CastContext, history: MessageRow[]): Pro
   const provider = getProvider((cs.provider as string) || undefined);
   const model = (cs.model as string) || defaultModelFor(provider.id);
   const messages: ChatMessage[] = [
-    { role: "system", content: suggestSystem(ctx) },
-    ...kept.slice(-10).map((m) => ({ role: m.role === "user" ? "user" : "assistant", content: m.content })),
-    { role: "user", content: "Propose tes suggestions de réponses pour le joueur." },
+    chatMsg("system", suggestSystem(ctx)),
+    ...kept.slice(-10).map((m) => chatMsg(m.role === "user" ? "user" : "assistant", m.content)),
+    chatMsg("user", "Propose tes suggestions de réponses pour le joueur."),
   ];
   for (let attempt = 0; attempt < 2; attempt++) {
     const text = await provider
@@ -2888,6 +3044,27 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
   const body = await readJson(req);
   const conv = getConversation(convId);
   if (!conv) return json({ error: "conversation not found" }, 404);
+  // idempotent retries: the client tags every attempt with a uid and re-posts
+  // the SAME uid when the connection dropped before any token arrived. If a
+  // previous attempt with this uid partially committed (user turn + possibly a
+  // partial reply), drop that tail so the retry starts clean — never touching
+  // anything past the newest user message (real newer turns are safe).
+  const attemptUid = typeof body.uid === "string" && body.uid ? body.uid.slice(0, 64) : "";
+  if (attemptUid) {
+    const msgs = listMessages(convId);
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      let meta: any = {};
+      try { meta = JSON.parse(m.meta || "{}"); } catch { /* ignore */ }
+      if (m.role === "user") {
+        if (meta.uid === attemptUid && i < msgs.length) {
+          for (const d of msgs.slice(i)) deleteMessage(d.id);
+          console.log(`[chat] ↻ nouvelle tentative #${convId} — tour précédent (uid ${attemptUid.slice(0, 8)}) retiré`);
+        }
+        break;
+      }
+    }
+  }
   const view = conversationView(convId)!;
   const world = view.world;
   const persona = view.persona;
@@ -2903,6 +3080,7 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
   const userMeta: Record<string, string> = {};
   if (modelText && modelText !== userText) userMeta.prompt = modelText;
   if (directive) userMeta.directive = directive;
+  if (attemptUid) userMeta.uid = attemptUid;
   const userMsg = createMessage({
     conversation_id: convId, role: "user",
     name: persona?.name ?? "Moi", content: userText || directive.slice(0, 120),
@@ -2944,6 +3122,8 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
   return sseStream(
     async (send, close) => {
     let full = "";
+    let assistantId = 0;
+    let doneSent = false; // the client was told the turn committed
     try {
       // transient failures (LM Studio loading a model, network blips) are
       // retried with backoff before surfacing an error
@@ -2978,6 +3158,9 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
         // try to get the model list for a nicer error
         const models = await provider.models().catch(() => []);
         const hint = models.length ? ` Modèles détectés : ${models.slice(0, 5).join(", ")}` : "";
+        // like any other failure: drop the pending user turn so the retry
+        // (the client keeps its own copy) doesn't duplicate the message
+        deleteMessage(userMsg.id);
         send("error", { message: `Le modèle "${model}" n'a rien renvoyé.${hint}` });
         close();
         return;
@@ -2987,44 +3170,64 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
         name: cards[0]?.name ?? "Narrateur", content: full.trim(),
       });
       assistantCreated = true;
-      const segments = parseSegmentsFor(conv, full);
-      updateMessage(assistant.id, { segments: JSON.stringify(segments) });
-      touchConversation(convId);
-      const firstLine = full.trim().split("\n")[0]?.slice(0, 60) ?? "";
-      // fresh conversation (only the opening message so far) → name it from the
-      // first reply; keep manual titles
-      if (historyBefore.length <= 1 && conv.title === "Nouvelle partie") {
-        updateConversation(convId, { title: firstLine || "Partie" });
+      assistantId = assistant.id;
+      // The turn is now COMMITTED: bookkeeping failures below must never turn
+      // into an "error" event (the client would think the turn failed and
+      // retry, duplicating it). Log them and move on.
+      try {
+        const segments = parseSegmentsFor(conv, full);
+        updateMessage(assistant.id, { segments: JSON.stringify(segments) });
+        touchConversation(convId);
+        const firstLine = full.trim().split("\n")[0]?.slice(0, 60) ?? "";
+        // fresh conversation (only the opening message so far) → name it from the
+        // first reply; keep manual titles
+        if (historyBefore.length <= 1 && conv.title === "Nouvelle partie") {
+          updateConversation(convId, { title: firstLine || "Partie" });
+        }
+        // dashboard preview = the latest exchange
+        updateConversation(convId, { last_message: full.trim().slice(0, 200) });
+        // game-master directives apply to THIS turn only — clear the pending flag
+        if (settings.dm) {
+          updateConversation(convId, { settings: JSON.stringify({ ...settings, dm_pending: false }) });
+        }
+      } catch (e) {
+        console.error(`[chat] post-commit bookkeeping failed (partie #${convId}):`, String(e?.message ?? e).slice(0, 160));
       }
-      // dashboard preview = the latest exchange
-      updateConversation(convId, { last_message: full.trim().slice(0, 200) });
-      // game-master directives apply to THIS turn only — clear the pending flag
-      if (settings.dm) {
-        updateConversation(convId, { settings: JSON.stringify({ ...settings, dm_pending: false }) });
-      }
-      send("done", { message: messageView(assistant) });
+      doneSent = true;
+      send("done", { message: messageView(getMessage(assistant.id) ?? assistant) });
       console.log(`[chat] 📨  Réponse #${assistant.id} envoyée au client — suggestions en arrière-plan…`);
-      // suggestions run in the background — the local model accepts concurrent
-      // requests
-      const suggPromise = generateSuggestions(
-        { world, persona, cards, scenario, conversation: conv },
-        listMessages(convId),
-      );
-      const sugg = await suggPromise;
-      if (sugg.length) {
-        const m2 = getMessage(assistant.id)!;
-        updateMessage(assistant.id, { meta: JSON.stringify({ ...JSON.parse(m2.meta || "{}"), suggestions: sugg }) });
-        send("suggestions", { messageId: assistant.id, suggestions: sugg });
+      // suggestions are best-effort: a failure here is already-committed and
+      // must not surface as an error to the client
+      try {
+        const sugg = await generateSuggestions(
+          { world, persona, cards, scenario, conversation: conv },
+          listMessages(convId),
+        );
+        if (sugg.length) {
+          const m2 = getMessage(assistant.id)!;
+          updateMessage(assistant.id, { meta: JSON.stringify({ ...JSON.parse(m2.meta || "{}"), suggestions: sugg }) });
+          send("suggestions", { messageId: assistant.id, suggestions: sugg });
+        }
+      } catch (e) {
+        console.warn(`[chat] suggestions échouées (partie #${convId}):`, String(e?.message ?? e).slice(0, 160));
       }
       close();
     } catch (e: any) {
       const aborted = e?.name === "AbortError" || e?.name === "TimeoutError" || /abort/i.test(String(e));
       if (assistantCreated) {
-        // the reply was already committed — a post-done failure (suggestions on
-        // a stream the client already closed) must NOT remove the user turn
-        try {
-          send("error", { message: String(e?.message ?? e) });
-        } catch { /* stream already closed */ }
+        if (doneSent) {
+          // committed AND announced — the client already has the turn, nothing
+          // to report (this path is defensive; post-done work swallows its own
+          // errors above)
+          console.error(`[chat] erreur après envoi (partie #${convId}):`, String(e?.message ?? e).slice(0, 160));
+        } else {
+          // committed but never announced (e.g. the meta write above blew up) —
+          // deliver "done" now so the client doesn't wait on a finished turn
+          try {
+            const m = getMessage(assistantId);
+            if (m) send("done", { message: messageView(m) });
+          } catch { /* stream closed */ }
+        }
       } else if (aborted && clientStopped) {
         // user pressed Stop: commit whatever the model already wrote, then
         // drop the orphan user turn only if nothing was produced

@@ -60,7 +60,7 @@ export function zipFiles(files: { path: string; data: Uint8Array | string }[]): 
     const local = concat([
       u32(0x04034b50),
       u16(20), // version needed (2.0)
-      u16(0), // flags
+      u16(0x0800), // flags: UTF-8 file names (French accents, spaces…)
       u16(0), // method: store
       u16(0), // time
       u16(0), // date
@@ -79,7 +79,7 @@ export function zipFiles(files: { path: string; data: Uint8Array | string }[]): 
         u32(0x02014b50),
         u16(20),
         u16(20),
-        u16(0),
+        u16(0x0800), // UTF-8 file names (must match the local header flag)
         u16(0),
         u16(0),
         u16(0),

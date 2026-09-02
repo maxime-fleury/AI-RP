@@ -12,6 +12,7 @@ cond_stage_model) whose UNet is SD 1.5-scale (859M params, cross_attention_dim=7
 no CLIP-G, no add embeddings). diffusers' StableDiffusionPipeline handles it natively.
 """
 import argparse
+import asyncio
 import base64
 import io
 import os
@@ -35,10 +36,13 @@ def load_pipeline():
     STATUS["device"] = device
     ckpt = os.path.join(MODELS, "koji", "koji_v21.safetensors")
 
+    # fp16 is a CUDA-only optimisation — on CPU many ops lack Half kernels and
+    # inference either errors out or crawls; keep fp32 there
+    torch_dtype = torch.float16 if device == "cuda" else torch.float32
     t0 = time.time()
     pipe = StableDiffusionPipeline.from_single_file(
         ckpt,
-        torch_dtype=torch.float16,
+        torch_dtype=torch_dtype,
         safety_checker=None,
         requires_safety_checker=False,
     )
@@ -110,6 +114,12 @@ def main(port: int):
     def health():
         return {"status": STATUS["status"], "device": STATUS["device"], "error": STATUS["error"]}
 
+    # One pipeline, one GPU: diffusers is not thread-safe and two concurrent
+    # renders would race it / double VRAM usage. Requests therefore serialize on
+    # an asyncio lock while the CPU/GPU work runs off the event loop, so health
+    # checks stay responsive even when a generation is queued behind another.
+    gen_lock = asyncio.Lock()
+
     @app.post("/generate")
     async def do_generate(request: Request):
         try:
@@ -119,7 +129,8 @@ def main(port: int):
         if _pipe is None:
             return JSONResponse({"error": "pipeline not ready"}, status_code=503)
         try:
-            return generate(body)
+            async with gen_lock:
+                return await asyncio.to_thread(generate, body)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 

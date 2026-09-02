@@ -11,7 +11,8 @@ import { DATA_DIR, IMAGES_DIR, UPLOADS_DIR, DB_PATH } from "./paths";
 import { db, listConversations, listMessages, listWorlds, listCards, listPersonas } from "./db";
 
 const BACKUPS_DIR = path.join(DATA_DIR, "backups");
-const KEEP = 7;
+const KEEP = 7; // calendar-day snapshots kept
+const KEEP_FORCED = 14; // extra safety-net snapshots kept (they can pile up)
 
 function dirSize(dir: string): number {
   if (!fs.existsSync(dir)) return 0;
@@ -124,12 +125,24 @@ export function purgeOrphans(files: string[]): { removed: number; bytes: number 
   return { removed, bytes };
 }
 
-/** Run a backup now (idempotent per day — one copy per calendar day). */
+/**
+ * Run a backup now. The daily scheduled copy is idempotent (one per calendar
+ * day); forced copies (manual backup + the pre-action safety nets around
+ * import / purge / rewind) always write a NEW file, so two operations on the
+ * same day each keep their own pre-state snapshot instead of overwriting it.
+ */
 export function runBackup(force = false): string | null {
   fs.mkdirSync(BACKUPS_DIR, { recursive: true });
   if (!fs.existsSync(DB_PATH)) return null;
   const stamp = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-  const dest = path.join(BACKUPS_DIR, `app-${stamp}.db`);
+  let base = `app-${stamp}`;
+  if (force) {
+    for (let n = 1; n < 1000; n++) {
+      if (!fs.existsSync(path.join(BACKUPS_DIR, `${base}.db`))) break;
+      base = `app-${stamp}-${String(n).padStart(3, "0")}`;
+    }
+  }
+  const dest = path.join(BACKUPS_DIR, `${base}.db`);
   if (fs.existsSync(dest) && !force) return null;
   try {
     // VACUUM INTO writes a consistent snapshot (committed WAL data included)
@@ -146,16 +159,17 @@ export function runBackup(force = false): string | null {
     console.error("[backup] failed:", e);
     return null;
   }
-  // rotation: keep only the KEEP most recent
-  const files = fs
-    .readdirSync(BACKUPS_DIR)
-    .filter((f) => f.endsWith(".db"))
-    .sort()
-    .reverse();
-  for (const f of files.slice(KEEP)) {
-    try { fs.unlinkSync(path.join(BACKUPS_DIR, f)); } catch { /* ignore */ }
-    try { fs.unlinkSync(path.join(BACKUPS_DIR, f + ".sha256")); } catch { /* ignore */ }
-  }
+  // rotation: daily copies keep KEEP calendar days; forced safety-net
+  // snapshots (multiple per day possible) keep the most recent ones
+  const files = fs.readdirSync(BACKUPS_DIR).filter((f) => f.endsWith(".db"));
+  const isDaily = (f: string) => /^app-\d{4}-\d{2}-\d{2}\.db$/.test(f);
+  const prune = (f: string) => {
+    for (const suffix of ["", ".sha256"]) {
+      try { fs.unlinkSync(path.join(BACKUPS_DIR, f + suffix)); } catch { /* ignore */ }
+    }
+  };
+  for (const f of files.filter(isDaily).sort().reverse().slice(KEEP)) prune(f);
+  for (const f of files.filter((f) => !isDaily(f)).sort().reverse().slice(KEEP_FORCED)) prune(f);
   console.log(`[backup] saved ${path.basename(dest)}`);
   return dest;
 }

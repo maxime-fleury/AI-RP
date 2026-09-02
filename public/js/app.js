@@ -1,6 +1,6 @@
-import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=45";
-import { el, esc, toast, actionToast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=45";
-import { renderChat } from "./chat.js?v=45";
+import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=50";
+import { el, esc, toast, actionToast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=50";
+import { renderChat } from "./chat.js?v=50";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -344,7 +344,7 @@ function shortcutsHelp() {
 }
 let shortcutCapturing = false; // set while the settings editor awaits a keypress
 function fireShortcut(k) {
-  import("./chat.js?v=45").then((m) => m.chatShortcut(k)).catch(() => {});
+  import("./chat.js?v=50").then((m) => m.chatShortcut(k)).catch(() => {});
 }
 document.addEventListener("keydown", (e) => {
   if (shortcutCapturing) return; // the settings key-capture owns this press
@@ -1418,6 +1418,19 @@ function scenarioModal(world, existing) {
   const body = el("div", {}, name.wrap, intro.wrap, notes.wrap,
     el("div", { class: "scen-gen-row", style: { marginTop: "4px" } }, genreSel.wrap, genBtn),
   );
+  // An empty scenario is auto-created before the IA generation so it has an id
+  // to regenerate against. If the user then closes the modal WITHOUT saving,
+  // that placeholder must not linger in the world — delete it on cancel.
+  let autoCreatedId = null;
+  let saved = false;
+  const cleanupIfUnsaved = async () => {
+    if (!autoCreatedId || saved) return;
+    try {
+      await api(`/api/scenarios/${autoCreatedId}`, { method: "DELETE" });
+      await refreshAll();
+      renderWorldDetail(world.id);
+    } catch { /* already gone */ }
+  };
 
   // write the AI opening into the intro field (new scenarios are created first
   // so they have an id to regenerate against)
@@ -1431,6 +1444,7 @@ function scenarioModal(world, existing) {
           body: { name: name.input.value.trim() || "Scénario", intro: "", notes: notes.input.value.trim() },
         });
         existing = created;
+        autoCreatedId = created.id;
         id = created.id;
       }
       const res = await api(`/api/scenarios/${id}/generate`, {
@@ -1450,7 +1464,7 @@ function scenarioModal(world, existing) {
     title: existing ? "Modifier le scénario" : "Nouveau scénario",
     body,
     footer: [
-      el("button", { class: "btn btn-ghost", onclick: () => close() }, "Annuler"),
+      el("button", { class: "btn btn-ghost", onclick: () => { cleanupIfUnsaved(); close(); } }, "Annuler"),
       el("button", { class: "btn btn-primary", onclick: async () => {
         const payload = {
           name: name.input.value.trim() || "Scénario",
@@ -1460,12 +1474,15 @@ function scenarioModal(world, existing) {
         try {
           if (existing) await api(`/api/scenarios/${existing.id}`, { method: "PATCH", body: payload });
           else await api(`/api/worlds/${world.id}/scenarios`, { body: payload });
+          saved = true; // the placeholder (if any) is now a real scenario
           close();
           await refreshAll();
           renderWorldDetail(world.id);
         } catch (e) { toast(e.message, "err"); }
       } }, "Enregistrer"),
     ],
+    // Escape / backdrop close: same cleanup as the Annuler button
+    onClose: cleanupIfUnsaved,
   });
 }
 
@@ -1621,7 +1638,7 @@ function cardModal(existing) {
   const avatarStatus = el("span", { class: "avatar-gen-status" });
   const sameSeedBtn = el("button", { class: "mini-btn", hidden: true, title: "Même composition, détails différents", onclick: () => genAvatar("seed") }, "🔒 Même seed");
   const varyBtn = el("button", { class: "mini-btn", hidden: true, title: "Nouvelle variation du même personnage", onclick: () => genAvatar("vary") }, "🎲 Varier");
-  const avatarPreview = existing?.avatar ? el("img", { src: existing.avatar, class: "avatar avatar-lg" }) : el("div", { class: "avatar avatar-lg", style: { display: "grid", placeItems: "center" } }, "🎭");
+  let avatarPreview = existing?.avatar ? el("img", { src: existing.avatar, class: "avatar avatar-lg" }) : el("div", { class: "avatar avatar-lg", style: { display: "grid", placeItems: "center" } }, "🎭");
   const avatarBox = el("div", { class: "avatar-editor" },
     avatarPreview,
     el("div", { class: "avatar-controls" },
@@ -2178,6 +2195,20 @@ async function renderSettings() {
     try {
       const text = await file.text();
       const parsed = JSON.parse(text);
+      if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.conversations)) {
+        throw new Error("ce fichier ne ressemble pas à une sauvegarde innsekai");
+      }
+      // restore ADDS rows — warn before the user duplicates what they already
+      // have (restoring the same file twice re-creates every element)
+      const would = (parsed.conversations?.length || 0) + (parsed.worlds?.length || 0)
+        + (parsed.cards?.length || 0) + (parsed.personas?.length || 0) + (parsed.scenarios?.length || 0);
+      const existing = (store.conversations?.length || 0) + (store.worlds?.length || 0)
+        + (store.cards?.length || 0) + (store.personas?.length || 0);
+      if (would > 0 && existing > 0 && !(await confirmModal({
+        title: "La restauration va AJOUTER des données",
+        message: `Ce fichier contient ${would} élément(s) (parties, mondes, cartes, personas…). Restaurer ne remplace rien : ils seront créés EN PLUS des ${existing} élément(s) déjà présents — restaurer deux fois le même fichier duplique donc tout.`,
+        confirmLabel: "Restaurer quand même",
+      }))) return;
       toast("Restauration en cours…", "ok", 8000);
       const res = await api("/api/backup", { body: { backup: parsed } });
       toast(`Restauration terminée : ${res.worlds} mondes, ${res.cards} cartes, ${res.conversations} parties ✓`);
@@ -2203,7 +2234,7 @@ async function renderSettings() {
       fileInput,
     ),
     el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "12px" } },
-      "La sauvegarde contient tes mondes, scénarios, cartes, personas et conversations (texte + réglages) ; les illustrations générées ne sont pas incluses — tu peux copier le dossier data/ pour tout conserver.",
+      "La sauvegarde contient tes mondes, scénarios, cartes, personas et conversations (texte + réglages), ainsi que les illustrations et avatars qu'ils référencent. Restaurer ajoute ces données à celles déjà présentes.",
     ),
   ));
 

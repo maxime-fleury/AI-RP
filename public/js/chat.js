@@ -1,6 +1,6 @@
-import { api, apiFetch, readSseStream } from "./api.js?v=45";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=45";
-import { store, refreshAll, refreshConversations, navigate, applyTheme } from "./app.js?v=45";
+import { api, apiFetch, readSseStream } from "./api.js?v=50";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=50";
+import { store, refreshAll, refreshConversations, refreshConversation, navigate, applyTheme } from "./app.js?v=50";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -10,8 +10,43 @@ let abortController = null;
 let beforeUnloadHandler = null; // installed when streaming starts
 let chipsRowRef = null;
 let sceneRefreshHook = null; // set by renderChat; fired after each completed turn
+// auto-coherence check: module-level because the SSE "done" handler in
+// doStream() runs outside renderChat (it used to live inside and threw a
+// ReferenceError on every completed turn)
 let lastAutoValidateAt = 0; // per-session throttle for the auto coherence check
 let autoValidateBusy = false;
+let coherenceBannerEl = null; // wired by renderChat
+let coherenceFindings = [];
+function showCoherenceBanner(findings) {
+  coherenceFindings = findings || [];
+  const banner = coherenceBannerEl;
+  if (!banner) return;
+  if (!coherenceFindings.length) { banner.hidden = true; return; }
+  banner.hidden = false;
+  const viewBtn = el("button", { class: "mini-btn", onclick: () => openFindings(coherenceFindings) }, "Voir");
+  const closeBtn = el("button", { class: "mini-btn", "aria-label": "Fermer", onclick: () => { banner.hidden = true; } }, "✕");
+  banner.replaceChildren(
+    el("span", {}, "🛡 " + coherenceFindings.length + " incohérence" + (coherenceFindings.length > 1 ? "s" : "") + " possible" + (coherenceFindings.length > 1 ? "s" : "") + " détectée" + (coherenceFindings.length > 1 ? "s" : "") + " — " + esc(coherenceFindings[0].message || "")),
+    viewBtn,
+    closeBtn,
+  );
+}
+/** Non-blocking post-turn coherence check (opt-in party setting, throttled). */
+async function maybeAutoValidate() {
+  if (!currentConversation || autoValidateBusy) return;
+  let cs = {};
+  try { cs = JSON.parse(currentConversation.settings || "{}"); } catch { /* ignore */ }
+  if (!cs.validate_auto) return;
+  const now = Date.now();
+  if (now - (lastAutoValidateAt || 0) < 10 * 60 * 1000) return;
+  lastAutoValidateAt = now;
+  autoValidateBusy = true;
+  try {
+    const r = await api(`/api/conversations/${currentConversation.id}/validate`, { body: {} });
+    showCoherenceBanner(r.findings || []);
+  } catch { /* silent — the model may be busy */ }
+  finally { autoValidateBusy = false; }
+}
 // multi-select mode (module-level so renderMessage can read it)
 let selectionMode = false;
 const selectedIds = new Set();
@@ -106,7 +141,7 @@ export async function renderChat(convIdRaw) {
   if (convIdRaw === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=45");
+    const { newGameWizard } = await import("./app.js?v=50");
     newGameWizard(pre);
     return;
   }
@@ -704,36 +739,9 @@ export async function renderChat(convIdRaw) {
     el("button", { class: "speak-btn", onclick: () => askToSpeak("narrateur") }, "🎙 Narrateur"),
     ...cards.map((c) => el("button", { class: "speak-btn", onclick: () => askToSpeak(c.name) }, "🎙 " + esc(c.name))),
   );
-  // ── auto-validate: non-blocking coherence banner after a turn (opt-in) ──
-  let lastFindings = [];
+  // ── auto-validate banner: module-level check, banner element wired here ──
   const coherenceBanner = el("div", { class: "coherence-banner", hidden: true });
-  const showCoherenceBanner = (findings) => {
-    lastFindings = findings || [];
-    if (!lastFindings.length) { coherenceBanner.hidden = true; return; }
-    coherenceBanner.hidden = false;
-    const viewBtn = el("button", { class: "mini-btn", onclick: () => openFindings(lastFindings) }, "Voir");
-    const closeBtn = el("button", { class: "mini-btn", "aria-label": "Fermer", onclick: () => { coherenceBanner.hidden = true; } }, "✕");
-    coherenceBanner.replaceChildren(
-      el("span", {}, "🛡 " + lastFindings.length + " incohérence" + (lastFindings.length > 1 ? "s" : "") + " possible" + (lastFindings.length > 1 ? "s" : "") + " détectée" + (lastFindings.length > 1 ? "s" : "") + " — " + esc(lastFindings[0].message || "")),
-      viewBtn,
-      closeBtn,
-    );
-  };
-  const maybeAutoValidate = async () => {
-    if (!currentConversation || autoValidateBusy) return;
-    let cs = {};
-    try { cs = JSON.parse(currentConversation.settings || "{}"); } catch { /* ignore */ }
-    if (!cs.validate_auto) return;
-    const now = Date.now();
-    if (now - (lastAutoValidateAt || 0) < 10 * 60 * 1000) return;
-    lastAutoValidateAt = now;
-    autoValidateBusy = true;
-    try {
-      const r = await api(`/api/conversations/${currentConversation.id}/validate`, { body: {} });
-      showCoherenceBanner(r.findings || []);
-    } catch { /* silent — the model may be busy */ }
-    finally { autoValidateBusy = false; }
-  };
+  coherenceBannerEl = coherenceBanner;
 
   // ── multi-select bar (☑): count + copy / export / delete of the selection ──
   const selectionBar = el("div", { class: "selection-bar", hidden: true });
@@ -995,6 +1003,11 @@ async function doStream(content, opts = {}) {
   sendBtn.disabled = true;
   if (stopBtn) stopBtn.hidden = false;
   const streamGen = ++streamGeneration;
+  // idempotency key for this attempt: the SSE retry loop re-posts with the
+  // SAME uid, so the server can drop a partially-committed exchange instead of
+  // duplicating it
+  const attemptUid = (typeof crypto !== "undefined" && crypto.randomUUID?.()) ||
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
   // optimistic user bubble (display text may differ from the raw content)
   const displayText = opts.display || content;
@@ -1004,7 +1017,8 @@ async function doStream(content, opts = {}) {
     content: displayText, segments: [], meta: {}, created_at: Date.now(),
     bubbleClass: displayText.startsWith("🎲 ") ? "dice-roll" : undefined,
   };
-  scroll.append(renderMessage(userMsg));
+  const userNode = renderMessage(userMsg);
+  scroll.append(userNode);
 
   const pending = { id: `pending-${Date.now()}`, role: "assistant", name: "…", content: "", segments: [], meta: {}, created_at: Date.now() };
   const pendingNode = renderMessage(pending);
@@ -1084,14 +1098,16 @@ async function doStream(content, opts = {}) {
         const res = await apiFetch(`/api/conversations/${currentConversation.id}/stream`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content, directive: opts.directive || "", prompt: opts.prompt || "" }),
+          body: JSON.stringify({ content, directive: opts.directive || "", prompt: opts.prompt || "", uid: attemptUid }),
           signal: abortController.signal,
         });
+    let streamDone = false; // an "error" after "done" is never a failure (turn committed)
     await readSseStream(res, async (event, data) => {
       if (event === "delta") {
         full += data.text || "";
         scheduleRender();
       } else if (event === "done") {
+        streamDone = true;
         sfx("chime");
         if (document.hidden) notify("Réponse prête ✨", (currentConversation?.title || "Partie") + " — " + (data.message?.content || "").slice(0, 80));
         const m = data.message;
@@ -1110,20 +1126,33 @@ async function doStream(content, opts = {}) {
         sceneRefreshHook?.();
         // optional auto-coherence check (opt-in in the party settings, throttled)
         maybeAutoValidate();
-        // background, non-blocking: close a story chapter / offer dynamic NPCs /
-        // refresh the relationship graph (all server-throttled)
-        maybeChapter().catch(() => {});
-        maybeNpcSuggest().catch(() => {});
-        maybeRelations().catch(() => {});
+        // background but SEQUENCED (not fire-and-forget): maybeChapter may
+        // re-render the chat, so the NPC/relations hooks must run afterwards to
+        // attach their UI to the fresh DOM (each is server-throttled)
+        try { await maybeChapter(); } catch { /* non-blocking */ }
+        try { await maybeNpcSuggest(); } catch { /* non-blocking */ }
+        try { await maybeRelations(); } catch { /* non-blocking */ }
       } else if (event === "suggestions") {
         const { messageId, suggestions } = data;
         if (suggestions?.length) renderChips(suggestions);
         void messageId;
       } else if (event === "error") {
+        if (streamDone) { console.warn("[chat] erreur signalée après done — tour déjà validé, ignoré:", data.message); return; }
         throw new Error(data.message || "Erreur inconnue");
       }
     });
         await refreshAll();
+        // keep the open party's state (messages, meta) fresh so actions on the
+        // newest reply — Régénérer, favori, note, réactions — can find it
+        if (currentConversation?.id) {
+          const fresh = await api(`/api/conversations/${currentConversation.id}`).catch(() => null);
+          if (fresh) {
+            currentConversation = fresh;
+            const ci = store.conversations.findIndex((c) => c.id === fresh.id);
+            if (ci >= 0) store.conversations[ci] = fresh;
+            else store.conversations.unshift(fresh);
+          }
+        }
         break; // stream finished cleanly — never re-post
       } catch (e) {
         if (e.name === "AbortError" || abortController?.signal.aborted) return;
@@ -1139,7 +1168,14 @@ async function doStream(content, opts = {}) {
         const errNode = el("div", { class: "msg me" },
           el("div", { class: "bubble", style: { borderColor: "var(--danger)", color: "var(--danger)" } },
             el("div", { style: { fontWeight: 700 } }, "⚠️ " + esc(e.message)),
-            el("button", { class: "mini-btn", style: { marginTop: "8px" }, onclick: () => doStream(content) }, "↻ Réessayer"),
+            el("button", { class: "mini-btn", style: { marginTop: "8px" }, onclick: () => {
+              // drop the stale optimistic bubble + error before re-posting;
+              // keep the original opts so slash-command rewrites and
+              // directives aren't lost on the retry
+              userNode.remove();
+              errNode.remove();
+              doStream(content, opts);
+            } }, "↻ Réessayer"),
           ),
         );
         scroll.append(errNode);
@@ -2672,7 +2708,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal, field } from "./ui.js?v=45";
+import { openModal, field } from "./ui.js?v=50";
 void applyTheme;
 void fmtTime;
 void currentConversation;
