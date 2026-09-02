@@ -4,9 +4,9 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+export const dataDir = mkdtempSync(path.join(tmpdir(), "innsekai-test-"));
 
-export const dataDir = mkdtempSync(path.join(tmpdir(), "airp-test-"));
-process.env.AI_RP_DATA_DIR = dataDir;
+process.env.INNSEKAI_DATA_DIR = dataDir;
 
 export async function loadApp() {
   const db = await import("../src/server/db");

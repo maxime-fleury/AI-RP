@@ -771,7 +771,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
           mes_example: card.mes_example || "",
           system_prompt: card.system_prompt || "",
           post_history_instructions: card.post_history_instructions || "",
-          creator: "Freebuff AI-RP",
+          creator: "Freebuff Innsekai",
           character_version: "1.0",
           alternate_greetings: [],
           tags: [],
@@ -1728,7 +1728,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         return { ...c, cast, settings, messages: listMessages(c.id) };
       });
       return json({
-        app: "ai-rp",
+        app: "innsekai",
         version: 1,
         exported_at: new Date().toISOString(),
         worlds: listWorlds(),

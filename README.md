@@ -1,4 +1,4 @@
-# AI-RP — Roleplay & Mondes
+# Innsekai — Roleplay & Mondes
 
 Interface web de roleplay avec IA : crée des mondes (isekai…), importe des cartes
 de personnages SillyTavern, définis des scénarios et joue avec un narrateur + des
@@ -34,7 +34,7 @@ PORT=3210 bun src/index.ts
   recrée tout depuis un fichier.
 - Le dossier `data/` contient la base SQLite et tous les fichiers générés
   (images) : copie-le régulièrement pour tout conserver, ou ajoute
-  `AI_RP_DATA_DIR` comme variable d'environnement pour déplacer ces données
+  `INNSEKAI_DATA_DIR` comme variable d'environnement pour déplacer ces données
   ailleurs.
 
 ## Stack

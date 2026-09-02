@@ -4,8 +4,8 @@ import path from "node:path";
 export const ROOT = path.resolve(import.meta.dir, "../..");
 export const MODELS_DIR = path.join(ROOT, "models");
 // overridable so tests can use an isolated data directory
-export const DATA_DIR = process.env.AI_RP_DATA_DIR
-  ? path.resolve(process.env.AI_RP_DATA_DIR)
+export const DATA_DIR = process.env.INNSEKAI_DATA_DIR
+  ? path.resolve(process.env.INNSEKAI_DATA_DIR)
   : path.join(ROOT, "data");
 export const IMAGES_DIR = path.join(DATA_DIR, "images");
 export const UPLOADS_DIR = path.join(DATA_DIR, "uploads");

@@ -6,7 +6,7 @@ import { ensureImageServer } from "./server/image";
 import { getSetting, cleanupStaleJobs } from "./server/db";
 import { scheduleDailyBackup } from "./server/backup";
 
-const NAME = "ai-rp";
+const NAME = "innsekai";
 const MIN_PORT = 3000;
 const MAX_PORT = 3600;
 const EXCLUDED = new Set([8000]);

@@ -1,11 +1,11 @@
 // Tiny API helper
 export function getToken() {
-  try { return localStorage.getItem("ai-rp-token") || ""; } catch { return ""; }
+  try { return localStorage.getItem("innsekai-token") || ""; } catch { return ""; }
 }
 export function setToken(tok) {
   try {
-    if (tok) localStorage.setItem("ai-rp-token", tok);
-    else localStorage.removeItem("ai-rp-token");
+    if (tok) localStorage.setItem("innsekai-token", tok);
+    else localStorage.removeItem("innsekai-token");
   } catch { /* ignore */ }
 }
 
@@ -25,7 +25,7 @@ export async function api(path, opts = {}) {
     ...opts.fetchOpts,
   });
   if (res.status === 401) {
-    window.dispatchEvent(new CustomEvent("airp-unauthorized"));
+    window.dispatchEvent(new CustomEvent("innsekai-unauthorized"));
     const err = new Error("Authentification requise — entre le token LAN (Réglages → Sécurité).");
     err.status = 401;
     throw err;
@@ -48,7 +48,7 @@ export async function apiFetch(path, options = {}) {
 export async function apiForm(path, formData) {
   const res = await apiFetch(path, { method: "POST", body: formData });
   if (res.status === 401) {
-    window.dispatchEvent(new CustomEvent("airp-unauthorized"));
+    window.dispatchEvent(new CustomEvent("innsekai-unauthorized"));
     throw new Error("Authentification requise — entre le token LAN.");
   }
   if (!res.ok) {

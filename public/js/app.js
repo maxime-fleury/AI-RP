@@ -81,10 +81,10 @@ export function narratorStyleOptions() {
 
 // personalization: accent color + background image (local to this device)
 export function applyCustom() {
-  const accent = localStorage.getItem("ai-rp-accent");
+  const accent = localStorage.getItem("innsekai-accent");
   if (accent) document.documentElement.style.setProperty("--accent", accent);
   else document.documentElement.style.removeProperty("--accent");
-  const bg = localStorage.getItem("ai-rp-bg");
+  const bg = localStorage.getItem("innsekai-bg");
   if (bg) {
     document.documentElement.style.setProperty("--app-bg", `url("${bg}")`);
     document.body.classList.add("custom-bg");
@@ -100,7 +100,7 @@ export function applyTheme(theme) {
   const h = new Date().getHours();
   const effective = theme === "auto" ? (h >= 20 || h < 8 ? "anime" : "glass") : theme;
   document.documentElement.dataset.theme = effective;
-  localStorage.setItem("ai-rp-theme", JSON.stringify(theme));
+  localStorage.setItem("innsekai-theme", JSON.stringify(theme));
 }
 // 'auto' re-evaluates as the day/night boundary passes (and on window focus)
 setInterval(() => {
@@ -109,7 +109,7 @@ setInterval(() => {
 }, 60_000);
 window.addEventListener("focus", () => { if (getThemeChoice() === "auto") applyTheme("auto"); });
 function getThemeChoice() {
-  try { return JSON.parse(localStorage.getItem("ai-rp-theme") || '"glass"'); } catch { return "glass"; }
+  try { return JSON.parse(localStorage.getItem("innsekai-theme") || '"glass"'); } catch { return "glass"; }
 }
 
 // ─── sidebar ──────────────────────────────────────────────────────────────────
@@ -151,7 +151,7 @@ function renderSidebar(active) {
     el("div", { class: "brand" },
       el("div", { class: "logo" }, "🪄"),
       el("div", {},
-        el("h1", {}, "AI-RP"),
+        el("h1", {}, "Innsekai"),
         el("small", {}, "Mondes & Personnages"),
       ),
     ),
@@ -166,7 +166,7 @@ function renderSidebar(active) {
 function toggleSidebar() {
   const sb = document.getElementById("sidebar");
   const collapsed = sb.classList.toggle("collapsed");
-  try { localStorage.setItem("ai-rp-sidebar", collapsed ? "1" : "0"); } catch { /* ignore */ }
+  try { localStorage.setItem("innsekai-sidebar", collapsed ? "1" : "0"); } catch { /* ignore */ }
   renderSidebar(currentSection);
 }
 
@@ -2087,21 +2087,21 @@ async function renderSettings() {
 
   // ── Apparence & sécurité ──
   container.append(el("div", { class: "section-title", id: "sec-app" }, "Apparence & sécurité"));
-  const accentCur = localStorage.getItem("ai-rp-accent") || getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#ff7ad9";
+  const accentCur = localStorage.getItem("innsekai-accent") || getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#ff7ad9";
   const accentWrap = el("label", { class: "fl-field" },
     el("input", { type: "color", value: accentCur }),
     el("span", { class: "fl-label" }, "Couleur d'accent"),
   );
   accentWrap.querySelector("input").addEventListener("input", (e) => {
-    localStorage.setItem("ai-rp-accent", e.target.value);
+    localStorage.setItem("innsekai-accent", e.target.value);
     applyCustom();
   });
   const bgWrap = el("label", { class: "fl-field" },
-    el("input", { value: localStorage.getItem("ai-rp-bg") || "", placeholder: " " }),
+    el("input", { value: localStorage.getItem("innsekai-bg") || "", placeholder: " " }),
     el("span", { class: "fl-label" }, "Image de fond (URL)"),
   );
   bgWrap.querySelector("input").addEventListener("input", (e) => {
-    localStorage.setItem("ai-rp-bg", e.target.value.trim());
+    localStorage.setItem("innsekai-bg", e.target.value.trim());
     applyCustom();
   });
   const authField = field("Token d'accès LAN (vide = ouvert)", s.auth_token || "", { type: "password", placeholder: "Garde-le secret — protège l'API sur le réseau" });
@@ -2113,8 +2113,8 @@ async function renderSettings() {
       notifCb.wrap,
       soundCb.wrap,
       el("button", { class: "btn btn-ghost btn-sm", onclick: () => {
-        localStorage.removeItem("ai-rp-accent");
-        localStorage.removeItem("ai-rp-bg");
+        localStorage.removeItem("innsekai-accent");
+        localStorage.removeItem("innsekai-bg");
         applyCustom();
         toast("Apparence réinitialisée ✓");
         renderSettings();
@@ -2192,7 +2192,7 @@ async function renderSettings() {
           const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
           const a = document.createElement("a");
           a.href = URL.createObjectURL(blob);
-          a.download = `ai-rp-backup-${new Date().toISOString().slice(0, 10)}.json`;
+          a.download = `innsekai-backup-${new Date().toISOString().slice(0, 10)}.json`;
           a.click();
           URL.revokeObjectURL(a.href);
           toast("Sauvegarde téléchargée ✓");
@@ -2585,7 +2585,7 @@ function showAuthModal() {
   });
 }
 
-window.addEventListener("airp-unauthorized", () => {
+window.addEventListener("innsekai-unauthorized", () => {
   if (!document.querySelector(".modal")) showAuthModal();
 });
 
@@ -2594,7 +2594,7 @@ window.addEventListener("airp-unauthorized", () => {
   try {
     applyCustom();
     if ("Notification" in window && Notification.permission === "default") Notification.requestPermission().catch(() => {});
-    if (localStorage.getItem("ai-rp-sidebar") === "1") {
+    if (localStorage.getItem("innsekai-sidebar") === "1") {
       document.getElementById("sidebar")?.classList.add("collapsed");
     }
     // LAN token gate: ask for the token before loading anything

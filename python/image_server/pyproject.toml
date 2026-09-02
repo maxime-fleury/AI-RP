@@ -1,7 +1,7 @@
 [project]
-name = "ai-rp-image-server"
+name = "innsekai-image-server"
 version = "0.1.0"
-description = "Koji (SDXL) image generation sidecar for the AI-RP app"
+description = "Koji (SDXL) image generation sidecar for the Innsekai app"
 requires-python = ">=3.11"
 dependencies = [
     "diffusers>=0.31",

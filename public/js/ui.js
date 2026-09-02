@@ -63,8 +63,8 @@ export function actionToast(msg, actionLabel, onAction, ms = 6000) {
 export function openModal({ title, sub, body, footer, wide = false, onClose }) {
   const root = document.getElementById("modal-root");
   const backdrop = el("div", { class: "modal-backdrop" });
-  const modal = el("div", { class: `modal${wide ? " wide" : ""}`, role: "dialog", "aria-modal": "true", "aria-labelledby": "airp-modal-title" });
-  if (title) modal.append(el("h3", { id: "airp-modal-title" }, title));
+  const modal = el("div", { class: `modal${wide ? " wide" : ""}`, role: "dialog", "aria-modal": "true", "aria-labelledby": "innsekai-modal-title" });
+  if (title) modal.append(el("h3", { id: "innsekai-modal-title" }, title));
   if (sub) modal.append(el("div", { class: "m-sub" }, sub));
   if (body) modal.append(body);
   if (footer) modal.append(el("div", { class: "modal-footer" }, footer));
