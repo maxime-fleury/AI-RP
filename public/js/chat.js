@@ -328,6 +328,7 @@ export async function renderChat(convIdRaw) {
   const returnBtn = el("button", { title: "Revenir au checkpoint (rewind)", onclick: () => rewindModal() }, "🔁");
   const loopsBtn = el("button", { title: "Journal des boucles", onclick: () => loopsModal() }, "📔");
   const loreBtn = el("button", { title: "Canon de la partie", onclick: () => loreModal() }, "📚");
+  const relBtn = el("button", { title: "Relations entre personnages (affinités)", onclick: () => relationsModal(conv) }, "💞");
   const menu = el("div", { class: "header-menu", hidden: true, role: "menu" });
   const closeHeaderMenu = () => { menu.hidden = true; };
   const menuSection = (title, pairs) => {
@@ -346,7 +347,7 @@ export async function renderChat(convIdRaw) {
     menu.hidden = !menu.hidden;
   } }, "⋮");
   menu.append(
-    ...menuSection("🎬 Scène & mémoire", [[sceneBtn, "État de la scène"], [memoryBtn, "Mémoire structurée"], [dmBtn, "Directives du maître de jeu"], [branchesBtn, "Variantes"], [validateBtn, "Vérifier la cohérence"]]),
+    ...menuSection("🎬 Scène & mémoire", [[sceneBtn, "État de la scène"], [memoryBtn, "Mémoire structurée"], [relBtn, "Relations (affinités)"], [dmBtn, "Directives du maître de jeu"], [branchesBtn, "Variantes"], [validateBtn, "Vérifier la cohérence"]]),
     ...menuSection("🔎 Fil & sélection", [[searchBtn, "Rechercher"], [bookmarkFilterBtn, "Favoris seulement"], [selectBtn, "Sélectionner plusieurs messages"]]),
     ...menuSection("📤 Export", [[mdBtn, "Exporter en Markdown"], [copyThreadBtn, "Copier le fil"], [galleryBtn, "Galerie d'illustrations"], [exportBtn, "Exporter en ZIP"]]),
     ...menuSection("🕘 Boucles de temps", [[checkpointBtn, "Marquer un checkpoint"], [returnBtn, "Revenir au checkpoint"], [loopsBtn, "Journal des boucles"]]),
@@ -1109,9 +1110,11 @@ async function doStream(content, opts = {}) {
         sceneRefreshHook?.();
         // optional auto-coherence check (opt-in in the party settings, throttled)
         maybeAutoValidate();
-        // background, non-blocking: close a story chapter / offer dynamic NPCs
+        // background, non-blocking: close a story chapter / offer dynamic NPCs /
+        // refresh the relationship graph (all server-throttled)
         maybeChapter().catch(() => {});
         maybeNpcSuggest().catch(() => {});
+        maybeRelations().catch(() => {});
       } else if (event === "suggestions") {
         const { messageId, suggestions } = data;
         if (suggestions?.length) renderChips(suggestions);
@@ -1449,8 +1452,338 @@ async function branchesModal() {
   paint();
 }
 
-// ─── structured memory (🧠) — view / edit the JSON memory maintained by the ──
-// rolling summary: location, characters, goals, items, facts, relationships.
+// ─── relationship graph (💞) — affinities that evolve during play ─────────────
+// Data: conversation settings.rels, updated by the model after scenes (auto,
+// throttled) or on demand. Rendered as a canvas graph: each node is a character
+// (the persona is dashed), each directed pair a→b is scored -100…+100 and the
+// edge colour follows the dominant feeling. Hovering an edge shows both
+// directions; hovering a node highlights its links.
+let relationsModalRef = null; // { refresh } — the auto hook redraws an open modal
+
+async function relationsModal(convIn) {
+  const convId = Number(convIn.id);
+  let conv = convIn;
+  let rels = null;
+  let busy = false;
+  const tip = el("div", { class: "rel-tip", hidden: true });
+  const canvas = el("canvas", { class: "rel-canvas" });
+  const canvasWrap = el("div", { class: "rel-wrap" }, canvas, tip);
+  const status = el("span", { class: "rel-status" });
+  const scanBtn = el("button", { class: "btn btn-primary btn-sm" }, "🔄 Analyser les dernières scènes");
+  const resetBtn = el("button", { class: "btn btn-ghost btn-sm" }, "🗑 Réinitialiser");
+  const legendEl = el("div", { class: "rel-legend" });
+  const emptyEl = el("div", { class: "empty" },
+    el("div", { class: "big" }, "💞"),
+    el("h3", {}, "Aucun personnage à relier"),
+    el("p", {}, "Ajoute au moins deux personnages à la partie (cartes en scène ou personnages secondaires découverts en jouant), puis lance une analyse."),
+  );
+  const toolbar = el("div", { class: "rel-toolbar" }, scanBtn, resetBtn, status);
+
+  const bucketFor = (v) =>
+    v <= -70 ? { color: "#e11d48", label: "haine" }
+      : v <= -25 ? { color: "#f97316", label: "tension" }
+        : v < 25 ? { color: "#94a3b8", label: "neutre" }
+          : v < 70 ? { color: "#10b981", label: "allié" }
+            : { color: "#ec4899", label: "passion" };
+  const BUCKET_META = [
+    { label: "haine", color: "#e11d48" }, { label: "tension", color: "#f97316" },
+    { label: "neutre", color: "#94a3b8" }, { label: "allié", color: "#10b981" }, { label: "passion", color: "#ec4899" },
+  ];
+  legendEl.append(...BUCKET_META.map((b) => el("span", { class: "rel-legend-item" }, el("i", { style: { background: b.color } }), b.label)));
+
+  const collectNames = () => {
+    const map = new Map();
+    for (const c of conv.cards || []) if (c?.name) map.set(c.name, { name: c.name, persona: false });
+    if (conv.persona?.name) map.set(conv.persona.name, { name: conv.persona.name, persona: true });
+    for (const p of rels?.pairs || []) {
+      if (p?.a) map.set(p.a, { name: p.a, persona: false });
+      if (p?.b) map.set(p.b, { name: p.b, persona: false });
+    }
+    const personaName = conv.persona?.name;
+    return [...map.values()].sort((x, y) => {
+      if (x.name === personaName) return -1;
+      if (y.name === personaName) return 1;
+      return x.name.localeCompare(y.name, "fr");
+    });
+  };
+
+  let hoverName = null;
+  let hoverKey = null; // canonical "a|b" of the edge under the cursor
+  const redraw = () => {
+    const names = collectNames();
+    const hasPeople = names.length >= 2;
+    canvas.hidden = !hasPeople;
+    emptyEl.hidden = hasPeople;
+    if (!hasPeople) { hoverName = null; hoverKey = null; tip.hidden = true; return; }
+    const W = Math.max(560, canvasWrap.clientWidth - 8) || 860;
+    const H = 520;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    // circular layout
+    const N = names.length;
+    const cx = W / 2, cy = H / 2;
+    const R = Math.max(120, Math.min(Math.min(W, H) / 2 - 70, (N * 96) / (2 * Math.PI)));
+    const pos = new Map();
+    names.forEach((n, i) => {
+      const ang = -Math.PI / 2 + (i * 2 * Math.PI) / N;
+      pos.set(n.name, { x: cx + R * Math.cos(ang), y: cy + R * Math.sin(ang) });
+    });
+    const keyOf = (a, b) => (a < b ? a + "\u241f" + b : b + "\u241f" + a);
+    const rowsFor = (a, b) => {
+      const rows = { ab: null, ba: null };
+      for (const p of rels?.pairs || []) {
+        if (p.a === a && p.b === b) rows.ab = p;
+        else if (p.a === b && p.b === a) rows.ba = p;
+      }
+      return rows;
+    };
+    // one record per undirected pair
+    const seen = new Set();
+    const pairKeys = [];
+    for (const p of rels?.pairs || []) {
+      if (!pos.has(p?.a) || !pos.has(p?.b)) continue;
+      const k = keyOf(p.a, p.b);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      pairKeys.push(k);
+    }
+    const edgeInfo = (k) => {
+      const [a, b] = k.split("\u241f");
+      const rows = rowsFor(a, b);
+      const vals = [rows.ab, rows.ba].filter(Boolean).map((r) => r.value);
+      if (!vals.length) return null;
+      const avg = vals.reduce((s, v) => s + v, 0) / vals.length;
+      // the dominant direction drives the colour + the arrow head
+      const dom = (rows.ab?.value ?? -Infinity) >= (rows.ba?.value ?? -Infinity) ? rows.ab : rows.ba;
+      return { a, b, rows, avg, dom, bucket: bucketFor(dom.value) };
+    };
+    // edges (behind the nodes)
+    for (const k of pairKeys) {
+      const e = edgeInfo(k);
+      if (!e) continue;
+      const A = pos.get(e.a), B = pos.get(e.b);
+      const hi = hoverKey === k;
+      ctx.globalAlpha = hi ? 1 : 0.5 + (Math.abs(e.avg) / 100) * 0.45;
+      ctx.strokeStyle = e.bucket.color;
+      ctx.lineWidth = 1.6 + Math.min(4.5, (Math.abs(e.avg) / 100) * 4.4) + (hi ? 1.6 : 0);
+      ctx.beginPath();
+      ctx.moveTo(A.x, A.y);
+      ctx.lineTo(B.x, B.y);
+      ctx.stroke();
+      // arrow head at the target of the dominant feeling (a feels → b)
+      const fx = pos.get(e.dom.a).x, fy = pos.get(e.dom.a).y;
+      const tx = pos.get(e.dom.b).x, ty = pos.get(e.dom.b).y;
+      const ang = Math.atan2(ty - fy, tx - fx);
+      const tipX = tx - Math.cos(ang) * 27, tipY = ty - Math.sin(ang) * 27;
+      const back1 = ang + Math.PI - 0.55, back2 = ang + Math.PI + 0.55;
+      ctx.globalAlpha = hi ? 1 : 0.75;
+      ctx.beginPath();
+      ctx.moveTo(tipX, tipY);
+      ctx.lineTo(tipX + Math.cos(back1) * 8, tipY + Math.sin(back1) * 8);
+      ctx.lineTo(tipX + Math.cos(back2) * 8, tipY + Math.sin(back2) * 8);
+      ctx.closePath();
+      ctx.fillStyle = e.bucket.color;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      // score badge mid-edge when the graph is sparse enough
+      if (N <= 12 && Math.abs(e.avg) >= 15) {
+        const mx = (A.x + B.x) / 2, my = (A.y + B.y) / 2;
+        const label = (e.avg >= 0 ? "+" : "") + Math.round(e.avg);
+        ctx.font = "700 12px system-ui, sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = "rgba(0,0,0,.72)";
+        ctx.fillRect(mx - 13, my - 10, 26, 19);
+        ctx.fillStyle = "#fff";
+        ctx.fillText(label, mx, my + 0.5);
+      }
+    }
+    ctx.globalAlpha = 1;
+    // nodes
+    for (const n of names) {
+      const { x, y } = pos.get(n.name);
+      const r = 21;
+      const hue = nameHue(n.name);
+      const grad = ctx.createLinearGradient(x - r, y - r, x + r, y + r);
+      grad.addColorStop(0, `hsl(${hue} 78% 62%)`);
+      grad.addColorStop(1, `hsl(${(hue + 48) % 360} 80% 36%)`);
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = grad;
+      ctx.fill();
+      if (hoverName === n.name) {
+        ctx.strokeStyle = "rgba(255,255,255,.85)";
+        ctx.lineWidth = 3;
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.arc(x, y, r + 5, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      if (n.persona) {
+        ctx.strokeStyle = "rgba(255,255,255,.95)";
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.arc(x, y, r + 4, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      ctx.fillStyle = "#fff";
+      ctx.font = "700 13px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText((n.name.charAt(0) || "?").toUpperCase(), x, y + 0.5);
+      ctx.font = "11px system-ui, sans-serif";
+      ctx.textBaseline = "top";
+      ctx.shadowColor = "rgba(0,0,0,.85)";
+      ctx.shadowBlur = 3;
+      ctx.fillStyle = "#fff";
+      ctx.fillText(n.name, x, y + r + 7);
+      if (n.persona) {
+        ctx.font = "9.5px system-ui, sans-serif";
+        ctx.fillStyle = "rgba(255,255,255,.72)";
+        ctx.fillText("(toi)", x, y + r + 20);
+      }
+      ctx.shadowBlur = 0;
+    }
+    // remember geometry for hit-testing
+    redraw.geom = { pos, pairKeys, edgeInfo, W, H };
+  };
+
+  const fmtVal = (p) => (p.value >= 0 ? "+" : "") + p.value;
+  const tipRows = (name, k, g) => {
+    const out = [];
+    if (name) {
+      out.push(el("strong", {}, esc(name) + (name === conv.persona?.name ? " (toi)" : "")));
+      const links = (rels?.pairs || []).filter((p) => p.a === name || p.b === name);
+      if (!links.length) out.push(el("div", { class: "dim" }, "Aucun lien suivi pour l'instant."));
+      else for (const p of links) {
+        out.push(el("div", {}, esc(p.a) + " → " + esc(p.b) + " : " + fmtVal(p) + (p.note ? " — " + esc(p.note) : "")));
+      }
+    } else if (k && g) {
+      const e = g.edgeInfo(k);
+      if (e) {
+        out.push(el("strong", {}, "Lien"));
+        for (const p of [e.rows.ab, e.rows.ba]) {
+          if (p) out.push(el("div", {}, esc(p.a) + " → " + esc(p.b) + " : " + fmtVal(p) + " (" + bucketFor(p.value).label + ")" + (p.note ? " — " + esc(p.note) : "")));
+        }
+      }
+    }
+    return out;
+  };
+  canvas.addEventListener("mousemove", (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const g = redraw.geom;
+    hoverName = null;
+    hoverKey = null;
+    if (g) {
+      for (const [name, p] of g.pos) {
+        if (Math.hypot(p.x - mx, p.y - my) <= 26) { hoverName = name; break; }
+      }
+      if (!hoverName) {
+        for (const k of g.pairKeys) {
+          const ed = g.edgeInfo(k);
+          if (!ed) continue;
+          const A = g.pos.get(ed.a), B = g.pos.get(ed.b);
+          const dx = B.x - A.x, dy = B.y - A.y;
+          const len2 = dx * dx + dy * dy;
+          const t = len2 ? Math.max(0, Math.min(1, ((mx - A.x) * dx + (my - A.y) * dy) / len2)) : 0;
+          const px = A.x + t * dx, py = A.y + t * dy;
+          if (Math.hypot(mx - px, my - py) <= 8) { hoverKey = k; break; }
+        }
+      }
+    }
+    canvas.style.cursor = hoverName ? "pointer" : "default";
+    const rows = tipRows(hoverName, hoverKey, g);
+    if (rows.length) {
+      tip.hidden = false;
+      tip.replaceChildren(...rows);
+      const maxX = g ? g.W : 800;
+      const maxY = g ? g.H : 500;
+      tip.style.left = Math.min(mx + 14, maxX - 320) + "px";
+      tip.style.top = Math.min(my + 14, maxY - 130) + "px";
+    } else tip.hidden = true;
+    redraw();
+  });
+  canvas.addEventListener("mouseleave", () => {
+    hoverName = null;
+    hoverKey = null;
+    tip.hidden = true;
+    redraw();
+  });
+
+  const refreshData = async () => {
+    const [c, r] = await Promise.all([
+      api(`/api/conversations/${convId}`).catch(() => conv),
+      api(`/api/conversations/${convId}/relations`).catch(() => ({ rels: null })),
+    ]);
+    conv = c;
+    rels = r.rels || null;
+    const n = rels?.pairs?.length || 0;
+    resetBtn.hidden = !n;
+    if (n) status.textContent = `${n} lien${n > 1 ? "s" : ""} suivi${n > 1 ? "s" : ""} · dernière analyse ${timeAgo(rels.at) || "à l'instant"}.`;
+    else status.textContent = "Aucun lien suivi pour l'instant — joue quelques scènes puis lance une analyse.";
+    redraw();
+  };
+
+  scanBtn.addEventListener("click", async () => {
+    if (busy) return;
+    busy = true;
+    scanBtn.disabled = true;
+    scanBtn.textContent = "⏳ Analyse en cours…";
+    status.textContent = "Le modèle relit les dernières scènes…";
+    try {
+      const r = await api(`/api/conversations/${convId}/relations`, { method: "POST", body: { manual: true } });
+      if (!r.scanned) {
+        status.textContent = r.reason === "empty" ? "Il faut au moins deux messages de fiction pour analyser." : (r.error || "Analyse impossible pour l'instant.");
+      } else {
+        await refreshData();
+        status.textContent = r.changed ? `${r.changed} lien${r.changed > 1 ? "s" : ""} mis à jour ✓` : "Analyse à jour — aucun changement.";
+      }
+    } catch (e) {
+      status.textContent = "Analyse impossible — " + (e?.message || "modèle injoignable.");
+    } finally {
+      busy = false;
+      scanBtn.disabled = false;
+      scanBtn.textContent = "🔄 Analyser les dernières scènes";
+    }
+  });
+  resetBtn.addEventListener("click", async () => {
+    if (!(await confirmModal({ title: "Réinitialiser les relations", message: "Effacer tous les liens suivis ? Ils seront reconstruits lors des prochaines analyses.", confirmLabel: "Réinitialiser" }))) return;
+    try {
+      await api(`/api/conversations/${convId}/relations/reset`, { method: "POST", body: {} });
+      await refreshData();
+      toast("Relations réinitialisées ✓");
+    } catch (e) { toast(e.message, "err"); }
+  });
+
+  const body = el("div", {},
+    toolbar,
+    legendEl,
+    canvasWrap,
+    emptyEl,
+  );
+  openModal({
+    title: "💞 Relations entre personnages",
+    sub: "Ce que chaque personnage ressent pour les autres, mis à jour par le modèle à mesure que la partie avance. Survole un personnage ou un lien pour les détails.",
+    body,
+    wide: true,
+    onClose: () => { relationsModalRef = null; },
+  });
+  relationsModalRef = { refresh: refreshData };
+  await refreshData();
+  // the modal may still be animating → recompute the layout once it settles
+  requestAnimationFrame(redraw);
+}
+
 async function memoryModal() {
   if (!currentConversation) return;
   let conv;
@@ -2240,6 +2573,18 @@ async function maybeNpcSuggest() {
   await api(`/api/conversations/${conv.id}`, { method: "PATCH", body: { settings: cs } }).catch(() => {});
   const r = await api(`/api/conversations/${conv.id}/npcs/suggest`, { body: {} }).catch(() => ({ npcs: [] }));
   if (r.npcs?.length) showNpcChips(r.npcs);
+}
+
+// ─── relationship graph (auto, throttled server-side) ────────────────────────
+// After each completed turn we ask the server to re-read the recent scenes and
+// update the affinities between characters — silently: the server only scans
+// when enough new story accumulated and enough time passed since the last one.
+async function maybeRelations() {
+  const conv = currentConversation;
+  if (!conv || !conv.cards?.length) return;
+  const r = await api(`/api/conversations/${conv.id}/relations`, { body: {} }).catch(() => null);
+  // the graph modal is open → refresh it live; otherwise keep the scan silent
+  if (r?.scanned) relationsModalRef?.refresh?.();
 }
 
 function showNpcChips(npcs) {

@@ -198,6 +198,19 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
 .recap-actions { display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
 .recap-actions .hint { font-size: 12px; color: var(--text-dim); }
 .recap-busy { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-dim); }
+
+/* relationship graph (💞) — affinities between characters */
+.rel-wrap { position: relative; margin-top: 10px; border-radius: 14px; border: 1px solid var(--border); background: var(--surface); overflow: hidden; }
+.rel-canvas { display: block; width: 100%; }
+.rel-tip { position: absolute; pointer-events: none; max-width: 300px; background: var(--surface); border: 1px solid var(--accent-border); border-radius: 10px; padding: 8px 10px; font-size: 12px; line-height: 1.55; color: var(--text); box-shadow: 0 8px 24px rgba(0, 0, 0, .4); z-index: 5; }
+.rel-tip strong { display: block; margin-bottom: 3px; }
+.rel-tip .dim { color: var(--text-dim); font-style: italic; }
+.rel-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.rel-status { font-size: 12px; color: var(--text-dim); flex: 1; min-width: 160px; }
+.rel-legend { display: flex; gap: 14px; flex-wrap: wrap; justify-content: center; margin: 8px 2px 2px; }
+.rel-legend-item { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--text-dim); }
+.rel-legend-item i { width: 12px; height: 12px; border-radius: 99px; display: inline-block; }
+
 /* dynamic NPC suggestion chips + modal cards */
 .npc-chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 6px 10px; }
 .npc-hint { font-size: 12px; color: var(--text-dim); margin-right: 2px; }

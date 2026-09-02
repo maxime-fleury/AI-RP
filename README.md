@@ -80,7 +80,13 @@ PORT=3210 bun src/index.ts
   bandeau propose (ou affiche) le récap de la session précédente écrit par le
   narrateur, avec un storyboard de 1 à 3 scènes générées par Koji en arrière-
   plan (défilement en direct). Le récap est aussi injecté dans le prompt pour
-  garder la mémoire entre les sessions.- **Sauvegarde** : backup SQLite automatique chaque jour (`data/backups/`, 7
+  garder la mémoire entre les sessions.
+- **Relations (💞)** : le modèle relit régulièrement les dernières scènes (auto,
+  espacé, ou à la demande) et note ce que chaque personnage ressent pour les
+  autres (score -100 → +100, un sens par direction, avec justification) ; le
+  graphe des affinités s'affiche dans la partie (💞 → Relations), évolue au fil
+  des sessions et peut se réinitialiser d'un clic.
+- **Sauvegarde** : backup SQLite automatique chaque jour (`data/backups/`, 7
   jours de rotation), backup manuel + état du disque (illustrations/base)
   dans Réglages → Stockage, en plus de l'export/restauration JSON.
 

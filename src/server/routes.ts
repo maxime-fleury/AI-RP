@@ -1024,6 +1024,66 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       void renderRecapShots(conv.id).catch((e) => console.warn("[recap] images:", String(e?.message ?? e).slice(0, 160)));
       return json({ created: true, recap: data });
     }
+    // relationship graph: GET returns the accumulated affinities, POST asks the
+    // model to re-read the recent scenes and update them (auto = throttled,
+    // manual = always allowed), POST …/relations/reset clears the graph
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "relations" && parts[4] === "reset" && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const { cs } = relsOf(conv);
+      delete cs.rels;
+      updateConversation(conv.id, { settings: JSON.stringify(cs) });
+      return json({ ok: true });
+    }
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "relations" && method === "GET") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      return json({ rels: relsOf(conv).rels });
+    }
+    if (parts[1] === "conversations" && parts[2] && parts[3] === "relations" && !parts[4] && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const body = await readJson(req);
+      const manual = body?.manual === true;
+      const { cs, rels } = relsOf(conv);
+      const story = storyMessages(listMessages(conv.id));
+      if (story.length < 2) return json({ scanned: false, reason: "empty", have: story.length });
+      const sinceId = Number(rels?.last_msg_id ?? 0);
+      const fresh = story.filter((m) => m.id > sinceId);
+      if (!manual) {
+        if (rels && Date.now() - Number(rels.at || 0) < REL_AUTO_IDLE_MS) {
+          return json({ scanned: false, reason: "throttle" });
+        }
+        if (fresh.length < REL_AUTO_MIN_MESSAGES) {
+          return json({ scanned: false, reason: "threshold", needed: REL_AUTO_MIN_MESSAGES, have: fresh.length });
+        }
+      }
+      // known names: the cast + persona + names already in the graph, so the
+      // model reuses exact spellings instead of drifting
+      const known: string[] = [];
+      try {
+        for (const cid of JSON.parse(conv.cast || "[]") as number[]) {
+          const c = getCard(Number(cid));
+          if (c?.name) known.push(c.name);
+        }
+      } catch { /* ignore */ }
+      if (conv.persona_id) {
+        const po = getPersona(conv.persona_id);
+        if (po?.name) known.push(po.name);
+      }
+      for (const p of rels?.pairs ?? []) { known.push(p.a, p.b); }
+      const proposed = await suggestRelations([...new Set(known)], story.slice(-REL_SCAN_WINDOW));
+      if (!proposed) {
+        return json({ scanned: false, error: "L'analyse des relations a échoué — vérifie la connexion au modèle." }, 502);
+      }
+      const merged = mergeRels(rels, proposed);
+      const lastId = story[story.length - 1].id;
+      const state: RelState = { at: Date.now(), last_msg_id: lastId, pairs: merged.pairs };
+      cs.rels = state;
+      updateConversation(conv.id, { settings: JSON.stringify(cs) });
+      console.log(`[rels] 💞 ${conv.id} — ${proposed.length} lien(s) lus, ${merged.changed} mis à jour (${merged.pairs.length} au total)`);
+      return json({ scanned: true, rels: state, changed: merged.changed });
+    }
     // dynamic NPCs: suggest secondary characters from the recent fiction
     // (POST .../npcs/suggest), then add an approved one to the cast
     if (parts[1] === "conversations" && parts[2] && parts[3] === "npcs" && parts[4] === "suggest" && method === "POST") {
@@ -2362,6 +2422,85 @@ async function renderRecapShots(convId: number): Promise<void> {
       updateConversation(convId, { settings: JSON.stringify(curR.cs) });
     }
   }
+}
+
+// ─── relationship graph (affinities that evolve during play) ─────────────────
+// After each scene (auto, throttled) or on demand, the model reads the recent
+// story and updates what each named character feels for the others. Stored in
+// conversation settings (settings.rels) as DIRECTED pairs a→b with a score in
+// [-100, 100] plus a justifying note; visualised as a graph in the chat. The
+// world-level (static) relations table is deliberately not touched.
+const REL_AUTO_MIN_MESSAGES = 6; // new story messages before an auto re-scan
+const REL_AUTO_IDLE_MS = 3 * 60_000; // min time between two auto scans
+const REL_SCAN_WINDOW = 20; // messages handed to the model per scan
+const REL_MAX_PAIRS = 60;
+
+type RelPair = { a: string; b: string; value: number; note: string; at: number };
+type RelState = { at: number; last_msg_id: number; pairs: RelPair[] };
+
+export function relPairKey(a: string, b: string): string {
+  return `${a}\u241f${b}`;
+}
+
+function relsOf(conv: ConversationRow): { cs: any; rels: RelState | null } {
+  let cs: any = {};
+  try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  const r = cs.rels;
+  const ok = r && typeof r === "object" && !Array.isArray(r) && Array.isArray(r.pairs);
+  return { cs, rels: ok ? r : null };
+}
+
+/**
+ * Merge a fresh model read into the accumulated graph: listed pairs overwrite
+ * their previous value, unlisted pairs stay (affinities persist across scenes).
+ */
+export function mergeRels(prev: RelState | null, fresh: RelPair[]): { pairs: RelPair[]; changed: number } {
+  const byKey = new Map<string, RelPair>();
+  for (const p of prev?.pairs ?? []) byKey.set(relPairKey(p.a, p.b), p);
+  let changed = 0;
+  for (const p of fresh) {
+    const key = relPairKey(p.a, p.b);
+    const old = byKey.get(key);
+    if (!old || old.value !== p.value || old.note !== p.note) changed++;
+    byKey.set(key, p);
+  }
+  const pairs = [...byKey.values()].sort((x, y) => y.at - x.at).slice(0, REL_MAX_PAIRS);
+  return { pairs, changed };
+}
+
+async function suggestRelations(known: string[], msgs: MessageRow[]): Promise<RelPair[] | null> {
+  const knownTxt = known.length ? known.join(", ") : "aucun — utilise les noms tels qu'écrits dans la fiction";
+  const sys = [
+    "Tu suis une partie de roleplay et tu mets à jour les affinités entre personnages.",
+    `Personnages connus (réutilise EXACTEMENT ces noms, orthographe comprise) : ${knownTxt}.`,
+    "Pour CHAQUE paire qui interagit réellement dans les scènes, donne ce que le premier ressent pour le second (a = celui qui ressent, b = celui qui est ressenti).",
+    "value : -100 = haine … 0 = neutre … +100 = amour, loyauté absolue. Les deux sens peuvent différer (amour non partagé).",
+    "note : une courte phrase française qui justifie le lien (actions récentes), sans citer les répliques.",
+    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour : {"relations":[{"a":"Personnage A","b":"Personnage B","value":42,"note":"une phrase"}]}.',
+    "Quelques liens forts valent mieux qu'un catalogue exhaustif. N'invente jamais un lien absent des scènes ; si personne n'interagit, renvoie {\"relations\":[]}. JSON complet, non tronqué.",
+  ].join(" ");
+  const p = await llmJson(transcriptFor(msgs, REL_SCAN_WINDOW), sys, 1200, 0.6);
+  const list = Array.isArray(p?.relations) ? p.relations : null;
+  if (!list) return null;
+  const strip = (s: unknown) => String(s ?? "").trim().replace(/\s+/g, " ").slice(0, 40);
+  const norm = (name: string): string => {
+    const key = (x: string) => x.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+    const wanted = key(name);
+    return known.find((k) => key(k) === wanted) ?? name;
+  };
+  const out: RelPair[] = [];
+  for (const r of list) {
+    const a = strip(r?.a);
+    const b = strip(r?.b);
+    if (!a || !b) continue;
+    const na = norm(a);
+    const nb = norm(b);
+    if (na.toLowerCase() === nb.toLowerCase()) continue;
+    const value = Math.max(-100, Math.min(100, Math.round(Number(r?.value) || 0)));
+    const note = String(r?.note ?? "").trim().replace(/\s+/g, " ").slice(0, 200);
+    out.push({ a: na, b: nb, value, note, at: Date.now() });
+  }
+  return out;
 }
 
 async function suggestNpcs(conv: ConversationRow, msgs: MessageRow[]): Promise<NpcSuggestion[]> {
