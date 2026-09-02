@@ -48,10 +48,33 @@ def load_pipeline():
     )
     pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
     pipe.to(device)
+    # The GPU is shared with the resident LLM (LM Studio often holds most of the
+    # VRAM). Slice attention/VAE so a batch of portraits can't push allocation
+    # over the cliff — a failed cudaMalloc there used to wedge the driver and
+    # leave the sidecar answering /health "ready" while every /generate hung.
+    # (guarded: the slicing helpers aren't exposed by every diffusers build)
+    for enable in ("enable_attention_slicing", "enable_vae_slicing"):
+        fn = getattr(pipe, enable, None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception as e:
+                print(f"[image] {enable} skipped: {e}", flush=True)
     _pipe = pipe
     print(f"[image] model loaded in {time.time() - t0:.1f}s on {device}", flush=True)
     STATUS["status"] = "ready"
 
+
+def free_vram():
+    """Release torch's cached blocks after a render so the next one reuses memory
+    instead of growing the CUDA arena until it collides with the LLM."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 def generate(req: dict):
     global _pipe
@@ -130,7 +153,11 @@ def main(port: int):
             return JSONResponse({"error": "pipeline not ready"}, status_code=503)
         try:
             async with gen_lock:
-                return await asyncio.to_thread(generate, body)
+                try:
+                    return await asyncio.to_thread(generate, body)
+                finally:
+                    # free cached VRAM after every render (success or failure)
+                    free_vram()
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 

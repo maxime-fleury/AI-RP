@@ -1,6 +1,6 @@
-import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=50";
-import { el, esc, toast, actionToast, openModal, confirmModal, field, ICONS, fmtTime } from "./ui.js?v=50";
-import { renderChat } from "./chat.js?v=50";
+import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=51";
+import { el, esc, toast, actionToast, openModal, confirmModal, closeAllModals, field, ICONS, fmtTime } from "./ui.js?v=51";
+import { renderChat } from "./chat.js?v=51";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -272,6 +272,9 @@ async function route() {
   renderSidebar(currentSection);
   document.getElementById("sidebar")?.classList.remove("open"); // close the mobile drawer
   window.scrollTo(0, 0);
+  // a modal left open on the previous screen must not keep blocking the new
+  // one (its backdrop silently swallows every click, e.g. « Faire parler »)
+  closeAllModals();
   const run = async () => {
     try {
       return doRender(section, parts);
@@ -344,7 +347,7 @@ function shortcutsHelp() {
 }
 let shortcutCapturing = false; // set while the settings editor awaits a keypress
 function fireShortcut(k) {
-  import("./chat.js?v=50").then((m) => m.chatShortcut(k)).catch(() => {});
+  import("./chat.js?v=51").then((m) => m.chatShortcut(k)).catch(() => {});
 }
 document.addEventListener("keydown", (e) => {
   if (shortcutCapturing) return; // the settings key-capture owns this press
@@ -486,7 +489,8 @@ function renderDashboard() {
         el("h2", {}, "Bienvenue, aventurier. ✨"),
         el("p", {}, "Crée des mondes, importe des personnages (cartes SillyTavern), définis tes scénarios isekai et laisse l'IA raconter l'histoire à tes côtés."),
         el("div", { class: "cta-row" },
-          el("button", { class: "btn btn-primary", onclick: newGameWizard }, ICONS.plus, "Nouvelle partie"),
+          el("button", { class: "btn btn-primary", onclick: guidedWizard }, ICONS.sparkles, "Décris ce que tu veux"),
+          el("button", { class: "btn btn-ghost", onclick: newGameWizard }, ICONS.plus, "Nouvelle partie"),
           el("a", { href: "#/worlds", class: "btn btn-ghost" }, ICONS.worlds, "Explorer les mondes"),
           el("a", { href: "#/cards", class: "btn btn-ghost" }, ICONS.cards, "Importer des cartes"),
         ),
@@ -763,7 +767,10 @@ function worldModal(existing) {
 async function renderWorldDetail(id) {
   const world = store.worlds.find((w) => w.id === Number(id));
   if (!world) return renderWorlds();
-  const scenarios = await api(`/api/worlds/${world.id}/scenarios`).then((r) => r.scenarios).catch(() => []);
+  let scenarios = [];
+  let scenariosErr = "";
+  try { scenarios = (await api(`/api/worlds/${world.id}/scenarios`)).scenarios || []; }
+  catch (e) { scenariosErr = e?.message || "Erreur inconnue"; }
   const plays = store.conversations.filter((c) => c.world_id === world.id);
 
   const head = el("div", { class: "page-head" },
@@ -852,12 +859,20 @@ async function renderWorldDetail(id) {
           el("p", {}, "Génère une carte illustrée de ce monde — les lieux cités dans tes parties y seront épinglés."),
         ));
       }
-    } catch { /* ignore */ }
+    } catch (e) {
+      mapBox.replaceChildren(el("div", { class: "empty", style: { padding: "22px" } }, el("div", { class: "big" }, "🗺"), el("h3", {}, "Carte indisponible"), el("p", {}, esc(e.message) + " — recharge la page pour réessayer.")));
+    }
   })();
 
-  body.append(el("div", { class: "section-title" }, `Scénarios (${scenarios.length})`));
+  body.append(el("div", { class: "section-title" }, scenariosErr ? "Scénarios (indisponibles)" : `Scénarios (${scenarios.length})`));
   const addScen = el("button", { class: "btn btn-ghost btn-sm", onclick: () => scenarioModal(world) }, ICONS.plus, "Ajouter un scénario");
-  if (!scenarios.length) {
+  if (scenariosErr) {
+    body.append(el("div", { class: "empty", style: { padding: "30px" } },
+      el("div", { class: "big" }, "🎬"),
+      el("h3", {}, "Scénarios indisponibles"),
+      el("p", {}, esc(scenariosErr) + " — recharge la page pour réessayer."),
+    ));
+  } else if (!scenarios.length) {
     body.append(el("div", { class: "empty", style: { padding: "30px" } },
       el("div", { class: "big" }, "🎬"),
       el("h3", {}, "Aucun scénario"),
@@ -902,7 +917,13 @@ async function renderWorldDetail(id) {
 function renderLocationsTab(world) {
   const box = el("div", { class: "tab-box" });
   const paint = async () => {
-    const { locations } = await api(`/api/worlds/${world.id}/locations`).catch(() => ({ locations: [] }));
+    let locations = [];
+    try {
+      locations = (await api(`/api/worlds/${world.id}/locations`)).locations || [];
+    } catch (e) {
+      box.replaceChildren(el("div", { class: "empty" }, el("div", { class: "big" }, "📍"), el("h3", {}, "Lieux indisponibles"), el("p", {}, esc(e.message) + " — recharge la page pour réessayer.")));
+      return;
+    }
     box.replaceChildren(
       el("div", { class: "tab-head" },
         el("div", {},
@@ -965,7 +986,13 @@ function locationModal(world, existing, onDone) {
 function renderLorebookTab(world) {
   const box = el("div", { class: "tab-box" });
   const paint = async () => {
-    const { entries } = await api(`/api/worlds/${world.id}/lorebook`).catch(() => ({ entries: [] }));
+    let entries = [];
+    try {
+      entries = (await api(`/api/worlds/${world.id}/lorebook`)).entries || [];
+    } catch (e) {
+      box.replaceChildren(el("div", { class: "empty" }, el("div", { class: "big" }, "📖"), el("h3", {}, "Lorebook indisponible"), el("p", {}, esc(e.message) + " — recharge la page pour réessayer.")));
+      return;
+    }
     box.replaceChildren(
       el("div", { class: "tab-head" },
         el("div", {},
@@ -1042,7 +1069,13 @@ function lorebookModal(world, existing, onDone) {
 function renderRelationsTab(world) {
   const box = el("div", { class: "tab-box" });
   const paint = async () => {
-    const { relations } = await api(`/api/worlds/${world.id}/relations`).catch(() => ({ relations: [] }));
+    let relations = [];
+    try {
+      relations = (await api(`/api/worlds/${world.id}/relations`)).relations || [];
+    } catch (e) {
+      box.replaceChildren(el("div", { class: "empty" }, el("div", { class: "big" }, "🕸"), el("h3", {}, "Relations indisponibles"), el("p", {}, esc(e.message) + " — recharge la page pour réessayer.")));
+      return;
+    }
     box.replaceChildren(
       el("div", { class: "tab-head" },
         el("div", {},
@@ -1105,7 +1138,13 @@ function relationModal(world, existing, onDone) {
 function renderTimelineTab(world) {
   const box = el("div", { class: "tab-box" });
   const paint = async () => {
-    const { events } = await api(`/api/worlds/${world.id}/timeline`).catch(() => ({ events: [] }));
+    let events = [];
+    try {
+      events = (await api(`/api/worlds/${world.id}/timeline`)).events || [];
+    } catch (e) {
+      box.replaceChildren(el("div", { class: "empty" }, el("div", { class: "big" }, "🗓"), el("h3", {}, "Chronologie indisponible"), el("p", {}, esc(e.message) + " — recharge la page pour réessayer.")));
+      return;
+    }
     box.replaceChildren(
       el("div", { class: "tab-head" },
         el("div", {},
@@ -1229,8 +1268,10 @@ function renderGalleryTab(world) {
     if (filter === "portrait") return it.kind === "portrait" || it.character;
     return true;
   });
-  const characters = [...new Set(items.map((i) => i.character).filter(Boolean))];
   const paint = () => {
+    // items arrive asynchronously; compute this from the current collection so
+    // character filters are available after the gallery request completes.
+    const characters = [...new Set(items.map((i) => i.character).filter(Boolean))];
     const pills = el("div", { class: "gallery-filters" },
       ["all", "landscape", "portrait", "fav"].map((k) =>
         el("button", { class: "chip-btn slim" + (filter === k ? " on" : ""), onclick: () => { filter = k; paint(); } },
@@ -1621,6 +1662,43 @@ function cardTile(card) {
   );
 }
 
+// 🎨 avatar auto-généré après la création d'une carte : portrait IA construit
+// depuis les champs du personnage (seed stable par carte → même visage que les
+// illustrations de dialogue), puis attaché à la carte. Tout se fait en
+// arrière-plan — la création ne bloque jamais sur le serveur d'images.
+const avatarGenInFlight = new Set();
+export async function autoCardAvatar(id, fields, onDone) {
+  if (!id || avatarGenInFlight.has(`card:${id}`)) return;
+  avatarGenInFlight.add(`card:${id}`);
+  try {
+    const r = await api("/api/cards/generate-avatar", { body: { id, ...fields } });
+    if (r?.image) {
+      await api(`/api/cards/${id}`, { method: "PATCH", body: { avatar: r.image } });
+      onDone?.(r.image);
+    }
+  } catch (e) {
+    toast("Avatar IA non généré : " + (e?.message || "serveur d'images indisponible"), "warn");
+  } finally {
+    avatarGenInFlight.delete(`card:${id}`);
+  }
+}
+
+export async function autoPersonaAvatar(id, fields, onDone) {
+  if (!id || avatarGenInFlight.has(`persona:${id}`)) return;
+  avatarGenInFlight.add(`persona:${id}`);
+  try {
+    const r = await api("/api/cards/generate-avatar", { body: fields });
+    if (r?.image) {
+      await api(`/api/personas/${id}`, { method: "PATCH", body: { avatar: r.image } });
+      onDone?.(r.image);
+    }
+  } catch (e) {
+    toast("Avatar IA du persona non généré : " + (e?.message || "serveur d'images indisponible"), "warn");
+  } finally {
+    avatarGenInFlight.delete(`persona:${id}`);
+  }
+}
+
 function cardModal(existing) {
   const f = (v) => v ?? "";
   const name = field("Nom", f(existing?.name), { autofocus: true });
@@ -1817,11 +1895,22 @@ function cardModal(existing) {
           tags: JSON.stringify(tags.input.value.split(",").map((x) => x.trim()).filter(Boolean)), ...(avatarData ? { avatar: avatarData } : {}), ...(avatarServer ? { avatar: avatarServer } : {}),
         };
         try {
+          let created = null;
           if (existing) await api(`/api/cards/${existing.id}`, { method: "PATCH", body: payload });
-          else await api("/api/cards", { body: payload });
+          else created = await api("/api/cards", { body: payload });
           close();
           await refreshAll();
           renderCards();
+          // 🎨 nouveau personnage sans avatar fourni → portrait IA en arrière-plan
+          if (created?.id && !payload.avatar) {
+            autoCardAvatar(created.id, {
+              name: payload.name, description: payload.description, personality: payload.personality,
+              scenario: payload.scenario, tags: payload.tags,
+            }, async () => {
+              await refreshCards();
+              if (location.hash.startsWith("#/cards")) renderCards();
+            });
+          }
         } catch (e) { toast(e.message, "err"); }
       } }, "Enregistrer"),
     ],
@@ -1882,11 +1971,18 @@ function personaModal(existing) {
       el("button", { class: "btn btn-primary", onclick: async () => {
         const payload = { name: name.input.value.trim() || "Persona", description: desc.input.value.trim() };
         try {
+          let created = null;
           if (existing) await api(`/api/personas/${existing.id}`, { method: "PATCH", body: payload });
-          else await api("/api/personas", { body: payload });
+          else created = await api("/api/personas", { body: payload });
           close();
           await refreshAll();
           renderPersonas();
+          if (created?.id) {
+            autoPersonaAvatar(created.id, { name: payload.name, description: payload.description }, async () => {
+              await refreshPersonas();
+              if (location.hash.startsWith("#/personas")) renderPersonas();
+            });
+          }
         } catch (e) { toast(e.message, "err"); }
       } }, "Enregistrer"),
     ],
@@ -2476,6 +2572,559 @@ const GENRE_OPTS = [
   ["pvp", "⚡ PVP"],
 ];
 
+// ─── guided builder « Décris ce que tu veux » ────────────────────────────────
+// Une idée en langage libre → l'IA propose MONDE (existants correspondants +
+// 4 nouveaux), puis 4 PERSONAS, puis 4 CARTES par personnage évoqué.
+// Chaque lot : propositions éditables + « Valider » individuel, et un champ
+// d'amélioration qui ne régénère QUE le lot courant. À la fin, tout est créé
+// pour de vrai (avatars en arrière-plan) et la nouvelle partie s'ouvre pré-remplie.
+function guidedWizard() {
+  // Choices persist in `st` across steps so the user can wander back and forth;
+  // `memo` keeps the last fetched batch per stage so « ← » renders instantly
+  // (no second LLM call); `created` + per-character ids make the final step
+  // resumable — a failure mid-creation never duplicates the world or persona.
+  const st = { desc: "", world: null, persona: null, chars: [], memo: {}, charsCtx: null, requests: { worlds: 0, personas: 0, characters: 0 }, viewVersion: 0, created: { worldId: null, worldKey: "", worldOwned: false, personaId: null, personaKey: "", personaOwned: false } };
+  const labels = ["Idée", "Monde", "Persona", "Personnages", "Créer"];
+  let stepIdx = 0;
+  const progress = el("div", { class: "assist-progress" });
+  const stepEl = el("div", { class: "assist-stepbox" });
+  const body = el("div", {}, progress, stepEl);
+  openModal({ title: "✨ Décris ce que tu veux", sub: "L'IA construit ton monde, ton persona et tes personnages — lot par lot : modifie, valide ou affine. Tu peux revenir en arrière à tout moment, tes choix sont gardés.", body, wide: true });
+
+  const paintProgress = () => {
+    progress.replaceChildren(...labels.map((s, i) =>
+      el("span", { class: "assist-ps" + (i === stepIdx ? " cur" : i < stepIdx ? " done" : "") }, i < stepIdx ? "✓ " + s : s)),
+    );
+  };
+  const run = (fn) => { stepEl.replaceChildren(fn()); };
+  const fieldRow = (label, value, placeholder, rows) => {
+    const input = rows > 1
+      ? el("textarea", { rows, placeholder: placeholder ?? "", class: "assist-in" }, value ?? "")
+      : el("input", { placeholder: placeholder ?? "", class: "assist-in", value: value ?? "" });
+    return { wrap: el("label", { class: "assist-field" }, el("span", {}, label), input), input };
+  };
+  const spinner = (txt) => el("div", { class: "assist-status" }, "⏳ " + esc(txt));
+  // soft=true renders the previous batch from memory instead of calling the LLM.
+  const go = (i, soft) => {
+    if (i === 1) stepWorlds("", soft);
+    else if (i === 2) stepPersonas("", soft);
+    else if (i === 3) stepCharacters(soft);
+    else stepCreate();
+  };
+  const keyOf = (s) => String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+
+  // ── étape 1 : la description libre ──
+  function stepDescribe() {
+    const viewVersion = ++st.viewVersion;
+    stepIdx = 0; paintProgress();
+    const ta = fieldRow("Ton idée", st.desc, "Ex. : Un monde médiéval fantastique avec de la magie. Moi, Max, 22 ans, je suis téléporté au milieu de nulle part, dans un village perdu. Il y a une tavernière mystérieuse et un garde arrogant…", 7).input;
+    ta.style.minHeight = "150px";
+    const ex1 = "Un monde médiéval fantastique avec de la magie. Moi, Max, 22 ans, je suis téléporté au milieu de nulle part, dans un village perdu. Il y a une tavernière mystérieuse et un garde arrogant.";
+    const ex2 = "Un futur cyberpunk moite et pluvieux où la mémoire se vend à crédit. Je suis un détective endetté, et une fantôme de synthèse me hante. Décris mes partenaires de fortune.";
+    run(() => el("div", {},
+      el("h3", {}, "Raconte ton idée"),
+      el("p", { class: "modal-note" }, "Décris le monde, qui tu es, ce qui t'arrive — et les personnages que tu veux voir (facultatif). Ton modèle local (LM Studio) a besoin de quelques secondes par lot : laisse-le finir."),
+      ta,
+      el("div", { class: "assist-refine", style: { justifyContent: "flex-start" } },
+        el("button", { class: "chip-btn", onclick: () => { ta.value = ex1; } }, "Ex. isekai médiéval"),
+        el("button", { class: "chip-btn", onclick: () => { ta.value = ex2; } }, "Ex. cyberpunk"),
+      ),
+      el("div", { class: "assist-refine", style: { justifyContent: "flex-end" } },
+        el("button", { class: "btn btn-primary", onclick: () => {
+          st.desc = ta.value.trim();
+          if (!st.desc) return toast("Décris d'abord ton idée.", "err");
+          stepWorlds("");
+        } }, "✨ Générer mon monde"),
+      ),
+    ));
+  }
+
+  // ── étape 2 : choisir / améliorer le monde ──
+  async function stepWorlds(feedback, soft = false) {
+    const viewVersion = ++st.viewVersion;
+    stepIdx = 1; paintProgress();
+    const requestId = ++st.requests.worlds;
+    const list = el("div", { class: "assist-list" });
+    const status = spinner("L'IA propose des mondes…");
+    const root = el("div", {},
+      el("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "8px" } },
+        el("h3", { style: { margin: 0 } }, "🌍 Choisis (ou affine) ton monde"),
+        el("button", { class: "btn btn-ghost btn-sm", onclick: () => stepDescribe() }, "← Idée"),
+      ),
+      el("p", { class: "modal-note" }, "Si un monde existant correspond, il est proposé en premier ; sinon l'IA en invente. Chaque carte est modifiable avant validation."),
+      status, list,
+    );
+    run(() => root);
+    const paintBatch = (r) => {
+      status.hidden = true;
+      const matches = r.matches || [];
+      const proposals = r.proposals || [];
+      const chosenKey = keyOf(st.world?.name);
+      if (matches.length) {
+        list.append(el("div", { class: "assist-sec" }, "✅ Déjà dans tes mondes"));
+        for (const m of matches) {
+          const w = store.worlds.find((x) => x.id === m.id);
+          if (!w) continue;
+          const isChosen = st.world?.id === w.id;
+          list.append(el("div", { class: "assist-prop reuse" + (isChosen ? " chosen" : "") },
+            el("strong", {}, esc(w.name)),
+            el("p", {}, esc(m.reason || w.description?.slice(0, 160) || "")),
+            el("div", { class: "card-actions" }, el("button", { class: "btn btn-primary btn-sm", onclick: () => {
+              st.world = { id: w.id, name: w.name, description: w.description, tone: w.tone, lore: w.lore };
+              st.created.worldId = w.id; st.created.worldKey = keyOf(w.name); st.created.worldOwned = false;
+              st.memo.personas = null; st.chars = []; st.charsCtx = null; // contexte changé → régénère la suite
+              go(2, false);
+            } }, isChosen ? "✓ Monde choisi" : "Choisir ce monde")),
+          ));
+        }
+      }
+      if (proposals.length) {
+        list.append(el("div", { class: "assist-sec" }, "🌱 Mondes générés"));
+        for (const p of proposals) {
+          const fName = fieldRow("Nom", p.name, "", 1);
+          const fDesc = fieldRow("Description", p.description, "Ce qui rend ce monde unique, sa magie…", 4);
+          const fTone = fieldRow("Genre / ambiance", p.tone, "ex. heroic fantasy sombre", 1);
+          const fLore = fieldRow("Histoire fondatrice", p.lore, "Passé, enjeux…", 3);
+          const isChosen = !st.world?.id && keyOf(p.name) === chosenKey;
+          list.append(el("div", { class: "assist-prop" + (isChosen ? " chosen" : "") }, fName.wrap, fDesc.wrap, fTone.wrap, fLore.wrap,
+            el("div", { class: "card-actions" }, el("button", { class: "btn btn-primary btn-sm", onclick: () => {
+              const world = {
+                id: null, name: fName.input.value.trim(), description: fDesc.input.value.trim(),
+                tone: fTone.input.value.trim(), lore: fLore.input.value.trim(),
+              };
+              if (!world.name) return toast("Donne un nom au monde.", "err");
+              if (!world.description) return toast("Décris le monde en une phrase au minimum.", "err");
+              st.world = world;
+              st.memo.personas = null; st.chars = []; st.charsCtx = null;
+              go(2, false);
+            } }, isChosen ? "✓ Monde choisi" : "Valider ce monde")),
+          ));
+        }
+      }
+      if (!matches.length && !proposals.length) {
+        list.append(el("div", { class: "empty" }, el("h3", {}, "Le modèle n'a rien proposé"), el("p", {}, "Passe par l'amélioration ci-dessous et régénère.")));
+      }
+      const fb = el("input", { class: "assist-in", placeholder: "💡 Améliorer ces propositions (ex. « plus sombre, avec des îles flottantes »)…" });
+      list.append(el("div", { class: "assist-refine" }, fb,
+        el("button", { class: "btn btn-ghost btn-sm", onclick: () => {
+          const v = fb.value.trim();
+          if (!v) return toast("Écris d'abord ton amélioration.", "err");
+          stepWorlds(v, false);
+        } }, "↻ Régénérer ce lot"),
+      ));
+    };
+    if (soft && st.memo.worlds) { paintBatch(st.memo.worlds); return; }
+    try {
+      const r = await api("/api/assist/build", { body: { stage: "worlds", description: st.desc, feedback: feedback || "" } });
+      if (requestId !== st.requests.worlds || viewVersion !== st.viewVersion) return;
+      st.memo.worlds = r;
+      paintBatch(r);
+    } catch (e) {
+      if (requestId !== st.requests.worlds || viewVersion !== st.viewVersion) return;
+      status.replaceChildren(el("span", { class: "danger" }, "⚠️ " + esc(e.message)));
+      list.append(el("div", { class: "assist-refine" },
+        el("button", { class: "btn btn-primary btn-sm", onclick: () => stepWorlds(feedback, false) }, "↻ Réessayer"),
+      ));
+    }
+  }
+
+  // ── étape 3 : choisir / améliorer le persona ──
+  async function stepPersonas(feedback, soft = false) {
+    const viewVersion = ++st.viewVersion;
+    stepIdx = 2; paintProgress();
+    const requestId = ++st.requests.personas;
+    const batchKey = keyOf(`${st.desc}|${st.world?.id || ""}|${st.world?.name || ""}`);
+    const list = el("div", { class: "assist-list" });
+    const status = spinner("L'IA propose des personas…");
+    const root = el("div", {},
+      el("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "8px" } },
+        el("h3", { style: { margin: 0 } }, "🧑‍🤝‍🧑 Qui incarnes-tu ?"),
+        el("button", { class: "btn btn-ghost btn-sm", onclick: () => go(1, true) }, "← Monde"),
+      ),
+      el("p", { class: "modal-note" }, "4 façons d'être « toi » dans ce monde — ou ton persona existant s'il correspond déjà. Modifie puis valide."),
+      status, list,
+    );
+    run(() => root);
+    const paintBatch = (r) => {
+      status.hidden = true;
+      const matches = r.matches || [];
+      const proposals = r.proposals || [];
+      const chosenKey = keyOf(st.persona?.name);
+      if (matches.length) {
+        list.append(el("div", { class: "assist-sec" }, "✅ Ton persona existe déjà"));
+        for (const m of matches) {
+          const p = store.personas.find((x) => x.id === m.id);
+          if (!p) continue;
+          const isChosen = st.persona?.id === p.id;
+          list.append(el("div", { class: "assist-prop reuse" + (isChosen ? " chosen" : "") },
+            el("strong", {}, esc(p.name)),
+            el("p", {}, esc(m.reason || p.description?.slice(0, 160) || "")),
+            el("div", { class: "card-actions" }, el("button", { class: "btn btn-primary btn-sm", onclick: () => {
+              st.persona = { id: p.id, name: p.name, description: p.description };
+              st.created.personaId = p.id; st.created.personaKey = keyOf(p.name); st.created.personaOwned = false;
+              st.chars = []; st.charsCtx = null;
+              go(3, false);
+            } }, isChosen ? "✓ Persona choisi" : "Utiliser ce persona")),
+          ));
+        }
+      }
+      if (proposals.length) {
+        list.append(el("div", { class: "assist-sec" }, "🌱 Personas générés"));
+        for (const p of proposals) {
+          const fName = fieldRow("Nom", p.name, "", 1);
+          const fDesc = fieldRow("Description", p.description, "Qui tu es, apparence, passé, motivation…", 4);
+          const isChosen = !st.persona?.id && keyOf(p.name) === chosenKey;
+          list.append(el("div", { class: "assist-prop" + (isChosen ? " chosen" : "") }, fName.wrap, fDesc.wrap,
+            el("div", { class: "card-actions" }, el("button", { class: "btn btn-primary btn-sm", onclick: () => {
+              const persona = { id: null, name: fName.input.value.trim(), description: fDesc.input.value.trim() };
+              if (!persona.name) return toast("Donne un nom à ton persona.", "err");
+              st.persona = persona;
+              st.chars = []; st.charsCtx = null;
+              go(3, false);
+            } }, isChosen ? "✓ Persona choisi" : "Valider ce persona")),
+          ));
+        }
+      }
+      if (!matches.length && !proposals.length) {
+        list.append(el("div", { class: "empty" }, el("h3", {}, "Le modèle n'a rien proposé"), el("p", {}, "Affine et régénère ci-dessous.")));
+      }
+      const fb = el("input", { class: "assist-in", placeholder: "💡 Améliorer ces personas (ex. « plus naïf, avec un secret »)…" });
+      list.append(el("div", { class: "assist-refine" }, fb,
+        el("button", { class: "btn btn-ghost btn-sm", onclick: () => {
+          const v = fb.value.trim();
+          if (!v) return toast("Écris d'abord ton amélioration.", "err");
+          stepPersonas(v, false);
+        } }, "↻ Régénérer ce lot"),
+      ));
+    };
+    if (soft && st.memo.personas && st.memo.personasKey === batchKey) {
+      paintBatch(st.memo.personas);
+      return;
+    }
+    try {
+      const r = await api("/api/assist/build", { body: { stage: "personas", description: st.desc, world: st.world, feedback: feedback || "" } });
+      if (requestId !== st.requests.personas || viewVersion !== st.viewVersion) return;
+      st.memo.personas = r;
+      st.memo.personasKey = batchKey;
+      paintBatch(r);
+    } catch (e) {
+      if (requestId !== st.requests.personas || viewVersion !== st.viewVersion) return;
+      status.replaceChildren(el("span", { class: "danger" }, "⚠️ " + esc(e.message)));
+      list.append(el("div", { class: "assist-refine" },
+        el("button", { class: "btn btn-primary btn-sm", onclick: () => stepPersonas(feedback, false) }, "↻ Réessayer"),
+      ));
+    }
+  }
+
+  // ── étape 4 : personnages évoqués → 4 cartes chacun ──
+  async function stepCharacters(soft = false) {
+    const viewVersion = ++st.viewVersion;
+    stepIdx = 3; paintProgress();
+    const requestId = ++st.requests.characters;
+    const charsKey = keyOf(`${st.desc}|${st.world?.id || ""}|${st.world?.name || ""}|${st.persona?.id || ""}|${st.persona?.name || ""}`);
+    const list = el("div", { class: "assist-list" });
+    const status = spinner("Recherche des personnages évoqués…");
+    const addName = el("input", { class: "assist-in", placeholder: "Nom d'un personnage…" });
+    const addRole = el("input", { class: "assist-in", placeholder: "Rôle (optionnel)…" });
+    const genAllBtn = el("button", { class: "btn btn-primary", onclick: async () => {
+      genAllBtn.disabled = true; genAllBtn.textContent = "⏳ Génération des cartes…";
+      for (const ch of st.chars) { ch.cards = null; ch.chosen = null; }
+      for (const ch of st.chars) await genCards(ch, "");
+      genAllBtn.disabled = false; genAllBtn.textContent = "↻ Régénérer toutes les cartes";
+    } }, "✨ Générer les cartes");
+    const root = el("div", {},
+      el("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "8px" } },
+        el("h3", { style: { margin: 0 } }, "🎭 Personnages évoqués"),
+        el("button", { class: "btn btn-ghost btn-sm", onclick: () => go(2, true) }, "← Persona"),
+      ),
+      el("p", { class: "modal-note" }, "Ceux que tu as décrits, repérés dans ton idée. Chacun recevra 4 cartes à choisir — ou sa carte existante si elle correspond déjà."),
+      status, list,
+      el("div", { class: "assist-footer" },
+        el("div", { class: "assist-refine", style: { flex: "1" } }, addName, addRole,
+          el("button", { class: "btn btn-ghost btn-sm", onclick: () => {
+            const nm = addName.value.trim();
+            if (!nm) return toast("Écris un nom.", "err");
+            st.chars.push({ name: nm, role: addRole.value.trim(), detail: "", reuseName: null, reuseCard: null, cards: null, chosen: null, status: "", skipped: false });
+            addName.value = ""; addRole.value = "";
+            paint();
+          } }, "＋ Ajouter"),
+        ),
+        el("div", { class: "assist-refine", style: { justifyContent: "flex-end" } },
+          el("button", { class: "btn btn-ghost", onclick: () => stepCreate() }, "→ Continuer"),
+          el("button", { class: "btn btn-ghost btn-sm", title: "Relit ton idée depuis le début et remplace la liste", onclick: () => { st.chars = []; st.charsCtx = null; stepCharacters(false); } }, "↻ Relire ton idée"),
+          genAllBtn,
+        ),
+      ),
+    );
+    const paint = () => { list.replaceChildren(...st.chars.map(charRow)); };
+    run(() => root);
+
+    const genCards = async (ch, feedback) => {
+      ch.status = "⏳ L'IA crée 4 cartes pour « " + ch.name + " »…";
+      paint();
+      try {
+        const r = await api("/api/assist/build", { body: { stage: "cards", description: st.desc, world: st.world, character: { name: ch.name, role: ch.role, detail: ch.detail || "" }, feedback: feedback || "" } });
+        ch.cards = (r.proposals || []).filter((p2) => p2 && p2.name).slice(0, 4);
+        ch.status = "";
+        if (!ch.cards.length) ch.status = "Le modèle n'a rien proposé pour « " + ch.name + " » — affine ci-dessous.";
+      } catch (e) {
+        ch.status = "⚠️ " + e.message;
+      }
+      paint();
+    };
+
+    const cardProp = (c, ch) => {
+      const f = {
+        name: fieldRow("Nom", c.name, "", 1),
+        desc: fieldRow("Description", c.description, "Apparence, signes distinctifs…", 3),
+        pers: fieldRow("Personnalité", c.personality, "", 2),
+        sce: fieldRow("Situation initiale", c.scenario, "", 2),
+        tags: fieldRow("Tags", Array.isArray(c.tags) ? c.tags.join(", ") : "", "", 1),
+      };
+      return el("div", { class: "assist-prop sub" }, f.name.wrap, f.desc.wrap, f.pers.wrap, f.sce.wrap, f.tags.wrap,
+        el("div", { class: "card-actions" }, el("button", { class: "btn btn-primary btn-sm", onclick: () => {
+          ch.chosen = {
+            card: {
+              name: f.name.input.value.trim() || "Personnage",
+              description: f.desc.input.value.trim(),
+              personality: f.pers.input.value.trim(),
+              scenario: f.sce.input.value.trim(),
+              tags: f.tags.input.value.split(",").map((t) => t.trim()).filter(Boolean),
+            },
+          };
+          paint();
+        } }, "✓ Valider cette carte")),
+      );
+    };
+
+    const charRow = (ch) => {
+      const parts = [];
+      parts.push(el("div", { class: "char-head" },
+        el("input", { class: "assist-in", value: ch.name, oninput: (e) => (ch.name = e.target.value.trim()) }),
+        el("input", { class: "assist-in", value: ch.role, placeholder: "Rôle…", oninput: (e) => (ch.role = e.target.value.trim()) }),
+        el("button", { class: "mini-btn", title: "Retirer ce personnage", onclick: () => { st.chars = st.chars.filter((x) => x !== ch); paint(); } }, "🗑"),
+      ));
+      if (ch.detail) parts.push(el("div", { class: "assist-hint", style: { fontSize: "12px" } }, "📜 " + esc(ch.detail)));
+      if (ch.reuseCard) parts.push(el("div", { class: "assist-hint reuse" }, "💡 Correspond à ta carte « " + esc(ch.reuseCard.name) + " »."));
+      if (ch.status) parts.push(el("div", { class: "assist-status" }, esc(ch.status)));
+      if (ch.chosen) {
+        parts.push(el("div", { class: "assist-hint ok" },
+          "✓ " + (ch.chosen.reuseCardId ? "Carte existante utilisée : « " + esc(ch.reuseCard.name) + " »" : "Carte choisie : « " + esc(ch.chosen.card.name) + " »"),
+          el("button", { class: "mini-btn", onclick: () => { ch.chosen = null; paint(); } }, "↺ Changer"),
+        ));
+      } else {
+        // The matching existing card is offered immediately, BEFORE any LLM
+        // call: choosing it skips the 4-variant generation entirely.
+        if (ch.reuseCard) parts.push(el("div", { class: "assist-prop reuse" },
+          el("strong", {}, "Déjà dans ta collection"),
+          el("p", {}, esc(ch.reuseCard.description || "")),
+          el("div", { class: "card-actions" }, el("button", { class: "btn btn-primary btn-sm", onclick: () => { ch.chosen = { reuseCardId: ch.reuseCard.id, reuseName: ch.reuseCard.name }; paint(); } }, "Utiliser « " + esc(ch.reuseCard.name) + " »")),
+        ));
+        if (ch.cards) {
+          if (ch.cards.length) parts.push(el("div", { class: "assist-sec" }, "Variantes générées"));
+          for (const c of ch.cards) parts.push(cardProp(c, ch));
+          const fb = el("input", { class: "assist-in", placeholder: "💡 Pas convaincu ? Améliore et régénère…" });
+          parts.push(el("div", { class: "assist-refine" }, fb,
+            el("button", { class: "btn btn-ghost btn-sm", onclick: () => genCards(ch, fb.value.trim()) }, "↻ Régénérer"),
+          ));
+        } else {
+          parts.push(el("div", { class: "assist-hint" }, ch.reuseCard
+            ? "Sa carte existante est proposée ci-dessus — ou génère des variantes si tu préfères."
+            : "En attente — clique sur « ✨ Générer les cartes »."));
+        }
+      }
+      return el("div", { class: "assist-prop char-row" }, ...parts);
+    };
+
+    const applyCharacters = (r, preserve = false) => {
+      const previous = new Map(preserve ? st.chars.map((c) => [keyOf(c.name), c]) : []);
+      const chars = (r.characters || []).map((c) => {
+        const old = previous.get(keyOf(c.name));
+        return old || {
+          name: c.name, role: c.role || "", detail: c.detail || "", reuseName: c.reuse || null,
+          reuseCard: c.reuse ? (store.cards.find((x) => keyOf(x.name) === keyOf(c.reuse)) || null) : null,
+          cards: null, chosen: null, status: "", skipped: false,
+        };
+      });
+      if (preserve) {
+        for (const old of st.chars) if (!chars.some((c) => keyOf(c.name) === keyOf(old.name))) chars.push(old);
+      }
+      st.chars = chars;
+      st.charsCtx = charsKey;
+      st.memo.characters = r;
+      paint();
+      if (!chars.length) {
+        list.append(el("div", { class: "empty" }, el("h3", {}, "Aucun personnage repéré"), el("p", {}, "Ajoute-en à la main ci-dessous, ou continue sans personnages secondaires.")));
+      }
+    };
+    if (soft && st.memo.characters && st.charsCtx === charsKey) {
+      status.hidden = true;
+      applyCharacters(st.memo.characters, true);
+      return;
+    }
+    try {
+      const r = await api("/api/assist/build", { body: { stage: "characters", description: st.desc, world: st.world, persona: st.persona, feedback: "" } });
+      if (requestId !== st.requests.characters || viewVersion !== st.viewVersion) return;
+      status.hidden = true;
+      // Keep a manual character added while the extraction request was in
+      // flight; the user should never lose edits because the model answered.
+      applyCharacters(r, st.chars.length > 0);    } catch (e) {
+      if (requestId !== st.requests.characters || viewVersion !== st.viewVersion) return;
+      status.replaceChildren(el("span", { class: "danger" }, "⚠️ " + esc(e.message)));
+      list.append(el("div", { class: "assist-refine" },
+        el("button", { class: "btn btn-primary btn-sm", onclick: () => stepCharacters(false) }, "↻ Réessayer"),
+      ));
+    }
+  }
+
+
+  // ── étape 5 : récap & création réelle ──
+  function stepCreate() {
+    ++st.viewVersion;
+    stepIdx = 4; paintProgress();
+    const chosen = st.chars.map((ch) => ch.chosen).filter(Boolean);
+    run(() => el("div", {},
+      el("h3", {}, "✨ Vérifie et crée"),
+      el("p", { class: "modal-note" }, "Tout sera créé pour de vrai (avatars en arrière-plan), puis la nouvelle partie s'ouvrira pré-remplie."),
+      el("div", { class: "assist-summary" },
+        el("div", {}, el("strong", {}, "🌍 Monde"), el("p", {}, esc((st.world?.name || "") + (st.world?.description ? " — " + st.world.description : "")))),
+        el("div", {}, el("strong", {}, "🧑‍🤝‍🧑 Persona"), el("p", {}, esc(st.persona?.name || st.persona?.description || "—"))),
+        el("div", {}, el("strong", {}, "🎭 Personnages (" + chosen.length + ")"),
+          el("p", {}, esc(chosen.map((c) => (c.reuseCardId ? c.reuseName || "carte existante" : c.card.name)).join(", ") || "aucun") + (st.chars.length > chosen.length ? " — d'autres personnages sans carte validée seront ignorés." : "")),
+        ),
+      ),
+      el("div", { class: "assist-refine", style: { justifyContent: "flex-end", marginTop: "16px" } },
+        el("button", { class: "btn btn-ghost", onclick: () => stepCharacters(true) }, "← Retour"),
+        el("button", { class: "btn btn-primary", onclick: async (e) => {
+          const btn = e.target;
+          btn.disabled = true; btn.textContent = "Création…";
+          try {
+            if (!st.world?.name?.trim()) throw new Error("Choisis ou définis un monde avant de continuer.");
+
+            // Keep every successful write in wizard state immediately. If a
+            // later request fails, retrying resumes here instead of creating
+            // a second world/persona/card.
+            const worldKey = keyOf(st.world.name);
+            let worldId = st.world.id || null;
+            let worldCreated = false;
+            let worldChanged = false;
+            if (worldId && st.created.worldOwned && st.created.worldId === worldId && st.created.worldKey !== worldKey) {
+              await api(`/api/worlds/${worldId}`, { method: "PATCH", body: { name: st.world.name, description: st.world.description, tone: st.world.tone || "épique", lore: st.world.lore || "" } });
+              worldChanged = true;
+            }
+            if (!worldId && st.created.worldId && st.created.worldKey === worldKey) {
+              worldId = st.created.worldId;
+            }
+            if (!worldId) {
+              const existing = store.worlds.find((w) => keyOf(w.name) === worldKey);
+              if (existing) {
+                worldId = existing.id;
+              } else {
+                const w = await api("/api/worlds", { body: { name: st.world.name, description: st.world.description, tone: st.world.tone || "épique", lore: st.world.lore || "" } });
+                worldId = w.id;
+                worldCreated = true;
+              }
+            }
+            st.world = { ...st.world, id: worldId };
+            st.created.worldId = worldId;
+            st.created.worldKey = worldKey;
+            st.created.worldOwned = Boolean(st.created.worldOwned || worldCreated);
+            if (worldCreated || worldChanged) api(`/api/worlds/${worldId}/cover`, { body: {} }).catch(() => {});
+
+            // Reuse a selected existing persona, or resume/reuse a same-name
+            // one before creating a new record. New personas still get an
+            // avatar in the background.
+            let personaId = st.persona?.id || null;
+            let personaCreated = false;
+            let personaChanged = false;
+            if (st.persona) {
+              const personaKey = keyOf(st.persona.name);
+              if (personaId && st.created.personaOwned && st.created.personaId === personaId && st.created.personaKey !== personaKey) {
+                await api(`/api/personas/${personaId}`, { method: "PATCH", body: { name: st.persona.name, description: st.persona.description } });
+                personaChanged = true;
+              }
+              if (!personaId && st.created.personaId && st.created.personaKey === personaKey) {
+                personaId = st.created.personaId;
+              }
+              if (!personaId) {
+                const existing = store.personas.find((p) => keyOf(p.name) === personaKey);
+                if (existing) personaId = existing.id;
+              }
+              if (!personaId) {
+                const p = await api("/api/personas", { body: { name: st.persona.name, description: st.persona.description } });
+                personaId = p.id;
+                personaCreated = true;
+              }
+              st.persona = { ...st.persona, id: personaId };
+              st.created.personaId = personaId;
+              st.created.personaKey = personaKey;
+              st.created.personaOwned = Boolean(st.created.personaOwned || personaCreated);
+              if (personaCreated || personaChanged) {
+                autoPersonaAvatar(personaId, { name: st.persona.name, description: st.persona.description }, async () => {
+                  await refreshPersonas();
+                });
+              }
+            }
+
+            // Create each selected card once. A same-name card already in the
+            // collection is reused, preventing duplicates from hand-edited
+            // proposals as well as from a resumed partial run.
+            const cast = [];
+            const castSeen = new Set();
+            const cardIdsByName = new Map(store.cards.map((x) => [keyOf(x.name), x.id]));
+            const addCast = (id) => { if (id && !castSeen.has(id)) { castSeen.add(id); cast.push(id); } };
+            for (const ch of st.chars) {
+              if (ch.chosen?.reuseCardId) { addCast(ch.chosen.reuseCardId); continue; }
+              const card = ch.chosen?.card;
+              if (!card?.name?.trim()) continue;
+              const cardKey = keyOf(card.name);
+              const cardPayload = { name: card.name, description: card.description, personality: card.personality, scenario: card.scenario, tags: JSON.stringify(card.tags || []) };
+              const cardSignature = JSON.stringify(cardPayload);
+              // A wizard-owned card keeps its identity even if the user edits
+              // its name between retries; update it instead of creating a
+              // second card under the new name.
+              let cardId = ch.createdId && ch.createdOwned ? ch.createdId : null;
+              let cardCreated = false;
+              let cardChanged = false;
+              if (cardId && ch.createdSignature !== cardSignature) {
+                await api(`/api/cards/${cardId}`, { method: "PATCH", body: cardPayload });
+                cardChanged = true;
+              }
+              if (!cardId) cardId = cardIdsByName.get(cardKey) || null;
+              if (!cardId) {
+                const c = await api("/api/cards", { body: cardPayload });
+                cardId = c.id;
+                cardCreated = true;
+                // Keep same-run retries and same-name proposals idempotent even
+                // before refreshAll() updates the global store.
+                cardIdsByName.set(cardKey, cardId);
+              }
+              ch.createdId = cardId;
+              ch.createdKey = cardKey;
+              ch.createdOwned = Boolean(ch.createdOwned || cardCreated);
+              ch.createdSignature = cardSignature;
+              addCast(cardId);
+              if (cardCreated || cardChanged) autoCardAvatar(cardId, {
+                name: card.name, description: card.description, personality: card.personality,
+                scenario: card.scenario, tags: JSON.stringify(card.tags || []),
+              });
+            }
+            await refreshAll();
+            closeAllModals();
+            toast("✨ Monde, persona et personnages créés ✓");
+            newGameWizard({ world_id: worldId, persona_id: personaId, cast });
+          } catch (err) {
+            toast(err.message, "err");
+            btn.disabled = false; btn.textContent = "✨ Créer & lancer la partie";
+          }
+        } }, "✨ Créer & lancer la partie"),
+      ),
+    ));
+  }
+
+  stepDescribe();
+}
+
 export function newGameWizard(pre) {
   const { close, modal } = openModal({
     title: "Nouvelle partie ✨",
@@ -2489,7 +3138,7 @@ export function newGameWizard(pre) {
   const scenGenBtn = el("button", { class: "btn btn-primary btn-sm", onclick: generateScenarioInWizard }, ICONS.sparkles, "Générer");
   const scenGenRow = el("div", { class: "scen-gen-row" }, genreSel.wrap, scenGenBtn);
   const scenPreview = el("div", { class: "gen-preview", hidden: true });
-  const persoSel = field("Ton persona", "", { type: "select", options: [["", "— Inventé sur place —"], ...store.personas.map((p) => [p.id, p.name])] });
+  const persoSel = field("Ton persona", pre?.persona_id || "", { type: "select", options: [["", "— Inventé sur place —"], ...store.personas.map((p) => [p.id, p.name])] });
   const groupToggle = checkbox("group", false, "Mode groupe : plusieurs cartes dans la même scène");
   const castWrap = el("div", {}, el("label", {}, "Personnages présents (cartes)"));
   const castGrid = el("div", { class: "grid", style: { gridTemplateColumns: "repeat(auto-fill, minmax(140px,1fr))", marginTop: "8px" } });
@@ -2536,20 +3185,35 @@ export function newGameWizard(pre) {
     }));
   };
 
-  worldSel.input.addEventListener("change", async () => {
-    const wid = worldSel.input.value;
+  // load the world's scenarios into the select (returns them so a preselected
+  // scenario can be picked once the options exist)
+  let scenarioLoadVersion = 0;
+  const loadScenarios = async (wid) => {
+    const version = ++scenarioLoadVersion;
     scenSel.input.replaceChildren(el("option", { value: "" }, "— Par défaut —"));
     scenPreview.hidden = true;
-    if (!wid) return;
-    const sc = await api(`/api/worlds/${wid}/scenarios`).then((r) => r.scenarios).catch(() => []);
-    scenSel.input.append(...sc.map((s) => el("option", { value: s.id }, s.name)));
-  });
-  if (pre?.scenario_id) {
-    // world already known
-  }
+    if (!wid) return null;
+    try {
+      const sc = (await api(`/api/worlds/${wid}/scenarios`)).scenarios || [];
+      if (version !== scenarioLoadVersion || String(worldSel.input.value) !== String(wid)) return null;
+      scenSel.input.append(...sc.map((s) => el("option", { value: s.id }, s.name)));
+      return sc;
+    } catch (e) {
+      if (version !== scenarioLoadVersion || String(worldSel.input.value) !== String(wid)) return null;
+      scenSel.input.append(el("option", { value: "", disabled: "" }, "Scénarios indisponibles — " + e.message));
+      toast("Impossible de charger les scénarios : " + e.message, "err");
+      return null;
+    }
+  };
+  worldSel.input.addEventListener("change", () => loadScenarios(worldSel.input.value));
   if (pre?.world_id) {
+    // coming from « Jouer ▶ » on a scenario card (?world=&scenario=) : preselect
+    // the world, wait for its scenarios, then preselect the requested one
     worldSel.input.value = pre.world_id;
-    worldSel.input.dispatchEvent(new Event("change"));
+    loadScenarios(pre.world_id).then((sc) => {
+      if (!pre?.scenario_id || !sc?.some((s) => String(s.id) === String(pre.scenario_id))) return;
+      scenSel.input.value = pre.scenario_id;
+    });
   }
 
   modal.append(worldSel.wrap, scenSel.wrap, scenGenRow, scenPreview, persoSel.wrap, groupToggle.wrap, castWrap, castGrid,
@@ -2583,6 +3247,13 @@ export function newGameWizard(pre) {
     ),
   );
   renderCast();
+  // coming from the guided builder → preselect the validated persona & cast
+  if (pre?.persona_id) persoSel.input.value = String(pre.persona_id);
+  if (Array.isArray(pre?.cast)) {
+    for (const id of pre.cast) {
+      castGrid.querySelector(`[data-card-id="${id}"]`)?.classList.add("selected");
+    }
+  }
 }
 
 export async function startGameFromWorld(worldId) {

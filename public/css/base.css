@@ -1,5 +1,9 @@
 /* ── Innsekai base styles (theme-agnostic, driven by CSS variables) ── */
 * { box-sizing: border-box; margin: 0; padding: 0; }
+/* The [hidden] attribute must always beat display rules (e.g. .send-btn
+ * { display: grid }) — otherwise the ⏹ stop button and other toggled panels
+ * stay visible even when hidden=true and "do nothing" when clicked. */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
@@ -1582,3 +1586,47 @@ body.custom-bg {
 }
 .assist-chip:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); box-shadow: var(--glow-soft); }
 .assist-chip.selected { border-color: var(--accent); background: var(--accent); color: #fff; box-shadow: var(--glow); }
+
+/* ─── guided builder « Décris ce que tu veux » ─────────────────────────────── */
+.assist-progress { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+.assist-ps {
+  font-size: 12px; font-weight: 700; color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 999px; padding: 4px 12px; background: var(--surface);
+}
+.assist-ps.cur { color: var(--accent); border-color: var(--accent); box-shadow: var(--glow-soft); }
+.assist-ps.done { color: var(--ok, #35c27a); border-color: var(--ok, #35c27a); }
+.assist-stepbox h3 { margin: 0 0 6px; }
+.assist-in {
+  width: 100%; box-sizing: border-box; resize: vertical;
+  background: var(--input-bg); border: 1px solid var(--border); border-radius: 10px;
+  color: var(--text); padding: 9px 11px; font-size: 13px; line-height: 1.5; font-family: inherit;
+}
+.assist-in:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+.assist-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.assist-field > span { font-size: 11px; font-weight: 700; color: var(--accent); }
+.assist-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.assist-sec {
+  font-size: 12px; font-weight: 800; letter-spacing: .04em; color: var(--text-dim);
+  text-transform: uppercase; margin-top: 6px;
+}
+.assist-prop {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 12px 14px; display: flex; flex-direction: column; gap: 6px;
+}
+.assist-prop.sub { background: color-mix(in srgb, var(--surface) 60%, transparent); margin-left: 12px; }
+.assist-prop.reuse { border-color: var(--accent-border); background: var(--accent-glow); }
+.assist-prop.char-row { gap: 8px; }
+.char-head { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: center; }
+.assist-hint { font-size: 12px; color: var(--text-dim); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.assist-hint.reuse { color: var(--accent); }
+.assist-hint.ok { color: var(--ok, #35c27a); font-weight: 600; }
+.assist-hint .danger, .assist-status .danger { color: var(--danger); }
+.assist-refine { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+.assist-refine .assist-in { flex: 1; min-width: 200px; margin: 0; }
+.assist-footer { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
+.assist-summary {
+  display: flex; flex-direction: column; gap: 10px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-top: 10px;
+}
+.assist-summary strong { font-size: 13px; }
+.assist-summary p { margin: 2px 0 0; font-size: 13px; color: var(--text-dim); line-height: 1.5; }

@@ -1,6 +1,7 @@
 /* ── Thème : Glassmorphism Néon (défaut) ── */
 :root, [data-theme="glass"] {
   --bg: #07070f;
+  --bg2: #14142a; /* secondary panels (⋮ menu, 🎮 DM panel) — must be opaque-ish to stay readable over the chat */
   --surface: rgba(255, 255, 255, 0.045);
   --modal-bg: rgba(18, 18, 32, 0.92);
   --sidebar-bg: rgba(12, 12, 24, 0.55);

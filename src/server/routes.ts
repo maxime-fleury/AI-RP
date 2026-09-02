@@ -533,6 +533,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     }
     if (parts[1] === "worlds" && parts[2] && !parts[3] && method === "DELETE") {
       // soft delete → trash; restore via /api/trash
+      if (!getWorld(Number(parts[2]))) return json({ error: "not found" }, 404);
       deleteWorld(Number(parts[2]));
       return json({ ok: true, trashed: true });
     }
@@ -613,9 +614,12 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     }
     if (parts[1] === "locations" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
-      return json(updateLocation(Number(parts[2]), body));
+      const row = updateLocation(Number(parts[2]), body);
+      if (!row) return json({ error: "not found" }, 404);
+      return json(row);
     }
     if (parts[1] === "locations" && parts[2] && !parts[3] && method === "DELETE") {
+      if (!updateLocation(Number(parts[2]), {})) return json({ error: "not found" }, 404);
       deleteLocation(Number(parts[2]));
       return json({ ok: true });
     }
@@ -633,9 +637,12 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     }
     if (parts[1] === "lorebook" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
-      return json(updateLorebookEntry(Number(parts[2]), body));
+      const row = updateLorebookEntry(Number(parts[2]), body);
+      if (!row) return json({ error: "not found" }, 404);
+      return json(row);
     }
     if (parts[1] === "lorebook" && parts[2] && !parts[3] && method === "DELETE") {
+      if (!updateLorebookEntry(Number(parts[2]), {})) return json({ error: "not found" }, 404);
       deleteLorebookEntry(Number(parts[2]));
       return json({ ok: true });
     }
@@ -653,9 +660,12 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     }
     if (parts[1] === "relations" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
-      return json(updateRelation(Number(parts[2]), body));
+      const row = updateRelation(Number(parts[2]), body);
+      if (!row) return json({ error: "not found" }, 404);
+      return json(row);
     }
     if (parts[1] === "relations" && parts[2] && !parts[3] && method === "DELETE") {
+      if (!updateRelation(Number(parts[2]), {})) return json({ error: "not found" }, 404);
       deleteRelation(Number(parts[2]));
       return json({ ok: true });
     }
@@ -672,6 +682,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       return json(createTimelineEvent({ world_id: world.id, ...body }), 201);
     }
     if (parts[1] === "timeline" && parts[2] && !parts[3] && method === "DELETE") {
+      if (!updateTimelineEvent(Number(parts[2]), {})) return json({ error: "not found" }, 404);
       deleteTimelineEvent(Number(parts[2]));
       return json({ ok: true });
     }
@@ -747,9 +758,12 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     }
     if (parts[1] === "scenarios" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
-      return json(updateScenario(Number(parts[2]), body));
+      const row = updateScenario(Number(parts[2]), body);
+      return row ? json(row) : json({ error: "not found" }, 404);
     }
     if (parts[1] === "scenarios" && parts[2] && !parts[3] && method === "DELETE") {
+      const before = getScenario(Number(parts[2]));
+      if (!before) return json({ error: "not found" }, 404);
       deleteScenario(Number(parts[2]));
       return json({ ok: true, trashed: true });
     }
@@ -793,6 +807,58 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const hasAny = CARD_ASSIST_FIELDS.some((k) => fields[k].length);
       if (!hasAny) return json({ error: "Le modèle n'a rien proposé — réessaie ou vérifie ta connexion IA." }, 502);
       return json({ fields });
+    }
+    // guided builder « Décris ce que tu veux »: stateless stage calls — the
+    // client sends the description + validated context + optional feedback that
+    // regenerates the CURRENT batch only. Stages: worlds (reuse + new proposals),
+    // personas, characters (with reuse hints) and cards (4 variants per character).
+    if (p === "/api/assist/build" && method === "POST") {
+      const body = await readJson(req);
+      const stage = String(body.stage || "");
+      const description = String(body.description || "").trim().slice(0, 3000);
+      if (!description) return json({ error: "Décris d'abord ton idée de partie." }, 400);
+      const feedback = String(body.feedback || "").trim().slice(0, 500);
+      const world = body.world && typeof body.world === "object" ? (body.world as Record<string, unknown>) : null;
+      const persona = body.persona && typeof body.persona === "object" ? (body.persona as Record<string, unknown>) : null;
+      try {
+        const t0 = Date.now();
+        if (stage === "worlds") {
+          const existing = listWorlds()
+            .sort((a, b) => b.created_at - a.created_at)
+            .slice(0, 25)
+            .map((w) => ({ id: w.id, name: w.name, description: w.description, tone: w.tone }));
+          const r = await assistWorlds(description, feedback, existing);
+          console.log(`[assist/worlds] ${r.matches.length} correspondance(s), ${r.proposals.length} proposition(s) — ${Date.now() - t0} ms`);
+          if (!r.matches.length && !r.proposals.length) return json({ error: "Le modèle n'a pas fourni de monde exploitable — réessaie." }, 502);
+          return json(r);
+        }
+        if (stage === "personas") {
+          const existing = listPersonas()
+            .sort((a, b) => b.created_at - a.created_at)
+            .slice(0, 25)
+            .map((p) => ({ id: p.id, name: p.name, description: p.description }));
+          const r = await assistPersonas(description, world, feedback, existing);
+          console.log(`[assist/personas] ${r.matches.length} correspondance(s), ${r.proposals.length} proposition(s) — ${Date.now() - t0} ms`);
+          if (!r.matches.length && !r.proposals.length) return json({ error: "Le modèle n'a pas fourni de persona exploitable — réessaie." }, 502);
+          return json(r);
+        }
+        if (stage === "characters") {
+          const cards = listCards().map((c) => ({ id: c.id, name: c.name, description: c.description }));
+          const r = await assistCharacters(description, world, persona, cards, feedback);
+          console.log(`[assist/characters] ${r.characters.length} personnage(s) — ${Date.now() - t0} ms`);
+          return json(r);
+        }
+        if (stage === "cards") {
+          const r = await assistCards(description, world, body.character as Record<string, unknown> | undefined, feedback);
+          console.log(`[assist/cards] ${r.proposals.length} proposition(s) — ${Date.now() - t0} ms`);
+          if (!r.proposals.length) return json({ error: "Le modèle n'a pas fourni de carte exploitable — réessaie." }, 502);
+          return json(r);
+        }
+        return json({ error: "Étape inconnue." }, 400);
+      } catch (e) {
+        console.warn(`[assist/${stage}] échec :`, String((e as Error)?.message ?? e).slice(0, 200));
+        return json({ error: "L'IA n'a pas répondu — vérifie que LM Studio est lancé, puis réessaie." }, 502);
+      }
     }
     // generate a character avatar with the image model: portrait built from the
     // card fields, stable seed per character (same face as chat illustrations),
@@ -864,9 +930,11 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         fs.writeFileSync(path.join(UPLOADS_DIR, "avatars", file), bytes);
         body.avatar = `/uploads/avatars/${file}`;
       }
-      return json(updateCard(Number(parts[2]), body));
+      const card = updateCard(Number(parts[2]), body);
+      return card ? json(card) : json({ error: "not found" }, 404);
     }
     if (parts[1] === "cards" && parts[2] && !parts[3] && method === "DELETE") {
+      if (!getCard(Number(parts[2]))) return json({ error: "not found" }, 404);
       deleteCard(Number(parts[2]));
       return json({ ok: true, trashed: true });
     }
@@ -893,7 +961,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         },
       });
       let png: Uint8Array;
-      const avatarFile = card.avatar ? path.join(UPLOADS_DIR, path.basename(card.avatar)) : "";
+      const avatarFile = card.avatar ? mediaFileFor(card.avatar) : null;
       if (avatarFile && fs.existsSync(avatarFile)) png = new Uint8Array(fs.readFileSync(avatarFile));
       else png = placeholderPng(256, [43, 24, 66]);
       const out = withCharaChunk(png, chara);
@@ -915,9 +983,12 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     }
     if (parts[1] === "personas" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
-      return json(updatePersona(Number(parts[2]), body));
+      const row = updatePersona(Number(parts[2]), body);
+      return row ? json(row) : json({ error: "not found" }, 404);
     }
     if (parts[1] === "personas" && parts[2] && !parts[3] && method === "DELETE") {
+      const before = getPersona(Number(parts[2]));
+      if (!before) return json({ error: "not found" }, 404);
       deletePersona(Number(parts[2]));
       return json({ ok: true, trashed: true });
     }
@@ -1009,8 +1080,8 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         group_mode: body.group_mode === undefined ? undefined : body.group_mode ? 1 : 0,
         pinned: body.pinned === undefined ? undefined : body.pinned ? 1 : 0,
         archived: body.archived === undefined ? undefined : body.archived ? 1 : 0,
-        cast: body.cast ? JSON.stringify(body.cast) : undefined,
-        settings: body.settings ? JSON.stringify(body.settings) : undefined,
+        cast: body.cast !== undefined ? JSON.stringify(body.cast) : undefined,
+        settings: body.settings !== undefined ? JSON.stringify(body.settings) : undefined,
       };
       if (typeof body.branch_kind === "string" && ["main", "canon", "alternative", "draft", "abandoned"].includes(body.branch_kind)) {
         patch.branch_kind = body.branch_kind;
@@ -1023,8 +1094,9 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
           patch.summary = memoryToText(m);
         }
       }
-      updateConversation(Number(parts[2]), patch);
-      return json(conversationView(Number(parts[2])));
+      const updated = updateConversation(Number(parts[2]), patch);
+      if (!updated) return json({ error: "not found" }, 404);
+      return json(conversationView(updated.id));
     }
     if (parts[1] === "conversations" && parts[2] && !parts[3] && method === "DELETE") {
       // soft delete: move to the trash (archived=1); restore via PATCH archived:0
@@ -1036,6 +1108,7 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
     // permanent delete (trash screen) — drops rows + images
     if (parts[1] === "conversations" && parts[2] && parts[3] === "permanent" && method === "DELETE") {
       const convId = Number(parts[2]);
+      if (!getConversation(convId)) return json({ error: "not found" }, 404);
       deleteConversation(convId);
       try { fs.rmSync(path.join(IMAGES_DIR, "conversations", String(convId)), { recursive: true, force: true }); } catch { /* ignore */ }
       return json({ ok: true });
@@ -1790,11 +1863,13 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const m = getMessage(mid);
       const conv = getConversation(convId);
       if (!conv || !m || m.conversation_id !== convId) return json({ error: "not found" }, 404);
-      const meta = JSON.parse(m.meta || "{}");
+      let meta: Record<string, unknown> = {};
+      try { if (typeof m.meta === "string" && m.meta) meta = JSON.parse(m.meta); } catch { /* ignore */ }
       // meta-only updates (favoris, notes privées…) never touch content
-      if (body.meta && typeof body.meta === "object" && !Array.isArray(body.meta)) {
+      if (body.meta !== undefined && typeof body.meta === "object" && !Array.isArray(body.meta)) {
+        if (!JSON.parse(m.meta || "{}")) meta = {};
         Object.assign(meta, body.meta);
-        updateMessage(mid, { meta: JSON.stringify(meta) });
+        updateMessage(mid, { meta: JSON.stringify(meta) } as Partial<MessageRow>);
         return json(messageView(getMessage(mid)!));
       }
       if (typeof body.content !== "string" || !body.content.trim()) {
@@ -1857,13 +1932,16 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const body = await readJson(req);
       const emoji = String(body.emoji || "").trim();
       if (!emoji) return json({ error: "emoji manquant" }, 400);
-      const meta = JSON.parse(m.meta || "{}");
+      let metaText = "{}";
+      if (m.meta && typeof m.meta === "string") metaText = m.meta;
+      let meta: any = {};
+      try { meta = JSON.parse(metaText); } catch { meta = {}; }
       const reactions: string[] = Array.isArray(meta.reactions) ? meta.reactions : [];
       const idx = reactions.indexOf(emoji);
       if (method === "POST" && idx < 0) reactions.push(emoji);
       if (method === "DELETE" && idx >= 0) reactions.splice(idx, 1);
       meta.reactions = reactions;
-      updateMessage(mid, { meta: JSON.stringify(meta) });
+      updateMessage(mid, { meta: JSON.stringify(meta) } as Partial<MessageRow>);
       return json(messageView(getMessage(mid)!));
     }
     // stream a chat turn
@@ -1907,8 +1985,8 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       const fullChar = char ? cast.find((c) => c.id === char.id) ?? null : null;
       const avatarRel = fullChar?.avatar ?? "";
       if (avatarRel) {
-        const avatarFile = path.join(UPLOADS_DIR, path.basename(avatarRel));
-        if (fs.existsSync(avatarFile)) {
+        const avatarFile = mediaFileFor(avatarRel);
+        if (avatarFile && fs.existsSync(avatarFile)) {
           init_image = fs.readFileSync(avatarFile).toString("base64");
         }
       }
@@ -2333,6 +2411,215 @@ async function generateCardAssist(idea: string): Promise<CardAssistFields> {
   return out;
 }
 
+// ─── guided builder helpers (« Décris ce que tu veux ») ──────────────────────
+const ASSIST_STR = (v: unknown, max = 2000): string => String(v ?? "").trim().slice(0, max);
+const ASSIST_ARR = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+/** Name-normalized key for dedupe: lowercase, accents stripped, non-letters → space. */
+const assistKey = (s: string): string =>
+  String(s ?? "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+/** Drop near-duplicate names inside a batch (e.g. « la forêt » vs « La Forêt »). */
+function dedupeByName<T extends { name: string }>(items: T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const it of items) {
+    const key = assistKey(it.name);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
+  }
+  return out;
+}
+/** How many unique entries are complete enough to keep (name + body)? */
+function completeCount(r: Record<string, unknown> | null, field: string, forbiddenNames = new Set<string>()): number {
+  const seen = new Set<string>();
+  return ASSIST_ARR(r?.[field]).filter((p) => {
+    const o = p as any;
+    const name = assistKey(String(o?.name ?? ""));
+    const description = String(o?.description ?? "").trim();
+    if (!o || typeof o !== "object" || !name || !description || forbiddenNames.has(name) || seen.has(name)) return false;
+    seen.add(name);
+    return true;
+  }).length;
+}
+
+/** Stage 1 — worlds: reuse up to 2 existing ones + exactly 4 new proposals. */
+async function assistWorlds(
+  description: string, feedback: string,
+  existing: { id: number; name: string; description: string; tone: string }[],
+): Promise<{ matches: { id: number; reason: string }[]; proposals: { name: string; description: string; tone: string; lore: string }[] }> {
+  const sys = [
+    "Tu aides un joueur à créer le monde d'un roleplay isekai à partir d'une description libre.",
+    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format :',
+    '{"matches":[{"id":42,"reason":"pourquoi ce monde existant convient"}],"proposals":[{"name":"Nom du monde","description":"2-3 phrases décrivant les lieux et la magie","tone":"genre et ambiance en quelques mots","lore":"1-2 phrases d\'histoire fondatrice"}]}.',
+    "matches : les mondes EXISTANTS fournis qui correspondent VRAIMENT à l'idée (0 à 2, id = leur numéro exact). Si aucun ne correspond, matches = [] et on créera un monde neuf.",
+    "proposals : EXACTEMENT 4 mondes NOUVEAUX, variés entre eux, cohérents avec l'idée.",
+    "Chaque proposition doit avoir un name unique ET inédit (jamais le nom d'un monde existant), une description de 2-3 phrases, un tone et un lore.",
+    "Ne propose jamais un monde existant dans proposals — il va dans matches.",
+    "Tout en français. JSON complet, non tronqué.",
+  ].join(" ");
+  const existingBlock = existing.length
+    ? existing.map((w) => `- #${w.id} « ${w.name} » : ${w.description.slice(0, 160)} (${w.tone})`).join("\n")
+    : "(aucun monde existant)";
+  const fb = feedback ? `\nRetour du joueur sur la fournée précédente (à intégrer absolument) : ${feedback}` : "";
+  const text = await llmJson(
+    `Idée du joueur : ${description}\n\nMondes existants à évaluer :\n${existingBlock}${fb}`,
+    sys, 1600, 0.95, 300_000,
+    (r) => {
+      const props = completeCount(r, "proposals", new Set(existing.map((w) => assistKey(w.name))));
+      if (props < 2) return `Il fallait au moins 2 mondes nouveaux complets, uniques et inédits (nom + description) ; ta réponse n'en contenait que ${props}.`;
+      const ms = ASSIST_ARR(r?.matches).filter((m) => Number.isFinite(Number((m as any)?.id))).length;
+      if (ms > 2) return "Au maximum 2 mondes existants peuvent être proposés en « matches ».";
+      return null;
+    },
+  );
+  const matches = dedupeByName(ASSIST_ARR(text?.matches)
+    .map((m) => ({
+      id: Number((m as any)?.id),
+      name: existing.find((w) => w.id === Number((m as any)?.id))?.name ?? "",
+      reason: ASSIST_STR((m as any)?.reason, 200),
+    }))
+    .filter((m) => Number.isFinite(m.id) && existing.some((w) => w.id === m.id)))
+    .slice(0, 2)
+    .map((m) => ({ id: m.id, reason: m.reason }));
+  const proposals = dedupeByName(ASSIST_ARR(text?.proposals)
+    .map((p) => ({
+      name: ASSIST_STR((p as any)?.name, 80),
+      description: ASSIST_STR((p as any)?.description, 1200),
+      tone: ASSIST_STR((p as any)?.tone, 160),
+      lore: ASSIST_STR((p as any)?.lore, 600),
+    }))
+    .filter((p) => p.name && p.description && !existing.some((w) => assistKey(w.name) === assistKey(p.name))))
+    .slice(0, 4);
+  return { matches, proposals };
+}
+
+/** Stage 2 — personas: reuse matching existing personas + exactly 4 new ones. */
+async function assistPersonas(
+  description: string, world: Record<string, unknown> | null, feedback: string,
+  existing: { id: number; name: string; description: string }[],
+): Promise<{ matches: { id: number; reason: string }[]; proposals: { name: string; description: string }[] }> {
+  const sys = [
+    "Tu proposes des personas de roleplay (le rôle que le joueur incarne) adaptés au monde choisi et à la description du joueur.",
+    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format :',
+    '{"matches":[{"id":42,"reason":"pourquoi ce persona existant colle au joueur"}],"proposals":[{"name":"Nom du persona","description":"2-3 phrases : qui il est, apparence, passé, motivation (à la deuxième personne, le joueur s\'incarne dedans)"}]}.',
+    "matches : les personas EXISTANTS fournis qui correspondent VRAIMENT au « moi » que le joueur décrit (0 à 2, id = leur numéro exact). Sinon matches = [].",
+    "proposals : EXACTEMENT 4 personas NOUVEAUX (jamais un persona existant), variés, cohérents avec le monde ET avec le joueur décrit.",
+    "Chaque proposition doit avoir un name unique ET un nom différent des personas existants, et une description de 2-3 phrases.",
+    "Tout en français. JSON complet, non tronqué.",
+  ].join(" ");
+  const worldBlock = world ? `Monde validé : « ${ASSIST_STR(world.name, 80)} » — ${ASSIST_STR(world.description, 600)}` : "(pas de monde choisi)";
+  const existingBlock = existing.length
+    ? existing.map((p) => `- #${p.id} « ${p.name} » : ${p.description.slice(0, 160)}`).join("\n")
+    : "(aucun persona existant)";
+  const fb = feedback ? `\nRetour du joueur sur la fournée précédente (à intégrer absolument) : ${feedback}` : "";
+  const text = await llmJson(
+    `Idée du joueur : ${description}\n\n${worldBlock}\n\nPersonas existants à évaluer :\n${existingBlock}${fb}`,
+    sys, 1500, 0.95, 300_000,
+    (r) => {
+      const props = completeCount(r, "proposals", new Set(existing.map((p) => assistKey(p.name))));
+      if (props < 2) return `Il fallait au moins 2 personas nouveaux, uniques et inédits (nom + description) ; ta réponse n'en contenait que ${props}.`;
+      const ms = ASSIST_ARR(r?.matches).filter((m) => Number.isFinite(Number((m as any)?.id))).length;
+      if (ms > 2) return "Au maximum 2 personas existants peuvent être proposés en « matches ».";
+      return null;
+    },
+  );
+  const matches = dedupeByName(ASSIST_ARR(text?.matches)
+    .map((m) => ({
+      id: Number((m as any)?.id),
+      name: existing.find((p) => p.id === Number((m as any)?.id))?.name ?? "",
+      reason: ASSIST_STR((m as any)?.reason, 200),
+    }))
+    .filter((m) => Number.isFinite(m.id) && existing.some((p) => p.id === m.id)))
+    .slice(0, 2)
+    .map((m) => ({ id: m.id, reason: m.reason }));
+  const proposals = dedupeByName(ASSIST_ARR(text?.proposals)
+    .map((p) => ({ name: ASSIST_STR((p as any)?.name, 80), description: ASSIST_STR((p as any)?.description, 1400) }))
+    .filter((p) => p.name && p.description && !existing.some((x) => assistKey(x.name) === assistKey(p.name))))
+    .slice(0, 4);
+  return { matches, proposals };
+}
+
+/** Stage 3 — characters the player described (with the fiction's own detail
+ * about each one, so the card stage never invents blind), + reuse hints. */
+async function assistCharacters(
+  description: string, world: Record<string, unknown> | null, persona: Record<string, unknown> | null,
+  cards: { id: number; name: string; description: string }[], feedback: string,
+): Promise<{ characters: { name: string; role: string; detail: string; reuse: string | null }[] }> {
+  const sys = [
+    "À partir de l'idée du joueur, extrais les personnages non-joueurs (PNJ) qu'il a décrits ou évoqués.",
+    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format :',
+    '{"characters":[{"name":"Nom du PNJ","role":"sa fonction dans l\'histoire","detail":"CE QUE le joueur a dit de lui : apparence, attitude, indices visuels (1-2 phrases)","reuse":null}]}.',
+    "characters : de 0 à 4 PNJ réellement évoqués par le joueur (0 si aucun).",
+    "name : si le joueur n'a pas donné de nom propre (ex. « la tavernière mystérieuse »), garde sa description courte comme nom provisoire — on le nommera plus tard.",
+    "detail : reproduis les indices de la description (apparence, objet, mystère) ; vide si le joueur n'a rien dit de précis.",
+    "reuse : si un PNJ correspond à une carte EXISTANTE fournie ci-dessous, met son nom exact dans \"reuse\" (sinon null). On proposera la carte existante en premier, plus des variantes neuves.",
+    "Tout en français. JSON complet, non tronqué.",
+  ].join(" ");
+  const worldBlock = world ? `Monde : « ${ASSIST_STR(world.name, 80)} » — ${ASSIST_STR(world.description, 400)}` : "";
+  const personaBlock = persona ? `Persona du joueur : « ${ASSIST_STR(persona.name, 80)} »` : "";
+  const cardsBlock = cards.length
+    ? cards.map((c) => `- « ${c.name} » : ${c.description.slice(0, 120)}`).join("\n")
+    : "(aucune carte existante)";
+  const fb = feedback ? `\nRetour du joueur (à intégrer) : ${feedback}` : "";
+  const text = await llmJson(
+    `Idée du joueur : ${description}\n\n${[worldBlock, personaBlock].filter(Boolean).join("\n")}\n\nCartes existantes :\n${cardsBlock}${fb}`,
+    sys, 1100, 0.5, 300_000,
+  );
+  const names = new Set(cards.map((c) => assistKey(c.name)));
+  const characters = dedupeByName(ASSIST_ARR(text?.characters)
+    .map((c) => {
+      const reuse = ASSIST_STR((c as any)?.reuse, 80);
+      return {
+        name: ASSIST_STR((c as any)?.name, 80),
+        role: ASSIST_STR((c as any)?.role, 200),
+        detail: ASSIST_STR((c as any)?.detail, 400),
+        reuse: reuse && names.has(assistKey(reuse)) ? reuse : null,
+      };
+    })
+    .filter((c) => c.name))
+    .slice(0, 4);
+  return { characters };
+}
+
+/** Stage 4 — 4 card variants for one validated character. */
+async function assistCards(
+  description: string, world: Record<string, unknown> | null,
+  character: Record<string, unknown> | undefined, feedback: string,
+): Promise<{ proposals: { name: string; description: string; personality: string; scenario: string; tags: string[] }[] }> {
+  const charName = ASSIST_STR(character?.name, 80) || "le personnage";
+  const charRole = ASSIST_STR(character?.role, 200);
+  const charDetail = ASSIST_STR(character?.detail, 400);
+  const sys = [
+    `Tu crées des cartes de personnage alternatives pour « ${charName} » (${charRole || "rôle à définir"}) dans le monde du joueur.`,
+    ...(charDetail ? [`Le joueur a dit de lui : « ${charDetail} » — RESPECTE ces indices visuels et ce mystère dans chaque carte.`] : []),
+    "Si le nom provisoire n'est pas un vrai nom propre (ex. « la tavernière mystérieuse », « le garde »), invente un nom propre pour chaque carte.",
+    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format :',
+    '{"proposals":[{"name":"Nom","description":"2 phrases : apparence et signes distinctifs","personality":"traits de caractère en une phrase","scenario":"sa situation initiale dans l\'histoire","tags":["tag1","tag2"]}]}.',
+    "proposals : EXACTEMENT 4 cartes complètes, variées entre elles (ton, rôle, attitude), avec des noms différents.",
+    "Tout en français. JSON complet, non tronqué.",
+  ].join(" ");
+  const worldBlock = world ? `Monde : « ${ASSIST_STR(world.name, 80)} » — ${ASSIST_STR(world.description, 400)}` : "";
+  const fb = feedback ? `\nRetour du joueur sur la fournée précédente (à intégrer) : ${feedback}` : "";
+  const text = await llmJson(`Idée du joueur : ${description}\n\n${worldBlock}${fb}`, sys, 2600, 0.9, 300_000,
+    (r) => {
+      const n = completeCount(r, "proposals");
+      if (n < 2) return `Il fallait au moins 2 cartes complètes et uniques (nom + description) ; ta réponse n'en contenait que ${n}.`;
+      return null;
+    },
+  );
+  const proposals = dedupeByName(ASSIST_ARR(text?.proposals)
+    .map((p) => ({
+      name: ASSIST_STR((p as any)?.name, 80),
+      description: ASSIST_STR((p as any)?.description, 1200),
+      personality: ASSIST_STR((p as any)?.personality, 1200),
+      scenario: ASSIST_STR((p as any)?.scenario, 800),
+      tags: ASSIST_ARR((p as any)?.tags).map((t) => ASSIST_STR(t, 40)).filter(Boolean).slice(0, 8),
+    }))
+    .filter((p) => p.name && (p.description || p.personality)))
+    .slice(0, 4);
+  return { proposals };
+}
+
 // ─── story chapters & dynamic NPCs ───────────────────────────────────────────
 // Chapters: closed automatically every CHAPTER_MIN_MESSAGES turns; the marker
 // message is display-only (skipped in buildMessages) and summaries feed the
@@ -2342,7 +2629,21 @@ const CHAPTER_MIN_MESSAGES = 10;
 type NpcSuggestion = { name: string; description: string; personality: string; role: string };
 const NPC_FMT = '{"npcs":[{"name":"Prénom","description":"2 phrases visuelles","personality":"traits en une phrase","role":"fonction dans la scène"}]}';
 
-async function llmJson(prompt: string, sys: string, maxTokens = 700, temperature = 0.7): Promise<Record<string, unknown> | null> {
+/**
+ * Ask the model for strict JSON, with ONE automatic corrective retry for two
+ * failure classes that small local models hit constantly:
+ *  1. the call threw / the text is not parseable (truncated, code fence, prose
+ *     around the block, broken escapes) → re-ask with an explicit nudge;
+ *  2. the JSON parses but fails `validate` (optional) — e.g. a stage that
+ *     promised 4 proposals got 1 — → re-ask with the exact rejection reason.
+ * Both retries run at a lower temperature to favor strict formatting over
+ * creativity. A stage therefore never silently returns a 1-world batch just
+ * because the first answer was short.
+ */
+async function llmJson(
+  prompt: string, sys: string, maxTokens = 700, temperature = 0.7, timeoutMs = 120_000,
+  validate?: (parsed: Record<string, unknown> | null) => string | null,
+): Promise<Record<string, unknown> | null> {
   const provider = getProvider();
   let model = defaultModelFor(provider.id);
   if (!model) {
@@ -2352,16 +2653,48 @@ async function llmJson(prompt: string, sys: string, maxTokens = 700, temperature
     } catch { /* offline */ }
   }
   if (!model) return null;
-  try {
-    const text = await provider.complete({
-      messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
-      model, temperature, maxTokens, noThinking: true, signal: AbortSignal.timeout(120_000),
-    });
-    return parseCardAssistJson(text || "");
-  } catch (e) {
-    console.warn(`[llm-json] échec: ${String(e?.message ?? e).slice(0, 140)}`);
-    return null;
+  const ask = async (extraSys: string, temp: number): Promise<Record<string, unknown> | null> => {
+    try {
+      const text = await provider.complete({
+        messages: [
+          { role: "system", content: sys + (extraSys ? " " + extraSys : "") },
+          { role: "user", content: prompt },
+        ],
+        model, temperature: temp, maxTokens, noThinking: true, signal: AbortSignal.timeout(timeoutMs),
+      });
+      return parseCardAssistJson(text || "");
+    } catch (e) {
+      console.warn(`[llm-json] échec: ${String(e?.message ?? e).slice(0, 140)}`);
+      return null;
+    }
+  };
+  let parsed = await ask("", temperature);
+  if (!parsed) {
+    console.warn("[llm-json] réponse illisible — 1 relance corrective");
+    // This is the one and only retry for a malformed response. Validate the
+    // retry here too, without launching a third model call.
+    parsed = await ask(
+      "⚠️ Ta première réponse a été rejetée : elle n'était pas un JSON valide et complet (tronqué, entouré de texte, ou échappements cassés). Recommence et réponds UNIQUEMENT avec le JSON demandé, fermé, non tronqué, sans texte autour.",
+      Math.min(0.5, temperature),
+    );
+    if (!parsed || (validate && validate(parsed))) return null;
+    return parsed;
   }
+  if (validate) {
+    const reason = validate(parsed);
+    if (reason) {
+      console.warn(`[llm-json] réponse rejetée (${reason}) — 1 relance corrective`);
+      const retried = await ask(
+        `⚠️ Ta première réponse a été rejetée pour la raison suivante : ${reason} Recommence depuis zéro en corrigeant cela, en français, au format exact demandé, JSON complet et non tronqué.`,
+        Math.min(0.6, temperature),
+      );
+      // Validate the corrective answer too. It must never become a successful
+      // partial batch, but it must not trigger a third model call either.
+      if (!retried || validate(retried)) return null;
+      return retried;
+    }
+  }
+  return parsed;
 }
 
 function transcriptFor(msgs: MessageRow[], max = 60): string {
@@ -2662,25 +2995,65 @@ async function suggestRelations(known: string[], msgs: MessageRow[]): Promise<Re
 async function suggestNpcs(conv: ConversationRow, msgs: MessageRow[]): Promise<NpcSuggestion[]> {
   let castNames: string[] = [];
   try { castNames = (JSON.parse(conv.cast || "[]") as number[]).map((id) => getCard(Number(id))?.name ?? "").filter(Boolean); } catch { /* ignore */ }
-  const sys = [
-    "Tu suis une partie de roleplay et repères les personnages secondaires qui émergent de la fiction.",
-    `Personnages déjà en carte (à ignorer) : ${castNames.join(", ") || "aucun"}.`,
-    "Ne propose QUE des personnages réellement évoqués par les derniers échanges (un tavernier, une garde, un rival…), jamais le narrateur ni le joueur.",
-    `Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : ${NPC_FMT}. 0 à 3 entrées. Noms propres, descriptions neutres et concrètes. JSON complet, non tronqué.`,
-  ].join(" ");
-  const p = await llmJson(transcriptFor(msgs, 24), sys, 900, 0.8);
-  const list = Array.isArray(p?.npcs) ? p.npcs : [];
   const norm = (s: string) => String(s).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
-  const taken = new Set(castNames.map(norm));
-  return list
-    .map((x: any) => ({
-      name: String(x?.name ?? "").trim().slice(0, 80),
-      description: String(x?.description ?? "").trim().slice(0, 1500),
-      personality: String(x?.personality ?? "").trim().slice(0, 1200),
-      role: String(x?.role ?? "").trim().slice(0, 400),
-    }))
-    .filter((n) => n.name && n.description && !taken.has(norm(n.name)))
-    .slice(0, 3);
+  const castNorm = castNames.map(norm).filter(Boolean);
+  const transcript = transcriptFor(msgs, 24);
+  // a name collides with a card already in the party — exact, or word-level
+  // ("Tavernier Grolo" vs the card "Tavernier") so variants of an existing
+  // character are never re-proposed
+  const collides = (nameRaw: string): boolean => {
+    const n = norm(nameRaw);
+    if (!n) return true;
+    if (castNorm.includes(n)) return true;
+    const words = n.split(/[\s'’-]+/).filter((w) => w.length >= 3);
+    return castNorm.some((c) => {
+      if (words.includes(c)) return true;
+      // plural/possessive drift: "Taverniers", "l'ombre" spanning glue chars
+      return c.length >= 4 && (n.startsWith(c + "s") || n.startsWith(c + "x") || n.startsWith(c + " "));
+    });
+  };
+  const clean = (list: any[]): NpcSuggestion[] => {
+    const seen = new Set<string>();
+    const out: NpcSuggestion[] = [];
+    for (const x of list) {
+      const name = String(x?.name ?? "").trim().slice(0, 80);
+      const key = norm(name);
+      if (!name || !String(x?.description ?? "").trim()) continue;
+      if (collides(name) || seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        name,
+        description: String(x?.description ?? "").trim().slice(0, 1500),
+        personality: String(x?.personality ?? "").trim().slice(0, 1200),
+        role: String(x?.role ?? "").trim().slice(0, 400),
+      });
+    }
+    return out.slice(0, 3);
+  };
+  // explicit exclusion list: the model famously re-proposes existing cast
+  // members (then the filter drops them and the user sees "Aucun PNJ") — make
+  // the rule loud and give the model a sanctioned empty answer instead
+  const sys = (extra: string) => `
+Tu suis une partie de roleplay et repères les personnages secondaires qui émergent de la fiction.
+
+PERSONNAGES DÉJÀ EN CARTE (STRICTEMENT INTERDITS, à ignorer) : ${castNames.join(", ") || "aucun"}.
+RÈGLES :
+- Ne propose JAMAIS un nom de cette liste, ni une variante, un surnom, un dérivé ou une translittération de l'un d'eux (même personnage, même rôle ⇒ interdit).
+- Ne propose QUE des personnages réellement évoqués par les derniers échanges, nouveaux par rapport à la liste ci-dessus, jamais le narrateur ni le joueur. Chaque proposition reçoit un nom propre INÉDIT.
+- Si TOUS les personnages secondaires de la scène sont déjà dans la liste (ou qu'aucun personnage secondaire distinct n'apparaît), réponds exactement {"npcs":[]} plutôt que de re-proposer un membre de la liste.
+${extra}
+RÉPONSE : ${NPC_FMT} — 0 à 3 entrées, JSON valide complet, aucun texte autour.
+`;
+  const castsJoined = castNames.join(", ") || "aucun";
+  const first = await llmJson(transcript, sys(""), 900, 0.8);
+  let out = clean(Array.isArray(first?.npcs) ? first.npcs as any[] : []);
+  // first pass only re-proposed cast members (or nothing) → one targeted retry
+  if (!out.length) {
+    const fallback = await llmJson(transcript, sys(`Rappel : ta première réponse ne contenait que des personnages déjà en carte (${castsJoined}) ou rien. Trouve un personnage secondaire DIFFÉRENT réellement présent dans ces échanges et donne-lui un nom propre inédit ; sinon {"npcs":[]}.`), 900, 0.6);
+    out = clean(Array.isArray(fallback?.npcs) ? fallback.npcs as any[] : []);
+    if (out.length) console.log(`[npcs] 💡 partie #${conv.id} — 1er essai vide (membres du casting re-proposés ?), 2e essai : ${out.map((n) => n.name).join(", ")}`);
+  }
+  return out;
 }
 
 // ─── quest journal ────────────────────────────────────────────────────────────
@@ -2741,11 +3114,20 @@ async function generateQuests(title: string, messages: MessageRow[]): Promise<Qu
 /** Extract + parse the first balanced JSON object — robust to prose around it,
  * braces inside strings and raw newlines in string values (models cheat). */
 function parseCardAssistJson(text: string): Record<string, unknown> | null {
-  const raw = String(text).replace(/```[a-zA-Z]*\n?/g, "");
-  try {
-    // fast path: whole text is valid JSON
-    return JSON.parse(raw);
-  } catch { /* fall through */ }
+  // Small local models frequently emit curly typographic quotes around keys
+  // and values (“name”:…). Normalize them to straight quotes BEFORE parsing so
+  // the balanced-block scan treats them as real string delimiters; curly
+  // apostrophes (’) stay content and are harmless inside double-quoted JSON.
+  const raw = String(text)
+    .replace(/```[a-zA-Z]*\n?/g, "")
+    .replace(/[“”]/g, '"')
+    .replace(/[‘]/g, "'")
+    .replace(/^\ufeff+/u, "");
+  const tryParse = (s: string): Record<string, unknown> | null => {
+    try { return JSON.parse(s); } catch { return null; }
+  };
+  const fast = tryParse(raw);
+  if (fast) return fast;
   // find the outermost balanced {...} block, ignoring braces inside strings
   let start = -1;
   let depth = 0;
@@ -2765,12 +3147,12 @@ function parseCardAssistJson(text: string): Record<string, unknown> | null {
       depth--;
       if (depth === 0 && start >= 0) {
         const block = raw.slice(start, i + 1);
-        try { return JSON.parse(block); } catch { /* try lenient below */ }
-        try {
-          // sanitize: collapse raw newlines inside string values, drop trailing commas
-          const cleaned = block.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"/gs, (m, inner) => '"' + inner.replace(/[\r\n\t]+/g, " ") + '"').replace(/,([\s]*[}\]])/g, "$1");
-          return JSON.parse(cleaned);
-        } catch { /* not JSON */ }
+        const direct = tryParse(block);
+        if (direct) return direct;
+        // sanitize: collapse raw newlines inside string values, drop trailing commas
+        const cleaned = block.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"/gs, (m, inner) => '"' + inner.replace(/[\r\n\t]+/g, " ") + '"').replace(/,([\s]*[}\]])/g, "$1");
+        const lenient = tryParse(cleaned);
+        if (lenient) return lenient;
         return null;
       }
     }
@@ -3144,7 +3526,9 @@ async function handleStream(req: Request, convId: number): Promise<Response> {
           break; // stream finished
         } catch (e: any) {
           const aborted = e?.name === "AbortError" || e?.name === "TimeoutError" || /abort/i.test(String(e));
-          if (aborted || attempt >= MAX_ATTEMPTS) throw e;
+          // Once any output has reached the client, retrying would append a
+          // second response to the partial one and commit duplicated fiction.
+          if (aborted || full || attempt >= MAX_ATTEMPTS) throw e;
           const wait = 500 * attempt * attempt;
           send("retry", { attempt, message: `Connexion au modèle instable — nouvelle tentative (${attempt}/${MAX_ATTEMPTS})…` });
           await new Promise((r) => setTimeout(r, wait));

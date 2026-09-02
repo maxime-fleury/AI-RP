@@ -2,7 +2,7 @@
  * Image generation client. Spawns the Python sidecar (diffusers + Koji) on
  * demand, waits for it to be healthy, then proxies generation requests.
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -15,6 +15,7 @@ let proc: ChildProcess | null = null;
 let ready = false;
 let loading = false;
 let lastError = "";
+let ensurePromise: Promise<boolean> | null = null;
 
 export interface ImageStatus {
   running: boolean;
@@ -61,55 +62,95 @@ function pythonExecutable(): string {
   return "python";
 }
 
-export async function ensureImageServer(timeoutMs = 300_000): Promise<boolean> {
+export function ensureImageServer(timeoutMs = 300_000): Promise<boolean> {
+  if (ensurePromise) return ensurePromise;
+  let wrapped: Promise<boolean>;
+  wrapped = ensureImageServerOnce(timeoutMs).finally(() => {
+    if (ensurePromise === wrapped) ensurePromise = null;
+  });
+  ensurePromise = wrapped;
+  return wrapped;
+}
+
+async function ensureImageServerOnce(timeoutMs: number): Promise<boolean> {
   if (ready) return true;
+  let waitingForExternal = false;
   // Already running (started externally)?
   try {
     const r = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(1500) });
     if (r.ok) {
-      const j = (await r.json()) as { status?: string };
-      ready = j.status === "ready";
-      return ready;
+      const j = (await r.json()) as { status?: string; error?: string };
+      if (j.status === "ready") {
+        ready = true;
+        loading = false;
+        return true;
+      }
+      if (j.status === "error") {
+        ready = false;
+        loading = false;
+        lastError = j.error || "Le serveur d'images a échoué à charger le modèle.";
+        return false;
+      }
+      if (j.status === "loading") {
+        // Do not spawn a second listener while an external sidecar is loading.
+        waitingForExternal = true;
+        loading = true;
+      }
     }
   } catch {
     /* not running */
   }
-  if (!proc) {
+  if (!proc && !waitingForExternal) {
     lastError = "";
     loading = true;
     const py = pythonExecutable();
     const server = path.join(PYTHON_DIR, "server.py");
     console.log(`[image] spawning: ${py} ${server} (port ${PORT})`);
-    proc = spawn(py, [server, "--port", String(PORT)], {
+    const child = spawn(py, [server, "--port", String(PORT)], {
       cwd: PYTHON_DIR,
       stdio: ["ignore", "pipe", "pipe"],
+      // the GPU is shared with the resident LLM: grow the CUDA arena in small
+      // segments so renders can't fragment/claim VRAM the LLM needs back
+      env: { ...process.env, PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True" },
     });
-    proc.stdout?.on("data", (d) => process.stdout.write(`[image] ${String(d)}`));
-    proc.stderr?.on("data", (d) => process.stderr.write(`[image] ${String(d)}`));
-    proc.on("exit", (code) => {
+    proc = child;
+    child.stdout?.on("data", (d) => process.stdout.write(`[image] ${String(d)}`));
+    child.stderr?.on("data", (d) => process.stderr.write(`[image] ${String(d)}`));
+    child.on("exit", (code) => {
       console.log(`[image] server exited (${code})`);
+      // An old launcher may exit after stopImageServer has already started a
+      // replacement. It must not clear the replacement's state.
+      if (proc !== child) return;
       proc = null;
       ready = false;
       loading = false;
     });
-    proc.on("error", (e) => {
+    child.on("error", (e) => {
       lastError = String(e);
       console.error("[image] spawn error:", e);
+      if (proc !== child) return;
       proc = null;
+      ready = false;
       loading = false;
     });
   }
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!proc) return false;
+    if (!proc && !waitingForExternal) return false;
     try {
       const r = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(2000) });
       if (r.ok) {
-        const j = (await r.json()) as { status?: string };
+        const j = (await r.json()) as { status?: string; error?: string };
         if (j.status === "ready") {
           ready = true;
           loading = false;
           return true;
+        }
+        if (j.status === "error") {
+          loading = false;
+          lastError = j.error || "Le serveur d'images a échoué à charger le modèle.";
+          stopImageServer();
+          return false;
         }
       }
     } catch {
@@ -118,7 +159,10 @@ export async function ensureImageServer(timeoutMs = 300_000): Promise<boolean> {
     await new Promise((r) => setTimeout(r, 1500));
   }
   loading = false;
-  lastError = "Le serveur d'images n'a pas démarré à temps (chargement du modèle Koji très long ?).";
+  lastError = waitingForExternal
+    ? "Le serveur d'images externe n'est pas devenu prêt à temps."
+    : "Le serveur d'images n'a pas démarré à temps (chargement du modèle Koji très long ?).";
+  stopImageServer();
   return false;
 }
 
@@ -144,14 +188,24 @@ export interface ImageResult {
 
 export async function generateImage(req: ImageRequest): Promise<ImageResult> {
   if (!(await ensureImageServer())) throw new Error(lastError || "Serveur d'images indisponible.");
-  // generous timeout: GPU inference can take minutes, but a deadlocked sidecar
-  // must not hold the caller's connection open forever
-  const res = await fetch(`${BASE}/generate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(req),
-    signal: AbortSignal.timeout(300_000),
-  });
+  // generous timeout: GPU inference can take minutes, but a wedged sidecar must
+  // not hold the caller's connection open forever
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+      signal: AbortSignal.timeout(300_000),
+    });
+  } catch (e) {
+    // network failure or watchdog timeout → the sidecar is likely wedged on a
+    // tight GPU. Reset it NOW so the NEXT request spawns a fresh server instead
+    // of every subsequent generation hanging on the dead one.
+    console.error(`[image] génération interrompue (${String((e as Error)?.message ?? e).slice(0, 120)}) — redémarrage du serveur d'images`);
+    stopImageServer();
+    throw new Error("La génération d'image n'a pas répondu à temps — le serveur d'images a été relancé. Réessaie.");
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`Image (${res.status}): ${text.slice(0, 300)}`);
@@ -217,10 +271,30 @@ export async function generateAndSave(
   return { url: `/images/${subdir}/${path.basename(file)}`, seed: res.seed, ms: res.ms };
 }
 
+/**
+ * Kill the whole sidecar process TREE. On Windows the venv python is a launcher
+ * that spawns the real interpreter as a child — killing only the launcher used
+ * to orphan the listener holding port 8770, so every later spawn failed to bind
+ * (winerror 10013) while the wedged orphan kept answering /health.
+ */
+function killProcTree(p: ChildProcess): void {
+  try {
+    if (process.platform === "win32") {
+      spawnSync("taskkill", ["/PID", String(p.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+    } else {
+      p.kill("SIGKILL");
+    }
+  } catch {
+    try { p.kill(); } catch { /* ignore */ }
+  }
+}
+
 export function stopImageServer(): void {
   if (proc) {
-    try { proc.kill(); } catch { /* ignore */ }
+    const child = proc;
     proc = null;
-    ready = false;
+    killProcTree(child);
   }
+  ready = false;
+  loading = false;
 }

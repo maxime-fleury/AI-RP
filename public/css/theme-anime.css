@@ -1,6 +1,7 @@
 /* ── Thème : Anime / ISEKAI vibrant ── */
 [data-theme="anime"] {
   --bg: #17122b;
+  --bg2: #251c38; /* secondary panels (⋮ menu, 🎮 DM panel) — must be opaque-ish to stay readable over the chat */
   --surface: rgba(255, 255, 255, 0.07);
   --modal-bg: rgba(30, 22, 54, 0.95);
   --sidebar-bg: rgba(24, 17, 46, 0.6);

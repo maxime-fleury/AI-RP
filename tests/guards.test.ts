@@ -88,6 +88,48 @@ describe("cross-conversation message guards", () => {
   });
 });
 
+describe("missing-resource mutations return 404, never false success", () => {
+  const MISSING = 999_999_999;
+
+  test("PATCH / worlds, scenarios, cards, personas, conversations → 404 on missing id", async () => {
+    for (const path of [`/api/worlds/${MISSING}`, `/api/scenarios/${MISSING}`, `/api/cards/${MISSING}`, `/api/personas/${MISSING}`, `/api/conversations/${MISSING}`]) {
+      const res = await api(routes, "PATCH", path, { name: "intrus" });
+      expect(res.status).toBe(404);
+      expect((await j(res)).error).toBe("not found");
+    }
+  });
+
+  test("DELETE / worlds, scenarios, cards, personas, conversations (+ permanent) → 404 on missing id", async () => {
+    for (const path of [`/api/worlds/${MISSING}`, `/api/scenarios/${MISSING}`, `/api/cards/${MISSING}`, `/api/personas/${MISSING}`, `/api/conversations/${MISSING}`, `/api/conversations/${MISSING}/permanent`]) {
+      const res = await api(routes, "DELETE", path);
+      expect(res.status).toBe(404);
+      expect((await j(res)).error).toBe("not found");
+    }
+  });
+
+  test("PATCH /locations|/lorebook|/relations|/timeline → 404 on missing id (already guarded)", async () => {
+    for (const path of [`/api/locations/${MISSING}`, `/api/lorebook/${MISSING}`, `/api/relations/${MISSING}`, `/api/timeline/${MISSING}`]) {
+      const res = await api(routes, "PATCH", path, { name: "intrus" });
+      expect(res.status).toBe(404);
+    }
+    for (const path of [`/api/locations/${MISSING}`, `/api/lorebook/${MISSING}`, `/api/relations/${MISSING}`, `/api/timeline/${MISSING}`]) {
+      expect((await api(routes, "DELETE", path)).status).toBe(404);
+    }
+  });
+
+  test("valid PATCH still succeeds (conversation title) and can clear settings", async () => {
+    const conv = db.createConversation({ title: "Avant", settings: JSON.stringify({ draft_intro: "intro" }) });
+    const res = await api(routes, "PATCH", `/api/conversations/${conv.id}`, { title: "Après", settings: {} });
+    expect(res.status).toBe(200);
+    const view = await j(res);
+    expect(view.title).toBe("Après");
+    // empty object is persisted (not treated as absent)
+    expect(db.getConversation(conv.id)?.settings).toBe("{}");
+    // and the stored settings no longer carry the old draft_intro
+    expect(view.settings).not.toContain("draft_intro");
+  });
+});
+
 describe("stats & user-message edits", () => {
   const conv = db.createConversation({ title: "Stats" });
   db.createMessage({ conversation_id: conv.id, role: "user", content: "Salut" });

@@ -41,7 +41,7 @@ export function fmtTime(ts) {
 
 export function toast(msg, type = "ok", ms = 3800) {
   const root = document.getElementById("toasts");
-  const t = el("div", { class: `toast ${type}`, role: "status", "aria-live": "polite" }, type === "err" ? "⚠️" : "✅", msg);
+  const t = el("div", { class: `toast ${type}`, role: "status", "aria-live": "polite" }, type === "err" || type === "warn" ? "⚠️" : "✅", msg);
   root.append(t);
   setTimeout(() => {
     t.style.opacity = "0";
@@ -77,6 +77,10 @@ export function openModal({ title, sub, body, footer, wide = false, onClose }) {
     if (previousFocus && typeof previousFocus.focus === "function") previousFocus.focus();
     onClose?.();
   };
+  // stash the close handle so a route change can force-close leftover modals
+  // (see closeAllModals) — otherwise an open modal keeps swallowing clicks
+  // on the freshly rendered screen behind it
+  backdrop._close = close;
   backdrop.addEventListener("mousedown", (e) => { if (e.target === backdrop) close(); });
   // Escape closes only the topmost modal, and the listener dies with the modal
   function escKey(e) {
@@ -88,6 +92,19 @@ export function openModal({ title, sub, body, footer, wide = false, onClose }) {
     focusable?.focus();
   }, 0);
   return { close, modal, backdrop };
+}
+
+/** Force-close every open modal (e.g. when switching screens): without this, a
+ * modal left open on a previous view keeps its backdrop on top and silently
+ * swallows clicks on the new screen. onClose hooks still fire. */
+export function closeAllModals() {
+  const root = document.getElementById("modal-root");
+  if (!root) return;
+  for (const backdrop of [...root.querySelectorAll(".modal-backdrop")]) {
+    const close = backdrop._close;
+    if (typeof close === "function") close();
+    else backdrop.remove();
+  }
 }
 
 export function confirmModal({ title, message, confirmLabel = "Supprimer", danger = true }) {

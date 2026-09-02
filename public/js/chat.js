@@ -1,6 +1,6 @@
-import { api, apiFetch, readSseStream } from "./api.js?v=50";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=50";
-import { store, refreshAll, refreshConversations, refreshConversation, navigate, applyTheme } from "./app.js?v=50";
+import { api, apiFetch, readSseStream } from "./api.js?v=51";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=51";
+import { store, refreshAll, refreshConversations, refreshConversation, navigate, applyTheme, autoCardAvatar } from "./app.js?v=51";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -15,6 +15,7 @@ let sceneRefreshHook = null; // set by renderChat; fired after each completed tu
 // ReferenceError on every completed turn)
 let lastAutoValidateAt = 0; // per-session throttle for the auto coherence check
 let autoValidateBusy = false;
+let narratorAvatarPending = false; // une seule tentative de portrait du narrateur par session
 let coherenceBannerEl = null; // wired by renderChat
 let coherenceFindings = [];
 function showCoherenceBanner(findings) {
@@ -137,15 +138,18 @@ async function dmSave(convId, dm, pending) {
 // ─── render ───────────────────────────────────────────────────────────────────
 export async function renderChat(convIdRaw) {
   clearRecapBanner(); // a new render supersedes any previous recap banner/poll
-  // support #/chat/new?world=&scenario=
-  if (convIdRaw === "new") {
+  // support #/chat/new?world=&scenario= — the query string rides along in
+  // parts[1] ("new?world=3&scenario=4"), so strip it before matching: without
+  // this, "Jouer ▶" on a scenario card sent /api/conversations/NaN → 404
+  const bareId = String(convIdRaw ?? "").split("?")[0];
+  if (bareId === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=50");
+    const { newGameWizard } = await import("./app.js?v=51");
     newGameWizard(pre);
     return;
   }
-  const convId = Number(convIdRaw);
+  const convId = Number(bareId);
   currentConversation = null;
   const conv = await api(`/api/conversations/${convId}`);
   currentConversation = conv;
@@ -311,14 +315,21 @@ export async function renderChat(convIdRaw) {
     try {
       const r = await api(`/api/conversations/${convId}/scene`);
       scenePanel.replaceChildren(renderScenePanel(r.state, r.updatedAt, generateScene));
-    } catch { /* panel is best-effort */ }
+    } catch {
+      // model unreachable: never leave the panel open and EMPTY (a floating
+      // rounded bar that contains nothing) — show the fallback state instead
+      scenePanel.replaceChildren(renderScenePanel(null, null, generateScene));
+    }
   };
   const generateScene = async () => {
     try {
       const r = await api(`/api/conversations/${convId}/scene`, { method: "POST", body: {} });
       scenePanel.replaceChildren(renderScenePanel(r.state, r.updatedAt, generateScene));
       toast(r.throttled ? "État déjà récent (2 min) ✓" : "État de la scène actualisé ✓");
-    } catch (e) { toast(e.message, "err"); }
+    } catch (e) {
+      scenePanel.replaceChildren(renderScenePanel(null, null, generateScene));
+      toast(e.message, "err");
+    }
   };
   // keep the panel fresh after each completed turn (only when it was opened)
   sceneRefreshHook = async () => { if (sceneEnabled && !busy) await generateScene().catch(() => {}); };
@@ -418,9 +429,13 @@ export async function renderChat(convIdRaw) {
   }
 
   async function openGallery() {
-    const data = await api(`/api/conversations/${convId}/gallery`).catch(() => ({ items: [], captions: {} }));
-    const items = data.items || [];
-    let captions = data.captions || {};
+    // a failed fetch must not masquerade as "Aucune illustration"
+    let data = null;
+    let galleryErr = "";
+    try { data = await api(`/api/conversations/${convId}/gallery`); }
+    catch (e) { galleryErr = e?.message || "Erreur inconnue"; }
+    const items = data?.items || [];
+    let captions = data?.captions || {};
     const grid = el("div", { class: "gallery-grid" });
     const paint = () => {
       grid.replaceChildren(...items.map((it) => {
@@ -448,11 +463,13 @@ export async function renderChat(convIdRaw) {
       capBtn.disabled = true;
       capBtn.textContent = "✨ L'IA rédige les légendes…";
       try {
-        const r = await api(`/api/conversations/${convId}/gallery/captions`, { method: "POST", body: {} }).catch(() => ({ captions: captions }));
+        // no silent swallow: a failed generation must NOT toast "✓" as if it
+        // succeeded (the old .catch kept the stale captions AND the success toast)
+        const r = await api(`/api/conversations/${convId}/gallery/captions`, { method: "POST", body: {} });
         captions = r.captions || {};
         paint();
         toast("Légendes générées ✓");
-      } catch (e) { toast(e.message, "err"); }
+      } catch (e) { toast(e.message || "Génération des légendes impossible", "err"); }
       capBtn.disabled = false;
       capBtn.textContent = "✨ Légendes IA";
     } }, "✨ Légendes IA");
@@ -463,8 +480,8 @@ export async function renderChat(convIdRaw) {
         el("div", { style: { display: "flex", justifyContent: "flex-end", marginBottom: "10px" } }, capBtn),
         items.length ? grid : el("div", { class: "empty" },
           el("div", { class: "big" }, "🖼"),
-          el("h3", {}, "Aucune illustration"),
-          el("p", {}, "Génère des images depuis les messages (bouton « Illustrer »)."),
+          el("h3", {}, galleryErr ? "Galerie indisponible" : "Aucune illustration"),
+          el("p", {}, galleryErr ? esc(galleryErr) : "Génère des images depuis les messages (bouton « Illustrer »)."),
         ),
       ),
       wide: true,
@@ -785,6 +802,7 @@ export async function renderChat(convIdRaw) {
 
   async function send() {
     const raw = textarea.value.trim();
+    if (busy && raw) return toast("Une génération est déjà en cours…", "warn", 2000);
     if (!raw || busy) return;
     const slash = parseSlash(raw);
     textarea.value = "";
@@ -992,6 +1010,8 @@ export async function renderChat(convIdRaw) {
     });
   }
 
+  // 🪄 avatar du narrateur — généré en arrière-plan, une seule fois par session
+  maybeNarratorAvatar();
 }
 
 // ─── streaming a turn ─────────────────────────────────────────────────────────
@@ -1357,7 +1377,7 @@ function parseSlash(raw) {
 
 // interpellation: ask the narrator or a specific character to speak
 async function askToSpeak(target) {
-  if (busy) return;
+  if (busy) return toast("Attends la fin de la génération en cours…", "warn", 2000);
   const narrator = target === "narrateur";
   const display = narrator ? "🎙 Le narrateur prend la parole" : `🎙 ${target} prend la parole`;
   const directive = narrator
@@ -2077,6 +2097,36 @@ function initialAvatar(name, glyph) {
   }, glyph || (name || "?").charAt(0).toUpperCase());
 }
 
+// 🪄 avatar du narrateur : généré une fois (lazily) dès qu'une partie contient
+// de la narration, puis stocké globalement dans les réglages pour toutes les
+// parties. Le narrateur reste un rôle spécial (jamais une carte) — c'est lui
+// qui raconte, il n'entre pas dans le casting.
+async function maybeNarratorAvatar() {
+  if (narratorAvatarPending || store.settings?.narrator_avatar) return;
+  const conv = currentConversation;
+  const msgs = conv?.messages || [];
+  const hasNarrator = msgs.some((m) => m.role !== "user" && (!m.name || String(m.name).toLowerCase() === "narrateur"));
+  if (!hasNarrator) return;
+  narratorAvatarPending = true;
+  try {
+    const r = await api("/api/cards/generate-avatar", {
+      body: {
+        name: "Narrateur",
+        description: "Le narrateur omniscient d'un récit fantastique : une silhouette éthérée et voilée de lumière, tenant un vieux grimoire ouvert d'où s'échappent des volutes d'encre et des étoiles, visage indistinct, ambiance mystique, fond sombre.",
+        personality: "Raconte, ne parle jamais : narration immersive, posée et omnisciente.",
+      },
+    });
+    if (r?.image) {
+      const s = await api("/api/settings", { method: "PATCH", body: { narrator_avatar: r.image } });
+      store.settings = s;
+      toast("🪄 Avatar du narrateur généré ✓");
+      if (!busy && currentConversation) await renderChat(currentConversation.id);
+    }
+  } catch (e) {
+    toast("Avatar du narrateur non généré : " + (e?.message || "serveur d'images indisponible"), "warn");
+  }
+}
+
 function avatarFor(m) {
   if (m.role === "user") {
     const p = currentConversation?.persona;
@@ -2087,6 +2137,7 @@ function avatarFor(m) {
   if (card?.avatar) return el("img", { src: card.avatar, class: "avatar avatar-md" });
   const name = m.name || "Narrateur";
   const isNarrator = name.toLowerCase() === "narrateur" || (!card && !m.name);
+  if (isNarrator && store.settings?.narrator_avatar) return el("img", { src: store.settings.narrator_avatar, class: "avatar avatar-md" });
   return initialAvatar(name, isNarrator ? "🪄" : null);
 }
 
@@ -2611,6 +2662,36 @@ async function maybeNpcSuggest() {
   if (r.npcs?.length) showNpcChips(r.npcs);
 }
 
+// 🎨 generic "accept an NPC into the party" flow (used by the suggestion chips
+// AND the "Proposer un PNJ" modal): adds the card, refreshes, then generates
+// an avatar for the new character in the background once the card exists.
+async function acceptNpc(npc) {
+  try {
+    const r = await api(`/api/conversations/${currentConversation.id}/npcs/accept`, { body: { npc } });
+    toast(`✨ ${npc.name} rejoint la partie ✓`);
+    await refreshAll();
+    await renderChat(currentConversation.id);
+    const card = r?.card;
+    if (card && !card.avatar) {
+      autoCardAvatar(card.id, {
+        name: card.name,
+        description: card.description || "",
+        personality: card.personality || "",
+        scenario: card.scenario || npc.role || "",
+        tags: "[]",
+      }, async () => {
+        // avatar prêt → rafraîchir la carte pour qu'elle apparaisse sur le cast
+        try {
+          const fresh = await refreshConversation(currentConversation.id);
+          if (currentConversation?.id === fresh?.id) currentConversation = fresh;
+        } catch { /* garde la copie courante ; l'avatar apparaîtra à la prochaine visite */ }
+        if (!busy) await renderChat(currentConversation.id);
+      });
+    }
+    return true;
+  } catch (e) { toast(e.message, "err"); return false; }
+}
+
 // ─── relationship graph (auto, throttled server-side) ────────────────────────
 // After each completed turn we ask the server to re-read the recent scenes and
 // update the affinities between characters — silently: the server only scans
@@ -2629,13 +2710,8 @@ function showNpcChips(npcs) {
   let row = wrap.querySelector(".npc-chips");
   if (!row) { row = el("div", { class: "npc-chips" }); wrap.prepend(row); }
   const accept = async (npc) => {
-    try {
-      await api(`/api/conversations/${currentConversation.id}/npcs/accept`, { body: { npc } });
-      row.remove();
-      toast(`✨ ${npc.name} rejoint la partie ✓`);
-      await refreshAll();
-      await renderChat(currentConversation.id);
-    } catch (e) { toast(e.message, "err"); }
+    row.remove();
+    await acceptNpc(npc);
   };
   row.replaceChildren(
     el("span", { class: "npc-hint" }, "💡 PNJ repérés :"),
@@ -2683,13 +2759,7 @@ async function npcSuggestModal() {
           n.description ? el("p", { class: "npc-desc" }, esc(n.description)) : null,
           n.personality ? el("p", { class: "npc-perso" }, esc(n.personality)) : null,
           el("button", { class: "btn btn-primary btn-sm", onclick: async () => {
-            try {
-              await api(`/api/conversations/${currentConversation.id}/npcs/accept`, { body: { npc: n } });
-              close();
-              toast(`✨ ${n.name} rejoint la partie ✓`);
-              await refreshAll();
-              await renderChat(currentConversation.id);
-            } catch (e) { toast(e.message, "err"); }
+            if (await acceptNpc(n)) close();
           } }, "＋ Ajouter à la partie"),
         );
         return card;
@@ -2708,7 +2778,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal, field } from "./ui.js?v=50";
+import { openModal, field } from "./ui.js?v=51";
 void applyTheme;
 void fmtTime;
 void currentConversation;
