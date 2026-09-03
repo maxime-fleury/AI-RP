@@ -1,12 +1,14 @@
-import { api, apiFetch, readSseStream } from "./api.js?v=65";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=65";
-import { store, refreshAll, refreshConversations, refreshConversation, navigate, applyTheme, autoCardAvatar } from "./app.js?v=65";
+import { api, apiFetch, readSseStream } from "./api.js?v=66";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=66";
+import { store, refreshAll, refreshConversations, refreshConversation, navigate, applyTheme, autoCardAvatar } from "./app.js?v=66";
 
 let currentConversation = null;
 let currentCtx = null;
 let busy = false;
 let streamGeneration = 0;
 let abortController = null;
+let stopRequested = false; // set when the user presses Stop — stale renders/optimistic UI must die
+let currentStreamSettled = null; // promise that resolves when the in-flight doStream() fully settles (finally)
 let beforeUnloadHandler = null; // installed when streaming starts
 let chipsRowRef = null;
 let turnSuggestionsMsgId = null; // last assistant message whose chips arrived via the SSE "suggestions" push
@@ -146,7 +148,7 @@ export async function renderChat(convIdRaw) {
   if (bareId === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=65");
+    const { newGameWizard } = await import("./app.js?v=66");
     newGameWizard(pre);
     return;
   }
@@ -476,10 +478,11 @@ export async function renderChat(convIdRaw) {
     const grid = el("div", { class: "gallery-grid" });
     const paint = () => {
       grid.replaceChildren(...items.map((it) => {
-        const img = el("img", { src: it.image });
+        const imgAlt = it.character ? `Illustration de ${it.character}` : (it.message || "Illustration de la partie");
+        const img = el("img", { src: it.image, alt: imgAlt });
         img.addEventListener("click", () => {
           const lb = el("div", { class: "lightbox" },
-            el("img", { src: it.image }),
+            el("img", { src: it.image, alt: imgAlt }),
             el("div", { class: "lb-meta" },
               it.character ? el("span", { class: "chip" }, "🎭 " + esc(it.character)) : null,
               el("span", { class: "chip" }, "seed " + (it.seed ?? "—")),
@@ -772,19 +775,25 @@ export async function renderChat(convIdRaw) {
   const stopBtn = el("button", { class: "send-btn stop-btn", hidden: true, onclick: stopStreaming, title: "Arrêter la génération" }, "⏹");
   const suggestBtn = el("button", { class: "send-btn ghost", onclick: onSuggest, title: "Suggestions de réponses" }, "💡");
   const composer = el("div", { class: "composer" }, textarea, suggestBtn, stopBtn, sendBtn);
-  function stopStreaming() {
-    if (abortController) {
-      const ac = abortController;
-      abortController = null;
-      ac.abort();
-      toast("Génération arrêtée.", "ok", 2500);
-      // the server commits whatever the model already wrote → show the real state
-      setTimeout(async () => {
-        if (currentConversation?.id) {
-          await refreshConversation(currentConversation.id);
-          await renderChat(String(currentConversation.id));
-        }
-      }, 900);
+  async function stopStreaming() {
+    if (!abortController) return;
+    const ac = abortController;
+    abortController = null;
+    stopRequested = true;
+    ac.abort(); // aborts the SSE fetch → the server aborts the provider request
+    toast("Génération arrêtée — le texte déjà écrit est conservé.", "ok", 3200);
+    // wait for the in-flight doStream() to fully settle (its finally drops the
+    // stale optimistic UI), THEN show the server's committed state — the
+    // partial reply if the model had written something, or the cleaned-up
+    // thread (user turn removed) if it hadn't. No fixed delay, no duplicates.
+    if (currentStreamSettled) {
+      try { await currentStreamSettled; } catch { /* doStream handles its own errors */ }
+    }
+    if (currentConversation?.id) {
+      try {
+        await refreshConversation(currentConversation.id);
+        await renderChat(String(currentConversation.id));
+      } catch { /* re-render failure is non-fatal */ }
     }
   }
   const chipsRow = el("div", { class: "chips-row" });
@@ -1057,9 +1066,12 @@ async function doStream(content, opts = {}) {
   dismissRecapBanner(); // the player is playing on — the "Previously on…" has served its purpose
   const { scroll, textarea, sendBtn, stopBtn } = currentCtx;
   busy = true;
+  stopRequested = false;
+  // resolvable once, so stopStreaming() can await the full settle + reconcile
+  currentStreamSettled = new Promise((res) => { streamSettledResolve = res; });
   sendBtn.disabled = true;
   if (stopBtn) stopBtn.hidden = false;
-  const streamGen = ++streamGeneration;
+  const gen = ++streamGeneration;
   // idempotency key for this attempt: the SSE retry loop re-posts with the
   // SAME uid, so the server can drop a partially-committed exchange instead of
   // duplicating it
@@ -1119,6 +1131,8 @@ async function doStream(content, opts = {}) {
   let renderQueued = false;
   const renderDelta = () => {
     renderQueued = false;
+    // stale generation guard: after Stop (or a newer turn), never touch the DOM
+    if (gen !== streamGeneration || stopRequested) return;
     if (!full || full === renderedFull) return;
     renderedFull = full;
     if (bodyEl.dataset.streaming !== "1") {
@@ -1160,6 +1174,7 @@ async function doStream(content, opts = {}) {
         });
     let streamDone = false; // an "error" after "done" is never a failure (turn committed)
     await readSseStream(res, async (event, data) => {
+      if (gen !== streamGeneration || stopRequested) return; // stale generation (Stop / newer turn)
       if (event === "delta") {
         full += data.text || "";
         scheduleRender();
@@ -1226,7 +1241,7 @@ async function doStream(content, opts = {}) {
         }
         if (document.hidden) notify("⚠️ Erreur", String(e.message || "Échec"));
         pendingNode.remove();
-        const errNode = el("div", { class: "msg me" },
+        const errNode = el("div", { class: "msg me", role: "alert", "aria-live": "assertive" },
           el("div", { class: "bubble", style: { borderColor: "var(--danger)", color: "var(--danger)" } },
             el("div", { style: { fontWeight: 700 } }, "⚠️ " + esc(e.message)),
             el("button", { class: "mini-btn", style: { marginTop: "8px" }, onclick: () => {
@@ -1254,6 +1269,16 @@ async function doStream(content, opts = {}) {
     if (stopBtn) stopBtn.hidden = true;
     window.removeEventListener("beforeunload", beforeUnloadHandler);
     beforeUnloadHandler = null;
+    // Stop pressed: drop the stale optimistic bubbles — the stopStreaming()
+    // reconcile re-renders the conversation from the server's committed state
+    // (partial reply kept, or the user turn removed if nothing was written)
+    if (stopRequested) {
+      pendingNode?.remove();
+      userNode?.remove();
+    }
+    streamSettledResolve?.();
+    streamSettledResolve = null;
+    currentStreamSettled = null;
     textarea?.focus();
   }
 }
@@ -2023,22 +2048,27 @@ function renderMessage(m) {
   const isChapter = !isMe && m.meta?.chapter;
   const isRewind = !isMe && m.meta?.rewind;
   const marker = isChapter || isRewind;
+  const isSystem = !isMe && (m.meta?.system || (m.name || "").toLowerCase() === "système" || (m.content || "").startsWith("[Système]"));
+  const isDice = (m.content || "").startsWith("🎲 ") || m.meta?.dice;
+  // distinct accessible kind per message — screen readers announce the role,
+  // CSS can target each kind without relying on color/italics/emoji alone
+  const kind = marker ? (isChapter ? "chapter" : "rewind") : isSystem ? "system" : isDice ? "dice" : isMe ? "user" : "narrator";
   const segs = m.segments || [];
   const body = el("div", { class: "body" });
   if (isChapter) {
     const [head, ...rest] = (m.content || "").split("\n\n");
-    body.append(el("div", { class: "chapter-head" }, esc(head || "")));
+    body.append(el("div", { class: "chapter-head", role: "heading", "aria-level": "2" }, esc(head || "")));
     if (rest.length) body.append(el("div", { class: "chapter-summary" }, esc(rest.join("\n\n"))));
   } else if (isRewind) {
-    body.append(el("div", { class: "rewind-head" }, esc(m.content)));
+    body.append(el("div", { class: "rewind-head", role: "note" }, esc(m.content)));
   } else if (isMe) {
-    body.append(el("div", {}, esc(m.content)));
+    body.append(el("div", { "data-kind": "user" }, esc(m.content)));
   } else if (segs.length) {
     for (let i = 0; i < segs.length; i++) {
-      body.append(el("div", { class: `seg seg-${i}` }, formatSegment(segs[i])));
+      body.append(el("div", { class: `seg seg-${i}`, "data-kind": segs[i].type || "text" }, formatSegment(segs[i])));
     }
   } else if (m.content) {
-    for (const b of splitBlocks(m.content)) body.append(el("div", {}, formatBody(b)));
+    for (const b of splitBlocks(m.content)) body.append(el("div", { "data-kind": b.type || "text" }, formatBody(b)));
   }
   const bubble = el("div", { class: "bubble" + (m.bubbleClass ? " " + m.bubbleClass : "") + (marker ? " chapter-bubble rewind-bubble" : ""), ...(!marker ? { title: "Double-clic pour modifier" } : {}) },
     isMe || marker ? null : el("div", { class: "who" }, esc(m.name || "Narrateur")),
@@ -2053,8 +2083,11 @@ function renderMessage(m) {
     });
   }
   if (!marker && !isMe && m.meta?.image) {
+    const altText = m.meta.image_char
+      ? `Illustration : ${m.meta.image_char}`
+      : (m.content || "").replace(/[*"«»]/g, " ").replace(/\s+/g, " ").trim().slice(0, 90) || "Illustration de la scène";
     const illu = el("div", { class: "msg-illu" },
-      el("img", { src: m.meta.image, alt: "illustration" }),
+      el("img", { src: m.meta.image, alt: altText, loading: "lazy" }),
       el("div", { class: "illu-meta" },
         m.meta.image_char ? el("span", { class: "illu-char" }, "🎭 " + esc(m.meta.image_char)) : null,
         el("span", { class: "illu-seed" }, "seed " + (m.meta.image_seed ?? "—")),
@@ -2084,7 +2117,7 @@ function renderMessage(m) {
     const reacts = el("div", { class: "reactions" });
     for (const r of ["👍", "❤️", "😂"]) {
       const on = list.includes(r);
-      const btn = el("button", { class: "reaction" + (on ? " on" : ""), title: on ? "Retirer la réaction" : "Réagir" }, r);
+      const btn = el("button", { class: "reaction" + (on ? " on" : ""), title: on ? "Retirer la réaction" : "Réagir", "aria-pressed": String(on), "aria-label": (on ? "Retirer " : "Réagir avec ") + r }, r);
       btn.addEventListener("click", async () => {
         try {
           await api(`/api/conversations/${currentConversation.id}/messages/${m.id}/reactions`, {
@@ -2103,7 +2136,11 @@ function renderMessage(m) {
     bubble.append(reacts);
   }
   const avatar = marker ? null : avatarFor(m);
-  const node = el("div", { class: `msg${isMe ? " me" : ""}${marker ? " chapter" : ""}${selectedIds.has(m.id) ? " sel" : ""}`, dataset: { mid: m.id, role: m.role } }, avatar, bubble);
+  const node = el("div", {
+    class: `msg${isMe ? " me" : ""}${marker ? " chapter" : ""}${selectedIds.has(m.id) ? " sel" : ""}`,
+    dataset: { mid: m.id, role: m.role, kind },
+    ...(kind === "dice" ? { role: "status" } : {}),
+  }, avatar, bubble);
   if (selectionMode && m.id && !String(m.id).startsWith("pending")) {
     const cb = el("input", { type: "checkbox", class: "sel-cb", "aria-label": "Sélectionner ce message", ...(selectedIds.has(m.id) ? { checked: "" } : {}) });
     cb.addEventListener("change", () => {
@@ -2344,16 +2381,19 @@ async function regenerate(messageId) {
 // ─── body formatting ──────────────────────────────────────────────────────────
 function formatSegment(s) {
   if (s.type === "dialogue") {
-    const p = el("p", {});
-    p.append(el("strong", { style: { color: "var(--accent)" } }, esc(s.speaker) + " : "));
-    p.append(esc("« " + s.text + " »"));
+    // spoken line: speaker attribution + quoted text, announced as dialogue
+    const p = el("p", { "data-kind": "dialogue", class: "seg-dialogue" });
+    p.append(el("strong", { class: "seg-speaker", style: { color: "var(--accent)" } }, esc(s.speaker) + " : "));
+    p.append(el("span", { class: "seg-line" }, esc("« " + s.text + " »")));
     return p;
   }
   if (s.type === "narration") {
-    const p = el("p", { style: { fontStyle: "italic", color: "var(--text-dim)" } }, esc(s.text));
-    return p;
+    // narrative description: real <em> (semantic emphasis), not just italic color
+    return el("p", { "data-kind": "narration", class: "seg-narration" },
+      el("em", { style: { color: "var(--text-dim)" } }, esc(s.text)),
+    );
   }
-  return el("p", {}, esc(s.text));
+  return el("p", { "data-kind": "text" }, esc(s.text));
 }
 
 function splitBlocks(text) {
@@ -2370,20 +2410,20 @@ function splitBlocks(text) {
 
 function formatBody(b) {
   if (b.type === "narration") {
-    return el("span", { style: { fontStyle: "italic", color: "var(--text-dim)" } }, esc(b.text));
+    return el("em", { "data-kind": "narration", style: { fontStyle: "italic", color: "var(--text-dim)" } }, esc(b.text));
   }
   if (b.type === "dialogue") {
-    return el("span", {}, "« " + esc(b.text) + " »");
+    return el("span", { "data-kind": "dialogue" }, "« " + esc(b.text) + " »");
   }
   // text block: separate name: "quoted" if present
   const mm = b.text.match(/^\s*([A-Za-zÀ-ÖØ-öø-ÿ'’ -]{1,40}?)\s*[::]\s*"([\s\S]*)"\s*$/);
   if (mm) {
-    return el("span", {},
+    return el("span", { "data-kind": "dialogue" },
       el("strong", { style: { color: "var(--accent)" } }, esc(mm[1]) + " : "),
       "« " + esc(mm[2]) + " »",
     );
   }
-  return el("span", {}, esc(b.text));
+  return el("span", { "data-kind": "text" }, esc(b.text));
 }
 
 // ─── mini character sheet on hover ───────────────────────────────────────────
@@ -2855,7 +2895,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal, field } from "./ui.js?v=65";
+import { openModal, field } from "./ui.js?v=66";
 void applyTheme;
 void fmtTime;
 void currentConversation;

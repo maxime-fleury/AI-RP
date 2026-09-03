@@ -129,12 +129,15 @@ CREATE TABLE IF NOT EXISTS timeline_events (
 CREATE TABLE IF NOT EXISTS jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   type TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
+  status TEXT NOT NULL DEFAULT 'queued',
   progress INTEGER NOT NULL DEFAULT 0,
   conversation_id INTEGER,
   message_id INTEGER,
   payload TEXT NOT NULL DEFAULT '{}',
   error TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL DEFAULT '',
+  cancellable INTEGER NOT NULL DEFAULT 0,
+  retryable INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   completed_at INTEGER
 );
@@ -158,6 +161,10 @@ CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at);
   if (!convCols2.has("branch_kind")) db.exec("ALTER TABLE conversations ADD COLUMN branch_kind TEXT NOT NULL DEFAULT 'main'");
   const cardCols = new Set((db.query("PRAGMA table_info(cards)").all() as any[]).map((c: any) => c.name));
   if (!cardCols.has("fingerprint")) db.exec("ALTER TABLE cards ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''");
+  const jobCols = new Set((db.query("PRAGMA table_info(jobs)").all() as any[]).map((c: any) => c.name));
+  if (!jobCols.has("title")) db.exec("ALTER TABLE jobs ADD COLUMN title TEXT NOT NULL DEFAULT ''");
+  if (!jobCols.has("cancellable")) db.exec("ALTER TABLE jobs ADD COLUMN cancellable INTEGER NOT NULL DEFAULT 0");
+  if (!jobCols.has("retryable")) db.exec("ALTER TABLE jobs ADD COLUMN retryable INTEGER NOT NULL DEFAULT 0");
   // soft-delete (trash) support: deletes move rows here, restore brings them back
   for (const [table, cols] of [["worlds", worldCols], ["scenarios", null], ["cards", cardCols], ["personas", null]] as [string, Set<string> | null][]) {
     if (cols && cols.has("trashed")) continue;
@@ -199,6 +206,7 @@ export function allSettings(): Record<string, unknown> {
 export interface WorldRow {
   id: number; name: string; description: string; lore: string; tone: string;
   narration_style: string; language: string; cover: string; settings: string; map: string; created_at: number;
+  trashed: number;
 }
 
 export function listWorlds(): WorldRow[] {
@@ -246,6 +254,7 @@ export function permanentDeleteWorld(id: number): void {
 // ─── scenarios ────────────────────────────────────────────────────────────────
 export interface ScenarioRow {
   id: number; world_id: number; name: string; intro: string; notes: string; created_at: number;
+  trashed: number;
 }
 
 export function listScenarios(worldId?: number): ScenarioRow[] {
@@ -290,6 +299,7 @@ export interface CardRow {
   first_mes: string; mes_example: string; system_prompt: string; post_history_instructions: string;
   alternate_greetings: string; tags: string; creator: string; avatar: string; voice: string;
   language: string; data: string; fingerprint: string; created_at: number;
+  trashed: number;
 }
 
 export function listCards(): CardRow[] {
@@ -351,6 +361,7 @@ export function permanentDeleteCard(id: number): void {
 // ─── personas ─────────────────────────────────────────────────────────────────
 export interface PersonaRow {
   id: number; name: string; description: string; avatar: string; created_at: number;
+  trashed: number;
 }
 
 export function listPersonas(): PersonaRow[] {
@@ -683,15 +694,16 @@ export function deleteTimelineEvent(id: number): void {
 // ─── jobs (async background task queue) ───────────────────────────────────────
 export interface JobRow {
   id: number; type: string; status: string; progress: number; conversation_id: number | null;
-  message_id: number | null; payload: string; error: string; created_at: number; completed_at: number | null;
+  message_id: number | null; payload: string; error: string; title: string;
+  cancellable: number; retryable: number; created_at: number; completed_at: number | null;
 }
 
 export function createJob(j: Partial<JobRow>): JobRow {
   const r = db.query(
-    `INSERT INTO jobs (type, status, progress, conversation_id, message_id, payload, error, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(j.type ?? "generic", j.status ?? "pending", j.progress ?? 0, j.conversation_id ?? null,
-    j.message_id ?? null, j.payload ?? "{}", j.error ?? "", now());
+    `INSERT INTO jobs (type, status, progress, conversation_id, message_id, payload, error, title, cancellable, retryable, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(j.type ?? "generic", j.status ?? "queued", j.progress ?? 0, j.conversation_id ?? null,
+    j.message_id ?? null, j.payload ?? "{}", j.error ?? "", j.title ?? "", j.cancellable ? 1 : 0, j.retryable ? 1 : 0, now());
   return getJob(Number(r.lastInsertRowid))!;
 }
 
@@ -715,7 +727,7 @@ export function updateJob(id: number, j: Partial<JobRow>): JobRow | null {
 }
 
 export function pendingJobs(): JobRow[] {
-  return db.query("SELECT * FROM jobs WHERE status IN ('pending','running') ORDER BY created_at").all() as JobRow[];
+  return db.query("SELECT * FROM jobs WHERE status IN ('queued','pending','running','retryable') ORDER BY created_at").all() as JobRow[];
 }
 
 /**

@@ -35,7 +35,21 @@ export function storageInfo() {
     .map((f) => {
       const full = path.join(BACKUPS_DIR, f);
       const st = fs.statSync(full);
-      return { file: f, size: st.size, date: st.mtime.toISOString() };
+      // checksum status: the .sha256 sidecar is verified against the file
+      let checksumOk = false;
+      try {
+        const want = fs.readFileSync(full + ".sha256", "utf8").trim();
+        const hasher = new Bun.CryptoHasher("sha256");
+        hasher.update(fs.readFileSync(full));
+        checksumOk = hasher.digest("hex") === want;
+      } catch { /* no sidecar yet */ }
+      return {
+        file: f,
+        size: st.size,
+        date: st.mtime.toISOString(),
+        ageMs: Math.max(0, Date.now() - st.mtime.getTime()),
+        checksumOk,
+      };
     })
     .sort((a, b) => b.date.localeCompare(a.date));
   return {

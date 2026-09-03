@@ -98,6 +98,62 @@ describe("JSON backup / restore fidelity", () => {
     expect(db.listRelations(restoredWorld.id).map((r) => r.kind)).toEqual(["alliées"]);
   });
 
+  test("backup preview reports counts/checksum; selective restore keeps only chosen types", async () => {
+    // hermetic payload — never derived from the (shared) live DB
+    const backup = {
+      app: "innsekai", version: 1, exported_at: new Date().toISOString(),
+      worlds: [{ name: "Preview Monde", description: "", lore: "", tone: "épique", narration_style: "", language: "", cover: "", settings: "{}" }],
+      cards: [{ name: "Preview Carte", description: "", personality: "", scenario: "", first_mes: "", mes_example: "", system_prompt: "", post_history_instructions: "", alternate_greetings: "[]", tags: "[]", creator: "", avatar: "", voice: "", language: "", data: "{}", fingerprint: "" }],
+      personas: [], scenarios: [], locations: [], lorebook: [], relations: [], timeline_events: [],
+      conversations: [{ title: "Preview Partie", world_id: null, persona_id: null, scenario_id: null, cast: [], group_mode: 0, pinned: 0, archived: 0, settings: "{}", messages: [{ role: "user", name: "", content: "Salut", segments: [], meta: {} }] }],
+      media: {},
+    };
+    const prev = await (await api(routes, "POST", "/api/backup/preview", { backup })).json();
+    expect(prev.preview.valid).toBe(true);
+    expect(prev.preview.counts.worlds).toBe(1);
+    expect(prev.preview.counts.cards).toBe(1);
+    expect(prev.preview.counts.conversations).toBe(1);
+    expect(typeof prev.checksum).toBe("string");
+    expect(prev.checksum.length).toBe(64);
+    expect(prev.preview.names.worlds).toContain("Preview Monde");
+
+    // selective: worlds ONLY (no cards / conversations) — append policy
+    const beforeWorlds = db.listWorlds().length;
+    const beforeCards = db.listCards().length;
+    const sel = await (await api(routes, "POST", "/api/backup/restore", {
+      backup, conflict: "append", include: { worlds: true, cards: false, conversations: false, scenarios: false, personas: false, locations: true, lorebook: true, relations: true, timeline: true, media: true },
+    })).json();
+    expect(sel.ok).toBe(true);
+    expect(sel.worlds).toBe(1);
+    expect(sel.cards).toBe(0);
+    expect(sel.conversations).toBe(0);
+    expect(db.listWorlds().length).toBe(beforeWorlds + 1);
+    expect(db.listCards().length).toBe(beforeCards); // no cards restored
+    // conversation count untouched too
+    expect(db.listConversations().some((c: any) => c.title === "Preview Partie")).toBe(false);
+  });
+
+  test("replace policy moves current data to the trash before restoring", async () => {
+    const world = db.createWorld({ name: "À remplacer" });
+    const backup = {
+      app: "innsekai", version: 1,
+      worlds: [{ name: "Nouveau monde", description: "", lore: "", tone: "", narration_style: "", language: "", cover: "", settings: "{}" }],
+      cards: [], personas: [], scenarios: [], locations: [], lorebook: [], relations: [], timeline_events: [], conversations: [], media: {},
+    };
+    const res = await (await api(routes, "POST", "/api/backup/restore", {
+      backup, conflict: "replace", include: { worlds: true },
+    })).json();
+    expect(res.ok).toBe(true);
+    expect(res.conflict).toBe("replace");
+    expect(res.replaced.worlds).toBeGreaterThanOrEqual(1);
+    // the old world is trashed (still in the DB, hidden from lists)
+    expect(db.getWorld(world.id)?.trashed).toBe(1);
+    expect(db.listWorlds().find((w) => w.name === "Nouveau monde")).toBeDefined();
+    // cleanup: un-trash everything so sibling test files (shared process) see
+    // a clean trash list — this test deliberately replaces the whole DB
+    for (const r of db.listTrashedResources()) db.restoreTrashed(r.type, r.id);
+  });
+
   test("forced backups write distinct files instead of overwriting the day snapshot", async () => {
     const a = runBackup(true);
     const b = runBackup(true);

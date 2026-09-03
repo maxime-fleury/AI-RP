@@ -1,6 +1,6 @@
-import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=65";
-import { el, esc, toast, actionToast, openModal, confirmModal, closeAllModals, field, ICONS, fmtTime } from "./ui.js?v=65";
-import { renderChat } from "./chat.js?v=65";
+import { api, apiFetch, apiForm, uploadFiles, setToken, readSseStream } from "./api.js?v=66";
+import { el, esc, toast, actionToast, openModal, confirmModal, closeAllModals, field, ICONS, fmtTime, fmtAge } from "./ui.js?v=66";
+import { renderChat } from "./chat.js?v=66";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -52,6 +52,158 @@ export async function refreshConversation(id) {
   const idx = store.conversations.findIndex((c) => c.id === id);
   if (idx >= 0) store.conversations[idx] = conv;
   else store.conversations.push(conv);
+}
+
+// ─── background jobs (global activity panel) ─────────────────────────────────
+// Every long-running operation (images, recaps, captions, summaries, relations,
+// AI assistance) reports here over SSE. The panel + sidebar badge + live
+// region stay in sync no matter which screen the user is on.
+export const jobs = { list: [], seen: new Set() };
+let jobsSubscribed = false;
+let activityOpen = false;
+let activityModal = null;
+
+function liveRegion() { return document.getElementById("live-region"); }
+/** Announce a transient status change to screen readers (aria-live polite). */
+export function announce(text) {
+  const r = liveRegion();
+  if (!r) return;
+  r.textContent = "";
+  requestAnimationFrame(() => { r.textContent = text; });
+}
+
+function runningJobCount() {
+  return jobs.list.filter((j) => j.status === "queued" || j.status === "running").length;
+}
+
+export function paintActivityBadge() {
+  const badge = document.getElementById("nav-activity-badge");
+  const n = runningJobCount();
+  if (badge) {
+    badge.textContent = n ? String(n) : "";
+    badge.hidden = !n;
+  }
+  const btn = document.getElementById("nav-activity");
+  if (btn) btn.setAttribute("aria-expanded", String(activityOpen));
+}
+
+function upsertJob(j) {
+  const idx = jobs.list.findIndex((x) => x.id === j.id);
+  if (idx >= 0) jobs.list[idx] = j;
+  else jobs.list.unshift(j);
+  jobs.list.sort((a, b) => b.created_at - a.created_at);
+  jobs.list = jobs.list.slice(0, 100);
+}
+
+const JOB_GLYPH = { queued: "⏳", running: "⋯", completed: "✓", failed: "✗", retryable: "↻", cancelled: "⊘" };
+
+function jobRow(j) {
+  const glyph = JOB_GLYPH[j.status] || "·";
+  const actions = [];
+  const canCancel = (j.status === "queued" || j.status === "running") && j.cancellable;
+  const canRetry = (j.status === "failed" || j.status === "retryable" || j.status === "cancelled") && j.retryable;
+  if (canCancel) {
+    actions.push(el("button", { class: "mini-btn", title: "Annuler cette tâche", onclick: async () => {
+      try {
+        await api(`/api/jobs/${j.id}/cancel`, { body: {} });
+        toast("Tâche annulée");
+      } catch (e) { toast(e.message, "err"); }
+    } }, "Annuler"));
+  }
+  if (canRetry) {
+    actions.push(el("button", { class: "mini-btn", title: "Relancer cette tâche", onclick: async () => {
+      try {
+        const r = await api(`/api/jobs/${j.id}/retry`, { body: {} });
+        toast("Tâche relancée ✓");
+        upsertJob(r.job);
+        paintActivityBadge();
+        if (activityOpen && activityModal) activityModal.render();
+      } catch (e) { toast(e.message, "err"); }
+    } }, "↻ Réessayer"));
+  }
+  const title = j.title || j.type;
+  const metaBits = [];
+  if (j.conversation_id) metaBits.push(`partie #${j.conversation_id}`);
+  if (j.progress > 0 && j.progress < 100 && (j.status === "queued" || j.status === "running")) metaBits.push(`${j.progress} %`);
+  metaBits.push(fmtTime(j.created_at));
+  return el("div", { class: `job-row st-${j.status}` },
+    el("span", { class: "job-status", "aria-hidden": "true" }, glyph),
+    el("div", { class: "job-main" },
+      el("div", { class: "job-title" }, esc(title), el("span", { class: "job-meta" }, metaBits.join(" · "))),
+      j.status === "queued" || j.status === "running"
+        ? el("div", { class: "job-bar-wrap", role: "progressbar", "aria-valuemin": 0, "aria-valuemax": 100, "aria-valuenow": String(j.progress || 0), "aria-label": `${title} : ${j.progress || 0} %` },
+            el("div", { class: "job-bar", style: { width: `${Math.max(4, j.progress || 0)}%` } }),
+          )
+        : null,
+      j.error ? el("div", { class: "job-error" }, esc(String(j.error).slice(0, 160))) : null,
+      actions.length ? el("div", { class: "job-actions" }, ...actions) : null,
+    ),
+  );
+}
+
+export function openActivityPanel() {
+  const box = el("div", { class: "activity-panel" });
+  const render = () => {
+    const list = jobs.list.length
+      ? el("div", { class: "jobs-list" }, ...jobs.list.map(jobRow))
+      : el("p", { style: { color: "var(--text-dim)", fontSize: "13px" } }, "Aucune tâche enregistrée — images, récaps, légendes et analyses IA apparaîtront ici.");
+    box.replaceChildren(list);
+  };
+  const modal = openModal({
+    title: "Activité en arrière-plan",
+    sub: "Images, récaps, légendes, résumés et assistance IA — statut en direct.",
+    body: box,
+    footer: [
+      el("button", { class: "btn btn-ghost", onclick: () => modal.close() }, "Fermer"),
+    ],
+    onClose: () => { activityOpen = false; activityModal = null; paintActivityBadge(); },
+  });
+  activityOpen = true;
+  activityModal = { close: modal.close, render };
+  render();
+}
+
+/** Subscribe to the live job stream (idempotent, auto-reconnects). */
+export async function subscribeJobs() {
+  if (jobsSubscribed) return;
+  jobsSubscribed = true;
+  try {
+    const { jobs: list } = await api("/api/jobs").catch(() => ({ jobs: [] }));
+    jobs.list = (list || []).map((j) => ({ ...j, payload: j.payloadObj || j.payload }));
+    jobs.seen = new Set(jobs.list.map((j) => `${j.id}:${j.status}`));
+    paintActivityBadge();
+  } catch { /* not fatal */ }
+  const stream = async () => {
+    try {
+      const res = await apiFetch("/api/jobs/stream");
+      await readSseStream(res, (event, data) => {
+        if (event === "snapshot") {
+          jobs.list = (data.jobs || []).map((j) => ({ ...j, payload: j.payloadObj || j.payload }));
+          jobs.seen = new Set(jobs.list.map((j) => `${j.id}:${j.status}`));
+        } else if (event === "job") {
+          const j = { ...data, payload: data.payloadObj || data.payload };
+          const prev = jobs.list.find((x) => x.id === j.id);
+          const prevStatus = prev?.status;
+          upsertJob(j);
+          const key = `${j.id}:${j.status}`;
+          if (!jobs.seen.has(key) && prevStatus && prevStatus !== j.status) {
+            jobs.seen.add(key);
+            const name = j.title || j.type;
+            if (j.status === "completed") { toast(`✓ ${name} terminé`); announce(`${name} terminé`); }
+            else if (j.status === "failed" || j.status === "retryable") { toast(`✗ ${name} : ${(j.error || "").slice(0, 90)}`, "err"); announce(`Échec de la tâche : ${name}`); }
+            else if (j.status === "cancelled") toast(`${name} annulé`, "warn", 2600);
+          }
+          jobs.seen.add(key);
+          paintActivityBadge();
+          if (activityOpen && activityModal) activityModal.render();
+        }
+      });
+    } catch { /* stream dropped */ }
+    // reconnect with backoff so a restarting server re-attaches
+    jobsSubscribed = false;
+    setTimeout(() => subscribeJobs(), 3000);
+  };
+  stream();
 }
 
 // ─── narrator presets (shared by the settings editor and the world modal) ───
@@ -123,15 +275,21 @@ function renderSidebar(active) {
     ["#/settings", "settings", "Réglages"],
   ];
   const nav = items.map(([href, icon, label]) =>
-    el("a", { href, title: label, class: `nav-item${active === icon ? " active" : ""}` },
+    el("a", { href, title: label, class: `nav-item${active === icon ? " active" : ""}`, ...(active === icon ? { "aria-current": "page" } : {}) },
       el("span", { class: "ic" }, ICONS[icon]),
       el("span", { class: "lbl" }, label),
       icon === "worlds" ? el("span", { class: "badge" }, store.worlds.length) : null,
       icon === "cards" ? el("span", { class: "badge" }, store.cards.length) : null,
     ),
   );
+  // global activity panel — lives outside the hash router
+  nav.push(el("button", { class: "nav-item activity-item", id: "nav-activity", title: "Activité en arrière-plan (tâches en cours)", "aria-expanded": "false", onclick: openActivityPanel },
+    el("span", { class: "ic" }, "🧵"),
+    el("span", { class: "lbl" }, "Activité"),
+    el("span", { id: "nav-activity-badge", class: "badge", hidden: true }),
+  ));
   const collapsedNow = sb.classList.contains("collapsed");
-  const collapseBtn = el("button", { class: "collapse-toggle", title: collapsedNow ? "Agrandir le panneau" : "Réduire le panneau", onclick: toggleSidebar },
+  const collapseBtn = el("button", { class: "collapse-toggle", title: collapsedNow ? "Agrandir le panneau" : "Réduire le panneau", "aria-expanded": String(!collapsedNow), "aria-controls": "sidebar", onclick: toggleSidebar },
     collapsedNow ? "»" : "«",
   );
   const status = el("div", { class: "side-status" },
@@ -348,7 +506,7 @@ function shortcutsHelp() {
 }
 let shortcutCapturing = false; // set while the settings editor awaits a keypress
 function fireShortcut(k) {
-  import("./chat.js?v=65").then((m) => m.chatShortcut(k)).catch(() => {});
+  import("./chat.js?v=66").then((m) => m.chatShortcut(k)).catch(() => {});
 }
 document.addEventListener("keydown", (e) => {
   if (shortcutCapturing) return; // the settings key-capture owns this press
@@ -630,7 +788,7 @@ function convCard(c) {
   const last = c.last_message ? c.last_message.slice(0, 90) : "";
   return el("div", { class: "card", style: { cursor: "pointer" }, onclick: () => navigate(`#/chat/${c.id}`) },
     el("div", { class: "card-cover", style: world?.cover ? { backgroundImage: `url(${world.cover})` } : { background: "linear-gradient(135deg, var(--active-bg), transparent)" } }),
-    el("button", { class: "star-btn" + (c.pinned ? " on" : ""), title: c.pinned ? "Désépingler" : "Épingler cette partie", onclick: (e) => { e.stopPropagation(); togglePin(c); } }, c.pinned ? "★" : "☆"),
+    el("button", { class: "star-btn" + (c.pinned ? " on" : ""), title: c.pinned ? "Désépingler" : "Épingler cette partie", "aria-pressed": String(!!c.pinned), "aria-label": c.pinned ? "Désépingler cette partie" : "Épingler cette partie", onclick: (e) => { e.stopPropagation(); togglePin(c); } }, c.pinned ? "★" : "☆"),
     el("div", { class: "card-body" },
       el("h3", {}, esc(c.title)),
       el("div", { class: "desc" }, esc(last || world?.name || "Nouvelle partie")),
@@ -736,7 +894,42 @@ function worldModal(existing) {
     if (preview) coverBox.append(preview);
     coverBox.append(genBtn);
   }
-  const body = el("div", {}, name.wrap, desc.wrap, lore.wrap, el("div", { class: "row" }, tone.wrap, nstyle.wrap), nstylePreview, lang.wrap, negative.wrap, coverBox);
+  // world starter templates (new worlds only): one click creates an editable
+  // structure — locations, lorebook, draft scenario — the user can then tweak
+  const templateBox = el("div", { class: "template-box", hidden: true });
+  if (!existing) {
+    api("/api/templates/worlds").then(({ templates }) => {
+      templateBox.hidden = false;
+      templateBox.replaceChildren(
+        el("div", { class: "template-hint" }, "Démarrer d'un modèle (modifiable ensuite) :"),
+        el("div", { class: "template-grid", role: "list" },
+          ...(templates || []).map((t) => el("button", {
+            class: "template-chip", role: "listitem",
+            title: `${t.tagline} — ${t.counts.locations} lieux, ${t.counts.lorebook} entrées de lore${t.counts.hasScenario ? ", scénario" : ""}`,
+            onclick: async () => {
+              templateBox.classList.add("busy");
+              try {
+                const r = await api(`/api/templates/worlds/${t.id}`, { body: {} });
+                close();
+                toast(`Modèle « ${t.name} » appliqué ✓ — tout est modifiable dans le monde`);
+                announce(`Monde créé depuis le modèle ${t.name}`);
+                await refreshAll();
+                navigate(`#/worlds/${r.worldId}`);
+              } catch (e) {
+                toast(e.message, "err");
+                templateBox.classList.remove("busy");
+              }
+            },
+          },
+            el("span", { class: "template-icon", "aria-hidden": "true" }, t.icon),
+            el("span", { class: "template-name" }, esc(t.name)),
+            el("small", {}, esc(t.tagline)),
+          )),
+        ),
+      );
+    }).catch(() => { /* templates unavailable — fall back to manual creation */ });
+  }
+  const body = el("div", {}, templateBox, name.wrap, desc.wrap, lore.wrap, el("div", { class: "row" }, tone.wrap, nstyle.wrap), nstylePreview, lang.wrap, negative.wrap, coverBox);
   const { close } = openModal({
     title: existing ? "Modifier le monde" : "Nouveau monde",
     body,
@@ -796,7 +989,7 @@ async function renderWorldDetail(id) {
   const body = el("div", {});
   if (world.cover) {
     body.append(el("div", { class: "hero", style: { padding: 0, overflow: "hidden" } },
-      el("img", { src: world.cover, style: { width: "100%", maxHeight: "340px", objectFit: "cover", display: "block" } }),
+      el("img", { src: world.cover, alt: `Jaquette du monde ${world.name}`, style: { width: "100%", maxHeight: "340px", objectFit: "cover", display: "block" } }),
     ));
   }
   if (world.lore) body.append(
@@ -843,7 +1036,7 @@ async function renderWorldDetail(id) {
     try {
       const { map, locations } = await api(`/api/worlds/${world.id}/map`);
       if (map) {
-        const img = el("img", { src: map, class: "world-map-img" });
+        const img = el("img", { src: map, class: "world-map-img", alt: `Carte du monde ${world.name}` });
         img.addEventListener("load", () => {
           const pins = el("div", { class: "map-pins" });
           locations.forEach((name, i) => {
@@ -903,13 +1096,21 @@ async function renderWorldDetail(id) {
     ["Chronologie", () => renderTimelineTab(world)],
     ["Galerie", () => renderGalleryTab(world)],
   ];
-  const tabBar = el("div", { class: "world-tabs", role: "tablist" });
-  const tabContent = el("div", { class: "world-tab-content" });
+  const tabBar = el("div", { class: "world-tabs", role: "tablist", "aria-label": "Sections du monde" });
+  const tabContent = el("div", { class: "world-tab-content", role: "tabpanel" });
   const activate = (i) => {
-    [...tabBar.children].forEach((b, j) => b.classList.toggle("on", j === i));
+    [...tabBar.children].forEach((b, j) => {
+      const on = j === i;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-selected", String(on));
+      b.tabIndex = on ? 0 : -1;
+    });
+    const activeId = tabBar.children[i]?.id;
+    if (activeId) tabContent.setAttribute("aria-labelledby", activeId);
     tabContent.replaceChildren(tabRenders[i][1]());
   };
-  tabRenders.forEach(([label], i) => tabBar.append(el("button", { class: "world-tab", role: "tab", onclick: () => activate(i) }, label)));
+  tabRenders.forEach(([label], i) => tabBar.append(el("button", { class: "world-tab", role: "tab", id: `world-tab-${i}`, "aria-controls": "world-tabpanel", "aria-selected": "false", onclick: () => activate(i) }, label)));
+  tabContent.id = "world-tabpanel";
   activate(0);
   main().replaceChildren(head, tabBar, tabContent);
 }
@@ -1315,7 +1516,7 @@ function renderGalleryTab(world) {
     const img = el("img", { src: it.image, alt: it.message || "illustration", loading: "lazy" });
     img.addEventListener("click", () => {
       const lb = el("div", { class: "lightbox" },
-        el("img", { src: it.image }),
+        el("img", { src: it.image, alt: it.character ? `Illustration de ${it.character}` : (it.message || "Illustration") }),
         el("div", { class: "lb-meta" },
           it.character ? el("span", { class: "chip" }, "🎭 " + esc(it.character)) : null,
           it.kind === "landscape" ? el("span", { class: "chip" }, "🏞 paysage") : it.character ? el("span", { class: "chip" }, "🎭 portrait") : null,
@@ -2285,33 +2486,10 @@ async function renderSettings() {
   // ── Backup / restore ──
   container.append(el("div", { class: "section-title", id: "sec-backup" }, "Sauvegarde"));
   const fileInput = el("input", { type: "file", accept: ".json,application/json", hidden: true });
-  fileInput.addEventListener("change", async () => {
+  fileInput.addEventListener("change", () => {
     const file = fileInput.files?.[0];
     fileInput.value = "";
-    if (!file) return;
-    try {
-      const text = await file.text();
-      const parsed = JSON.parse(text);
-      if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.conversations)) {
-        throw new Error("ce fichier ne ressemble pas à une sauvegarde innsekai");
-      }
-      // restore ADDS rows — warn before the user duplicates what they already
-      // have (restoring the same file twice re-creates every element)
-      const would = (parsed.conversations?.length || 0) + (parsed.worlds?.length || 0)
-        + (parsed.cards?.length || 0) + (parsed.personas?.length || 0) + (parsed.scenarios?.length || 0);
-      const existing = (store.conversations?.length || 0) + (store.worlds?.length || 0)
-        + (store.cards?.length || 0) + (store.personas?.length || 0);
-      if (would > 0 && existing > 0 && !(await confirmModal({
-        title: "La restauration va AJOUTER des données",
-        message: `Ce fichier contient ${would} élément(s) (parties, mondes, cartes, personas…). Restaurer ne remplace rien : ils seront créés EN PLUS des ${existing} élément(s) déjà présents — restaurer deux fois le même fichier duplique donc tout.`,
-        confirmLabel: "Restaurer quand même",
-      }))) return;
-      toast("Restauration en cours…", "ok", 8000);
-      const res = await api("/api/backup", { body: { backup: parsed } });
-      toast(`Restauration terminée : ${res.worlds} mondes, ${res.cards} cartes, ${res.conversations} parties ✓`);
-      await refreshAll();
-      renderSettings();
-    } catch (e) { toast("Fichier invalide : " + e.message, "err"); }
+    if (file) restoreFromBackup(file);
   });
   container.append(el("div", { class: "card", style: { padding: "18px 22px" } },
     el("div", { class: "row" },
@@ -2361,8 +2539,9 @@ async function renderSettings() {
         el("div", { class: "storage-backups" },
           (st.backups?.length
             ? st.backups.map((b) => el("div", { class: "storage-backup" },
-                el("span", {}, "📦 " + esc(b.file)),
-                el("span", {}, mb(b.size / 1e6) + " · " + new Date(b.date).toLocaleString("fr-FR")),
+                el("span", { class: b.checksumOk ? "bk-ok" : "bk-bad", title: b.checksumOk ? "Checksum SHA-256 vérifié" : "Checksum absent ou invalide" }, b.checksumOk ? "🛡" : "⚠"),
+                el("span", {}, esc(b.file)),
+                el("span", { class: "storage-backup-meta" }, mb(b.size / 1e6) + " · " + fmtAge(b.ageMs) + (b.checksumOk ? " · checksum OK" : " · checksum ?")),
               ))
             : [el("p", { style: { color: "var(--text-dim)", fontSize: "13px" } }, "Aucun backup pour l'instant — un backup SQLite complet est créé chaque jour automatiquement.")]),
         ),
@@ -2443,6 +2622,117 @@ async function renderSettings() {
   main().replaceChildren(container);
   refreshModels();
   loadProviderHealth();
+}
+
+// ─── restore workflow: preview → conflict policy + selective include → confirm ──
+async function restoreFromBackup(file) {
+  let parsed;
+  try {
+    parsed = JSON.parse(await file.text());
+  } catch {
+    return toast("Fichier illisible : ce n'est pas du JSON valide.", "err");
+  }
+  let info;
+  try {
+    info = await api("/api/backup/preview", { body: { backup: parsed } });
+  } catch (e) {
+    return toast(e.message, "err");
+  }
+  const p = info.preview;
+  const counts = p.counts;
+  const c = (k) => counts[k] || 0;
+  const nameList = (k) => (p.names[k] || []).map((n) => el("li", {}, "• " + esc(n)));
+  const total = c("worlds") + c("cards") + c("personas") + c("conversations") + c("scenarios");
+  if (!total) return toast("Ce fichier ne contient aucun élément restaurable.", "warn");
+
+  // conflict policy + selective includes (default: everything, append)
+  const appendRadio = el("label", { class: "restore-opt" },
+    el("input", { type: "radio", name: "conflict", value: "append", checked: "" }),
+    el("span", {}, "Ajouter aux données existantes"),
+    el("small", {}, "Rien n'est supprimé — les ids sont ré-attribués (restaurer deux fois duplique)."),
+  );
+  const replaceRadio = el("label", { class: "restore-opt" },
+    el("input", { type: "radio", name: "conflict", value: "replace" }),
+    el("span", {}, "Remplacer (les données actuelles vont à la corbeille)"),
+    el("small", { style: { color: "var(--danger)" } }, "Les mondes, cartes, personas et parties actuels sont déplacés vers la corbeille avant la restauration — récupérables mais à confirmer."),
+  );
+  const inc = (key, label, count) => {
+    const cb = el("label", { class: "restore-inc" },
+      el("input", { type: "checkbox", checked: "", dataset: { key } }),
+      el("span", {}, label),
+      count ? el("small", {}, count + " élément(s)") : null,
+    );
+    return cb;
+  };
+  const body = el("div", { class: "restore-flow" },
+    el("div", { class: "restore-summary" },
+      el("div", { class: "restore-checksum" }, "🔐 " + String(info.checksum || "").slice(0, 12) + "…"),
+      p.exported_at ? el("div", { class: "restore-meta" }, "Exporté le " + new Date(p.exported_at).toLocaleString("fr-FR")) : null,
+      p.mediaMB > 0 ? el("div", { class: "restore-meta" }, "≈ " + p.mediaMB + " Mo de médias embarqués") : null,
+      el("div", { class: "restore-meta" }, "Déjà présents : " + Object.values(info.existing || {}).reduce((a, b) => a + b, 0) + " élément(s)"),
+    ),
+    el("div", { class: "restore-counts" },
+      el("span", { class: "restore-count" }, el("strong", {}, c("worlds")), " Mondes"),
+      el("span", { class: "restore-count" }, el("strong", {}, c("cards")), " Cartes"),
+      el("span", { class: "restore-count" }, el("strong", {}, c("personas")), " Personas"),
+      el("span", { class: "restore-count" }, el("strong", {}, c("conversations")), " Parties"),
+      el("span", { class: "restore-count" }, el("strong", {}, c("scenarios")), " Scénarios"),
+      el("span", { class: "restore-count" }, el("strong", {}, c("media")), " Médias"),
+    ),
+    el("div", { class: "restore-names" },
+      p.names.worlds?.length ? el("div", {}, el("strong", {}, "Mondes : "), el("ul", {}, ...nameList("worlds"))) : null,
+      p.names.cards?.length ? el("div", {}, el("strong", {}, "Cartes : "), el("ul", {}, ...nameList("cards"))) : null,
+      p.names.personas?.length ? el("div", {}, el("strong", {}, "Personas : "), el("ul", {}, ...nameList("personas"))) : null,
+      p.names.conversations?.length ? el("div", {}, el("strong", {}, "Parties : "), el("ul", {}, ...nameList("conversations"))) : null,
+    ),
+    el("div", { class: "restore-section" },
+      el("div", { class: "restore-section-title" }, "Politique de conflit"),
+      appendRadio, replaceRadio,
+    ),
+    el("div", { class: "restore-section" },
+      el("div", { class: "restore-section-title" }, "Restaurer"),
+      el("div", { class: "restore-includes" },
+        inc("worlds", "Mondes", c("worlds")), inc("scenarios", "Scénarios", c("scenarios")),
+        inc("cards", "Cartes", c("cards")), inc("personas", "Personas", c("personas")),
+        inc("conversations", "Parties", c("conversations")), inc("media", "Médias", c("media")),
+      ),
+    ),
+  );
+  const restoreBtn = el("button", { class: "btn btn-primary" }, "Restaurer");
+  restoreBtn.addEventListener("click", async () => {
+        const conflict = body.querySelector('input[name="conflict"]:checked')?.value || "append";
+        const include = {};
+        for (const cb of body.querySelectorAll('.restore-inc input[type="checkbox"]')) include[cb.dataset.key] = cb.checked;
+        const replace = conflict === "replace";
+        if (replace && !(await confirmModal({
+          title: "Confirmer le remplacement",
+          message: "Toutes les données actuelles (mondes, cartes, personas, parties…) seront déplacées vers la corbeille avant la restauration. Continuer ?",
+          confirmLabel: "Remplacer et restaurer",
+        }))) return;
+        try {
+          restoreBtn.disabled = true;
+          restoreBtn.textContent = "Restauration…";
+          const res = await api("/api/backup/restore", { body: { backup: parsed, conflict, include } });
+          close();
+          toast(`Restauration terminée : ${res.worlds} mondes, ${res.cards} cartes, ${res.personas} personas, ${res.conversations} parties ✓`);
+          announce("Restauration terminée");
+          await refreshAll();
+          renderSettings();
+        } catch (e) {
+          toast("Restauration impossible : " + e.message, "err");
+          restoreBtn.disabled = false;
+          restoreBtn.textContent = "Restaurer";
+        }
+  });
+  const { close } = openModal({
+    title: "Aperçu de la restauration",
+    sub: "Vérifie le contenu, choisis la politique de conflit et ce que tu veux restaurer.",
+    body,
+    footer: [
+      el("button", { class: "btn btn-ghost", onclick: () => close() }, "Annuler"),
+      restoreBtn,
+    ],
+  });
 }
 
 // Réglages → IA : vérifie d'un coup le modèle et le service d'images
@@ -3308,6 +3598,7 @@ window.addEventListener("innsekai-unauthorized", () => {
       return;
     }
     await refreshAll();
+    subscribeJobs();
   } catch (e) {
     main().replaceChildren(el("div", { class: "empty" },
       el("div", { class: "big" }, "🔌"),

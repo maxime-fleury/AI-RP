@@ -133,3 +133,37 @@ describe("features: auth / context / gallery / map / reactions / exports", async
     expect(dataDir).not.toContain("data");
   });
 });
+
+describe("world templates", () => {
+  test("templates list exposes all 8 genres with counts", async () => {
+    const { db, routes } = await loadApp();
+    const res = await api(routes, "GET", "/api/templates/worlds");
+    expect(res.status).toBe(200);
+    const { templates } = (await res.json()) as any;
+    const ids = templates.map((t: any) => t.id).sort();
+    expect(ids).toEqual(["fantasy", "horror", "isekai", "modern", "mystery", "romance", "space-opera"].sort());
+    const fantasy = templates.find((t: any) => t.id === "fantasy");
+    expect(fantasy.counts.locations).toBeGreaterThanOrEqual(3);
+    expect(fantasy.counts.lorebook).toBeGreaterThanOrEqual(1);
+    expect(fantasy.counts.hasScenario).toBe(true);
+  });
+
+  test("applying a template creates editable world structure", async () => {
+    const { db, routes } = await loadApp();
+    const res = await api(routes, "POST", "/api/templates/worlds/fantasy", {});
+    expect(res.status).toBe(201);
+    const out = (await res.json()) as any;
+    const world = db.getWorld(out.worldId);
+    expect(world).not.toBeNull();
+    expect(world!.name).toBe("Fantaisie");
+    // structure is plain editable rows — locations + lorebook + a draft scenario
+    expect(db.listLocations(out.worldId).length).toBeGreaterThanOrEqual(3);
+    expect(db.listLorebook(out.worldId).length).toBeGreaterThanOrEqual(1);
+    expect(db.listScenarios(out.worldId).length).toBe(1);
+    // unknown template → 404, not a crash
+    const bad = await api(routes, "POST", "/api/templates/worlds/nope", {});
+    expect(bad.status).toBe(404);
+    // cleanup: the shared test process must not see the template's rows later
+    db.permanentDeleteWorld(out.worldId);
+  });
+});
