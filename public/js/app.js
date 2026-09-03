@@ -1,6 +1,6 @@
-import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=58";
-import { el, esc, toast, actionToast, openModal, confirmModal, closeAllModals, field, ICONS, fmtTime } from "./ui.js?v=58";
-import { renderChat } from "./chat.js?v=58";
+import { api, apiFetch, apiForm, uploadFiles, setToken } from "./api.js?v=65";
+import { el, esc, toast, actionToast, openModal, confirmModal, closeAllModals, field, ICONS, fmtTime } from "./ui.js?v=65";
+import { renderChat } from "./chat.js?v=65";
 
 // ─── global state ─────────────────────────────────────────────────────────────
 export const store = {
@@ -130,8 +130,9 @@ function renderSidebar(active) {
       icon === "cards" ? el("span", { class: "badge" }, store.cards.length) : null,
     ),
   );
-  const collapseBtn = el("button", { class: "collapse-toggle", title: "Réduire / agrandir le panneau", onclick: toggleSidebar },
-    sb.classList.contains("collapsed") ? "»" : "«",
+  const collapsedNow = sb.classList.contains("collapsed");
+  const collapseBtn = el("button", { class: "collapse-toggle", title: collapsedNow ? "Agrandir le panneau" : "Réduire le panneau", onclick: toggleSidebar },
+    collapsedNow ? "»" : "«",
   );
   const status = el("div", { class: "side-status" },
     el("div", { class: "status-row" },
@@ -347,7 +348,7 @@ function shortcutsHelp() {
 }
 let shortcutCapturing = false; // set while the settings editor awaits a keypress
 function fireShortcut(k) {
-  import("./chat.js?v=58").then((m) => m.chatShortcut(k)).catch(() => {});
+  import("./chat.js?v=65").then((m) => m.chatShortcut(k)).catch(() => {});
 }
 document.addEventListener("keydown", (e) => {
   if (shortcutCapturing) return; // the settings key-capture owns this press

@@ -99,10 +99,14 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
   font-size: 13px; font-weight: 600; transition: all .2s;
 }
 .theme-toggle:hover { border-color: var(--accent); box-shadow: var(--glow-soft); transform: translateY(-1px); }
+/* collapse handle: a circular button that floats on the sidebar seam,
+   vertically centered — « collapses, » reopens (see the media queries) */
 .collapse-toggle {
-  margin-top: 8px; padding: 8px 12px; border-radius: var(--radius-sm);
-  border: 1px solid var(--border); background: var(--surface); color: var(--text-dim);
-  font-size: 15px; cursor: pointer; transition: all .2s;
+  display: grid; place-items: center;
+  width: 30px; height: 30px; padding: 0; border-radius: 50%;
+  border: 1px solid var(--border); background: var(--bg2); color: var(--text-dim);
+  font-size: 13px; line-height: 1; cursor: pointer;
+  transition: color .2s, border-color .2s, box-shadow .2s;
 }
 .collapse-toggle:hover { color: var(--accent); border-color: var(--accent); box-shadow: var(--glow-soft); }
 
@@ -115,7 +119,6 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
 .sidebar.collapsed .side-status,
 .sidebar.collapsed .theme-toggle { display: none; }
 .sidebar.collapsed .nav-item { justify-content: center; padding: 11px 0; }
-.sidebar.collapsed .collapse-toggle { align-self: center; padding: 8px 12px; }
 .sidebar.collapsed .brand .logo { width: 34px; height: 34px; font-size: 17px; }
 .sidebar { transition: width .25s ease, padding .25s ease; }
 
@@ -453,28 +456,24 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
   box-shadow: none; font-size: 16px; color: var(--text);
 }
 .send-btn.ghost:hover { border-color: var(--accent); color: var(--accent); box-shadow: var(--glow-soft); }
-.chips-row { display: flex; flex-direction: column; gap: 8px; padding: 0 0 12px; } /* flush with the composer edges below */
+.chips-row { display: flex; flex-direction: column; gap: 8px; padding: 8px 0 12px; } /* flush with the composer edges below; top padding gives air to the floating card icons */
 .chips-label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); margin-right: 2px; }
-.chips-head { display: flex; align-items: center; gap: 8px; }
-.chips-title { font-size: 11px; text-transform: uppercase; letter-spacing: .12em; color: var(--text-dim); font-weight: 700; }
-.chips-refresh {
-  margin-left: auto; width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center;
-  border: 1px solid var(--border); background: var(--surface); color: var(--text-dim);
-  font-size: 13px; cursor: pointer; transition: all .25s;
-}
-.chips-refresh:hover { color: var(--accent); border-color: var(--accent); transform: rotate(180deg); box-shadow: var(--glow-soft); }
-.chips-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; width: 100%; } /* auto-fit: every row stretches across the full composer width */
+.chips-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 18px 8px; width: 100%; } /* auto-fit: every row stretches across the full composer width; extra row-gap clears the floating icons of the next row */
 .chip-btn {
-  display: flex; align-items: center; gap: 10px; text-align: left; position: relative; overflow: hidden;
+  /* column layout: full-width text on top, the send control anchored to the
+     bottom right — so the suggestion text uses all the card's width */
+  display: flex; flex-direction: column; justify-content: space-between; gap: 8px;
+  text-align: left; position: relative; /* no overflow:hidden — the floating
+  icon must stay fully visible while it straddles the card's top border */
   border: 1px solid var(--border); background: var(--surface); color: var(--text);
-  border-radius: 14px; padding: 8px 8px 8px 12px; cursor: pointer;
+  border-radius: 14px; padding: 24px 12px 10px; cursor: pointer;
   backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
   transition: all .22s;
   animation: chipIn .4s cubic-bezier(.2,.8,.3,1.15) backwards;
 }
 @keyframes chipIn { from { opacity: 0; transform: translateY(10px) scale(.96); } to { opacity: 1; transform: none; } }
 .chip-btn::before {
-  content: ""; position: absolute; inset: 0;
+  content: ""; position: absolute; inset: 0; border-radius: inherit;
   background: linear-gradient(120deg, var(--accent-glow), transparent 65%);
   opacity: 0; transition: opacity .2s; pointer-events: none;
 }
@@ -482,19 +481,22 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
 .chip-btn:hover::before { opacity: 1; }
 .chip-btn:active { transform: scale(.97); }
 .chip-main {
-  flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px;
-  padding: 2px 0; border: none; background: none; color: inherit;
+  flex: 1; min-height: 0; display: block;
+  padding: 0; border: none; background: none; color: inherit;
   text-align: left; cursor: pointer; z-index: 1;
 }
 .chip-main:focus-visible { outline: 2px solid var(--accent-border); outline-offset: -2px; border-radius: 10px; }
+/* the suggestion's icon floats as a circular label on the card's top edge */
 .chip-icon {
-  width: 28px; height: 28px; border-radius: 9px; flex-shrink: 0;
-  display: grid; place-items: center; font-size: 15px;
-  background: var(--active-bg); border: 1px solid var(--accent-border);
+  position: absolute; top: -15px; left: 2px; z-index: 2; /* centered on the top border, tucked against the card's left edge */
+  width: 30px; height: 30px; border-radius: 50%;
+  display: grid; place-items: center; font-size: 14px;
+  background: var(--bg2); border: 1px solid var(--accent-border);
+  box-shadow: var(--glow-soft);
 }
-.chip-text { font-size: 13px; line-height: 1.35; z-index: 1; }
+.chip-text { font-size: 13px; line-height: 1.4; }
 .chip-send {
-  flex: none; z-index: 1; margin-left: 2px;
+  flex: none; z-index: 1; align-self: flex-end;
   width: 30px; height: 30px; border-radius: 12px; display: grid; place-items: center;
   font-size: 14px; color: var(--text-dim);
   border: 1px solid var(--border); background: var(--surface); cursor: pointer;
@@ -736,6 +738,8 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
 .menu-btn:hover { border-color: var(--accent); }
 @media (max-width: 900px) {
   .menu-btn { display: inline-flex; }
+  /* the floating seam handle is a desktop thing — mobile uses the ☰ drawer */
+  .collapse-toggle { display: none; }
   #main { padding-top: 56px; }
   .chat-header { padding-left: 42px; }
   .sidebar {
@@ -749,6 +753,15 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
   .app { display: block; }
 }
 @media (min-width: 901px) { .sidebar { transform: none !important; } }
+@media (min-width: 901px) {
+  /* the handle floats on the seam between the panel and the content, right in
+     the middle of the viewport height; half of it sticks out of the sidebar */
+  .sidebar { position: relative; }
+  .collapse-toggle {
+    position: absolute; top: 50%; right: -15px; transform: translateY(-50%);
+    z-index: 15; box-shadow: 0 2px 12px rgba(0, 0, 0, .4);
+  }
+}
 
 /* ─── shortcuts help ───────────────────────────────────────────────────────── */
 .shortcuts { display: flex; flex-direction: column; gap: 8px; }

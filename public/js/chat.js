@@ -1,6 +1,6 @@
-import { api, apiFetch, readSseStream } from "./api.js?v=58";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=58";
-import { store, refreshAll, refreshConversations, refreshConversation, navigate, applyTheme, autoCardAvatar } from "./app.js?v=58";
+import { api, apiFetch, readSseStream } from "./api.js?v=65";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=65";
+import { store, refreshAll, refreshConversations, refreshConversation, navigate, applyTheme, autoCardAvatar } from "./app.js?v=65";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -9,6 +9,7 @@ let streamGeneration = 0;
 let abortController = null;
 let beforeUnloadHandler = null; // installed when streaming starts
 let chipsRowRef = null;
+let turnSuggestionsMsgId = null; // last assistant message whose chips arrived via the SSE "suggestions" push
 let sceneRefreshHook = null; // set by renderChat; fired after each completed turn
 // auto-coherence check: module-level because the SSE "done" handler in
 // doStream() runs outside renderChat (it used to live inside and threw a
@@ -145,7 +146,7 @@ export async function renderChat(convIdRaw) {
   if (bareId === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=58");
+    const { newGameWizard } = await import("./app.js?v=65");
     newGameWizard(pre);
     return;
   }
@@ -1190,8 +1191,8 @@ async function doStream(content, opts = {}) {
         try { await maybeRelations(); } catch { /* non-blocking */ }
       } else if (event === "suggestions") {
         const { messageId, suggestions } = data;
+        if (messageId) turnSuggestionsMsgId = messageId;
         if (suggestions?.length) renderChips(suggestions);
-        void messageId;
       } else if (event === "error") {
         if (streamDone) { console.warn("[chat] erreur signalée après done — tour déjà validé, ignoré:", data.message); return; }
         throw new Error(data.message || "Erreur inconnue");
@@ -1209,6 +1210,10 @@ async function doStream(content, opts = {}) {
             else store.conversations.unshift(fresh);
           }
         }
+        // after a completed turn, make sure the player always has fresh
+        // response suggestions (the SSE push can miss them when a chapter or
+        // sidebar card becomes the last message, or the model returned nothing)
+        scheduleAutoSuggestions();
         break; // stream finished cleanly — never re-post
       } catch (e) {
         if (e.name === "AbortError" || abortController?.signal.aborted) return;
@@ -1330,10 +1335,6 @@ function renderChips(suggestions) {
   if (!chipsRow) return;
   chipsRow.replaceChildren();
   if (!suggestions?.length) return;
-  const head = el("div", { class: "chips-head" },
-    el("span", { class: "chips-title" }, "💡 Que faire ?"),
-    el("button", { class: "chips-refresh", title: "Nouvelles suggestions", onclick: refreshSuggestions }, "↻"),
-  );
   const grid = el("div", { class: "chips-grid" });
   // 4 max: keeps the cards on one full-width row — a 5th would wrap alone on a
   // second line and leave the grid looking half-empty next to the composer.
@@ -1348,14 +1349,34 @@ function renderChips(suggestions) {
       el("button", { class: "chip-send", title: "Envoyer cette suggestion", "aria-label": "Envoyer cette suggestion", onclick: () => sendSuggestionFromChip(s) }, "➤"),
     ));
   });
-  chipsRow.append(head, grid);
+  chipsRow.append(grid);
 }
 
-async function refreshSuggestions() {
-  if (!currentConversation) return;
-  const res = await api(`/api/conversations/${currentConversation.id}/suggestions`, { method: "POST", body: {} }).catch(() => null);
-  if (res?.suggestions?.length) renderChips(res.suggestions);
-  else toast("Le modèle n'a rien proposé, réessaie.", "err");
+// ─── automatic chips after each completed turn ───────────────────────────────
+// Fired once the stream fully closed (server background generation included):
+// if the SSE "suggestions" push covered the last assistant reply — or its meta
+// already carries chips — we simply display them. Otherwise (push lost, a
+// chapter/sidebar card became the last message, background returned nothing)
+// we ask the server once so suggestions never silently stay away.
+let autoSuggestTimer = null;
+function scheduleAutoSuggestions() {
+  if (!currentConversation?.id) return;
+  const convId = currentConversation.id;
+  clearTimeout(autoSuggestTimer);
+  autoSuggestTimer = setTimeout(async () => {
+    if (busy || currentConversation?.id !== convId) return;
+    const msgs = currentConversation.messages || [];
+    const lastAssist = [...msgs].reverse().find((m) => m.role === "assistant");
+    if (!lastAssist) return;
+    if (turnSuggestionsMsgId === lastAssist.id) return; // SSE already delivered chips
+    if (Array.isArray(lastAssist.meta?.suggestions) && lastAssist.meta.suggestions.length) {
+      renderChips(lastAssist.meta.suggestions);
+      return;
+    }
+    const res = await api(`/api/conversations/${convId}/suggestions`, { method: "POST", body: {} }).catch(() => null);
+    if (!res?.suggestions?.length || busy || currentConversation?.id !== convId) return;
+    renderChips(res.suggestions);
+  }, 450);
 }
 
 function fillComposerFromChip(text) {
@@ -2834,7 +2855,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal, field } from "./ui.js?v=58";
+import { openModal, field } from "./ui.js?v=65";
 void applyTheme;
 void fmtTime;
 void currentConversation;
