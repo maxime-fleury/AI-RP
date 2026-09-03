@@ -1867,7 +1867,6 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
       try { if (typeof m.meta === "string" && m.meta) meta = JSON.parse(m.meta); } catch { /* ignore */ }
       // meta-only updates (favoris, notes privées…) never touch content
       if (body.meta !== undefined && typeof body.meta === "object" && !Array.isArray(body.meta)) {
-        if (!JSON.parse(m.meta || "{}")) meta = {};
         Object.assign(meta, body.meta);
         updateMessage(mid, { meta: JSON.stringify(meta) } as Partial<MessageRow>);
         return json(messageView(getMessage(mid)!));
@@ -2049,6 +2048,9 @@ export async function handleApi(req: Request, url: URL): Promise<Response> {
         version: 1,
         exported_at: new Date().toISOString(),
         worlds: listWorlds(),
+        locations: listWorlds().flatMap((w) => listLocations(w.id)),
+        lorebook: listWorlds().flatMap((w) => listLorebook(w.id)),
+        relations: listWorlds().flatMap((w) => listRelations(w.id)),
         scenarios: listScenarios(),
         cards: listCards(),
         personas: listPersonas(),
@@ -2078,6 +2080,31 @@ function restoreBackup(b: any): Response {
   for (const w of b.worlds ?? []) {
     const nw = createWorld(w);
     worldIds.set(Number(w.id), nw.id);
+  }
+  let locations = 0;
+  for (const loc of b.locations ?? []) {
+    createLocation({
+      world_id: worldIds.get(Number(loc.world_id)) ?? 0,
+      name: loc.name, description: loc.description, x: loc.x, y: loc.y,
+    });
+    locations++;
+  }
+  let lorebook = 0;
+  for (const le of b.lorebook ?? []) {
+    createLorebookEntry({
+      world_id: worldIds.get(Number(le.world_id)) ?? 0,
+      name: le.name, triggers: le.triggers, content: le.content,
+      priority: le.priority, enabled: le.enabled,
+    });
+    lorebook++;
+  }
+  let relations = 0;
+  for (const r of b.relations ?? []) {
+    createRelation({
+      world_id: worldIds.get(Number(r.world_id)) ?? 0,
+      from_name: r.from_name, to_name: r.to_name, kind: r.kind,
+    });
+    relations++;
   }
   const scenIds = new Map<number, number>();
   for (const s of b.scenarios ?? []) {
@@ -2167,7 +2194,7 @@ function restoreBackup(b: any): Response {
     ok: true,
     worlds: (b.worlds ?? []).length, scenarios: (b.scenarios ?? []).length,
     cards: (b.cards ?? []).length, personas: (b.personas ?? []).length, conversations,
-    timeline_events: timelineEvents, media,
+    timeline_events: timelineEvents, locations, lorebook, relations, media,
     // duplicate restores of the same file intentionally re-create everything
     // (ids are remapped) — the UI warns about that before restoring
     note: "ids ré-attribués — restaurer deux fois le même fichier duplique les données",

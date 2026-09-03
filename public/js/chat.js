@@ -1,6 +1,6 @@
-import { api, apiFetch, readSseStream } from "./api.js?v=51";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=51";
-import { store, refreshAll, refreshConversations, refreshConversation, navigate, applyTheme, autoCardAvatar } from "./app.js?v=51";
+import { api, apiFetch, readSseStream } from "./api.js?v=58";
+import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=58";
+import { store, refreshAll, refreshConversations, refreshConversation, navigate, applyTheme, autoCardAvatar } from "./app.js?v=58";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -145,7 +145,7 @@ export async function renderChat(convIdRaw) {
   if (bareId === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=51");
+    const { newGameWizard } = await import("./app.js?v=58");
     newGameWizard(pre);
     return;
   }
@@ -365,8 +365,10 @@ export async function renderChat(convIdRaw) {
     }
   }
 
-  // ── header overflow menu: secondary actions grouped by category ⇣ ──────────
-  // the header keeps only the essentials; everything else lives in a dropdown
+  // ── header menu: several small category dropdowns, not one giant list ⇣ ───
+  // the header keeps only the essentials; everything else lives in a two-pane
+  // popup: a rail of category buttons on the left, the selected category's
+  // actions on the right (each category acts as its own dropdown button).
   const questBtn = el("button", { title: "Journal de quêtes", onclick: () => questModal(conv) }, "🗡"); // invisible triggers, surfaced via the menu
   const statsBtn = el("button", { title: "Statistiques", onclick: () => statsModal(convId) }, "📊");
   const npcBtn = el("button", { title: "Proposer un PNJ", onclick: () => npcSuggestModal() }, "✨");
@@ -375,30 +377,64 @@ export async function renderChat(convIdRaw) {
   const loopsBtn = el("button", { title: "Journal des boucles", onclick: () => loopsModal() }, "📔");
   const loreBtn = el("button", { title: "Canon de la partie", onclick: () => loreModal() }, "📚");
   const relBtn = el("button", { title: "Relations entre personnages (affinités)", onclick: () => relationsModal(conv) }, "💞");
-  const menu = el("div", { class: "header-menu", hidden: true, role: "menu" });
+  const menu = el("div", { class: "header-menu", hidden: true });
   const closeHeaderMenu = () => { menu.hidden = true; };
-  const menuSection = (title, pairs) => {
-    const items = pairs.map(([b, label]) => {
-      if (!b) return null;
-      const icon = (b.textContent || "›").trim().split(/\s/)[0] || "›";
-      return el("button", { class: "menu-item", role: "menuitem", onclick: (e) => { e.stopPropagation(); closeHeaderMenu(); b.click(); } },
-        el("span", { class: "menu-ico" }, icon),
-        el("span", { class: "menu-lbl" }, label),
-      );
-    }).filter(Boolean);
-    return items.length ? [el("div", { class: "menu-cat" }, title), ...items] : [];
+  const sections = [
+    { title: "🎬 Scène & mémoire", items: [[sceneBtn, "État de la scène"], [memoryBtn, "Mémoire structurée"], [relBtn, "Relations (affinités)"], [dmBtn, "Directives du maître de jeu"], [branchesBtn, "Variantes"], [validateBtn, "Vérifier la cohérence"]] },
+    { title: "🔎 Fil & sélection", items: [[searchBtn, "Rechercher"], [bookmarkFilterBtn, "Favoris seulement"], [selectBtn, "Sélectionner plusieurs messages"]] },
+    { title: "📤 Export", items: [[mdBtn, "Exporter en Markdown"], [copyThreadBtn, "Copier le fil"], [galleryBtn, "Galerie d'illustrations"], [exportBtn, "Exporter en ZIP"]] },
+    { title: "🕘 Boucles de temps", items: [[checkpointBtn, "Marquer un checkpoint"], [returnBtn, "Revenir au checkpoint"], [loopsBtn, "Journal des boucles"]] },
+    { title: "🛠 Partie", items: [[loreBtn, "Canon de la partie"], [npcBtn, "Proposer un PNJ"], [questBtn, "Journal de quêtes"], [statsBtn, "Statistiques"], [settingsBtn, "Réglages de la partie"], [delBtn, "Archiver la partie"]] },
+  ].map((s) => ({ ...s, items: s.items.filter(([b]) => !!b) })).filter((s) => s.items.length);
+  const menuItem = ([b, label]) => {
+    const icon = (b.textContent || "›").trim().split(/\s/)[0] || "›";
+    return el("button", { class: "menu-item", onclick: (e) => { e.stopPropagation(); closeHeaderMenu(); b.click(); } },
+      el("span", { class: "menu-ico" }, icon),
+      el("span", { class: "menu-lbl" }, label),
+    );
   };
+  const rail = el("div", { class: "header-menu-rail" });
+  const pane = el("div", { class: "header-menu-pane" });
+  let activeSection = 0;
+  // the pane follows the hovered/focused category — buttons are built once and
+  // only their .on / hidden state flips, so the pointer and focus stay put
+  const setActive = (i) => {
+    if (i === activeSection) return;
+    activeSection = i;
+    railBtns.forEach((b, j) => {
+      b.classList.toggle("on", j === i);
+      b.setAttribute("aria-pressed", String(j === i));
+    });
+    sectionEls.forEach((sec, j) => { sec.hidden = j !== i; });
+  };
+  const railBtns = sections.map((s, i) => {
+    const m = s.title.match(/^(\S+)\s+(.*)$/);
+    return el("button", {
+      class: "menu-rail-btn" + (i === 0 ? " on" : ""),
+      "aria-pressed": String(i === 0),
+      title: s.title,
+      onmouseenter: () => setActive(i),
+      onfocus: () => setActive(i),
+      onclick: () => setActive(i),
+    },
+      el("span", { class: "menu-ico" }, m ? m[1] : "▪"),
+      el("span", { class: "menu-rail-lbl" }, m ? m[2] : s.title),
+      el("span", { class: "menu-rail-count" }, String(s.items.length)),
+    );
+  });
+  // note: `el()` turns any non-null value into a setAttribute call, so the
+  // hidden attr must be *omitted* for the first section (hidden: false would
+  // still hide it)
+  const sectionEls = sections.map((s, i) =>
+    el("div", { class: "menu-section", ...(i !== 0 ? { hidden: "" } : {}) }, s.items.map(menuItem)),
+  );
+  rail.append(...railBtns);
+  pane.append(...sectionEls);
+  menu.append(rail, pane);
   const menuBtn = el("button", { class: "btn btn-ghost btn-icon header-more-btn", title: "Plus d'options", "aria-label": "Plus d'options", onclick: (e) => {
     e.stopPropagation();
     menu.hidden = !menu.hidden;
   } }, "⋮");
-  menu.append(
-    ...menuSection("🎬 Scène & mémoire", [[sceneBtn, "État de la scène"], [memoryBtn, "Mémoire structurée"], [relBtn, "Relations (affinités)"], [dmBtn, "Directives du maître de jeu"], [branchesBtn, "Variantes"], [validateBtn, "Vérifier la cohérence"]]),
-    ...menuSection("🔎 Fil & sélection", [[searchBtn, "Rechercher"], [bookmarkFilterBtn, "Favoris seulement"], [selectBtn, "Sélectionner plusieurs messages"]]),
-    ...menuSection("📤 Export", [[mdBtn, "Exporter en Markdown"], [copyThreadBtn, "Copier le fil"], [galleryBtn, "Galerie d'illustrations"], [exportBtn, "Exporter en ZIP"]]),
-    ...menuSection("🕘 Boucles de temps", [[checkpointBtn, "Marquer un checkpoint"], [returnBtn, "Revenir au checkpoint"], [loopsBtn, "Journal des boucles"]]),
-    ...menuSection("🛠 Partie", [[loreBtn, "Canon de la partie"], [npcBtn, "Proposer un PNJ"], [questBtn, "Journal de quêtes"], [statsBtn, "Statistiques"], [settingsBtn, "Réglages de la partie"], [delBtn, "Archiver la partie"]]),
-  );
   const header = el("div", { class: "chat-header" }, backBtn, titleBlock, castStrip, groupBtn, menuBtn, menu);
 
   async function exportZip() {
@@ -1299,11 +1335,17 @@ function renderChips(suggestions) {
     el("button", { class: "chips-refresh", title: "Nouvelles suggestions", onclick: refreshSuggestions }, "↻"),
   );
   const grid = el("div", { class: "chips-grid" });
-  suggestions.slice(0, 5).forEach((s, i) => {
-    grid.append(el("button", { class: "chip-btn", style: { animationDelay: `${i * 70}ms` }, onclick: () => sendSuggestionFromChip(s) },
-      el("span", { class: "chip-icon" }, chipIcon(s)),
-      el("span", { class: "chip-text" }, esc(s)),
-      el("span", { class: "chip-num" }, String(i + 1)),
+  // 4 max: keeps the cards on one full-width row — a 5th would wrap alone on a
+  // second line and leave the grid looking half-empty next to the composer.
+  // A click anywhere on the card only fills the composer (editable); each card
+  // carries its own ➤ button for sending straight away.
+  suggestions.slice(0, 4).forEach((s, i) => {
+    grid.append(el("div", { class: "chip-btn", style: { animationDelay: `${i * 70}ms` } },
+      el("button", { class: "chip-main", title: "Mettre dans la zone de saisie (modifiable)", onclick: () => fillComposerFromChip(s) },
+        el("span", { class: "chip-icon" }, chipIcon(s)),
+        el("span", { class: "chip-text" }, esc(s)),
+      ),
+      el("button", { class: "chip-send", title: "Envoyer cette suggestion", "aria-label": "Envoyer cette suggestion", onclick: () => sendSuggestionFromChip(s) }, "➤"),
     ));
   });
   chipsRow.append(head, grid);
@@ -1316,10 +1358,24 @@ async function refreshSuggestions() {
   else toast("Le modèle n'a rien proposé, réessaie.", "err");
 }
 
+function fillComposerFromChip(text) {
+  // clicking a suggestion never sends it — it loads into the composer so the
+  // player can tweak it before hitting the send button (or Enter)
+  const ctx = currentCtx;
+  if (!ctx) return;
+  const ta = ctx.textarea;
+  ta.value = text;
+  ta.style.height = "auto";
+  ta.style.height = Math.min(ta.scrollHeight, 140) + "px";
+  ta.focus();
+  ta.setSelectionRange(text.length, text.length);
+}
+
 async function sendSuggestionFromChip(text) {
   const ctx = currentCtx;
   if (!ctx || busy) return;
-  ctx.textarea.value = text;
+  // the sent text must not stay behind in the composer
+  ctx.textarea.value = "";
   ctx.textarea.style.height = "auto";
   await doStream(text);
 }
@@ -2146,7 +2202,7 @@ async function copyText(text, label) {
     await navigator.clipboard.writeText(text);
   } catch {
     // non-secure context fallback
-    const ta = el("textarea", { value: text });
+    const ta = el("textarea", {}, text);
     document.body.append(ta);
     ta.select();
     document.execCommand("copy");
@@ -2581,7 +2637,7 @@ async function loreModal() {
         ...entries.map((e, i) => {
           const name = el("input", { class: "field", placeholder: "Nom (ex : Guilde des Ombres)", value: e.name });
           const trig = el("input", { class: "field", placeholder: "Motifs, séparés par des virgules (ex : guilde, ombre)", value: e.triggers });
-          const content = el("textarea", { class: "field", rows: 2, placeholder: "Fait canonique, en 2-4 phrases", value: e.content });
+          const content = el("textarea", { class: "field", rows: 2, placeholder: "Fait canonique, en 2-4 phrases" }, e.content);
           name.addEventListener("input", () => { e.name = name.value; });
           trig.addEventListener("input", () => { e.triggers = trig.value; });
           content.addEventListener("input", () => { e.content = content.value; });
@@ -2778,7 +2834,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal, field } from "./ui.js?v=51";
+import { openModal, field } from "./ui.js?v=58";
 void applyTheme;
 void fmtTime;
 void currentConversation;

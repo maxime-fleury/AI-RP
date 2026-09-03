@@ -92,8 +92,8 @@ export class LMStudioProvider implements ChatProvider {
       const errText = await res.text().catch(() => "");
       throw new Error(`LM Studio (${res.status}): ${errText.slice(0, 300) || res.statusText}`);
     }
-    const data = (await res.json()) as { choices?: { message?: { content?: string; reasoning_content?: string } }[] };
-    return data.choices?.[0]?.message?.content ?? data.choices?.[0]?.message?.reasoning_content ?? "";
+    const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+    return data.choices?.[0]?.message?.content ?? "";
   }
 }
 

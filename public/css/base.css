@@ -434,9 +434,11 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
   box-shadow: var(--glow-soft);
   transition: border-color .25s, box-shadow .25s;
 }
-.composer:focus-within { border-color: var(--accent); box-shadow: var(--glow); }
 .composer textarea { border: none; background: none; box-shadow: none; resize: none; min-height: 24px; max-height: 140px; padding: 8px 0; font-size: 14.5px; }
-.composer textarea:focus { box-shadow: none; }
+/* clicking/typing in the composer must stay flat: no inner ring on the field
+   (the global :focus-visible outline), no accent border/glow on the pill */
+.composer:focus-within { border-color: var(--border); }
+.composer textarea:focus, .composer textarea:focus-visible { box-shadow: none; outline: none; }
 .send-btn {
   width: 44px; height: 44px; border-radius: 16px; flex-shrink: 0;
   display: grid; place-items: center; font-size: 19px;
@@ -451,7 +453,7 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
   box-shadow: none; font-size: 16px; color: var(--text);
 }
 .send-btn.ghost:hover { border-color: var(--accent); color: var(--accent); box-shadow: var(--glow-soft); }
-.chips-row { display: flex; flex-direction: column; gap: 8px; padding: 0 4px 12px; }
+.chips-row { display: flex; flex-direction: column; gap: 8px; padding: 0 0 12px; } /* flush with the composer edges below */
 .chips-label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); margin-right: 2px; }
 .chips-head { display: flex; align-items: center; gap: 8px; }
 .chips-title { font-size: 11px; text-transform: uppercase; letter-spacing: .12em; color: var(--text-dim); font-weight: 700; }
@@ -461,11 +463,11 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
   font-size: 13px; cursor: pointer; transition: all .25s;
 }
 .chips-refresh:hover { color: var(--accent); border-color: var(--accent); transform: rotate(180deg); box-shadow: var(--glow-soft); }
-.chips-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(175px, 1fr)); gap: 8px; width: 100%; }
+.chips-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; width: 100%; } /* auto-fit: every row stretches across the full composer width */
 .chip-btn {
   display: flex; align-items: center; gap: 10px; text-align: left; position: relative; overflow: hidden;
   border: 1px solid var(--border); background: var(--surface); color: var(--text);
-  border-radius: 14px; padding: 10px 12px; cursor: pointer;
+  border-radius: 14px; padding: 8px 8px 8px 12px; cursor: pointer;
   backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
   transition: all .22s;
   animation: chipIn .4s cubic-bezier(.2,.8,.3,1.15) backwards;
@@ -474,23 +476,36 @@ label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform
 .chip-btn::before {
   content: ""; position: absolute; inset: 0;
   background: linear-gradient(120deg, var(--accent-glow), transparent 65%);
-  opacity: 0; transition: opacity .2s;
+  opacity: 0; transition: opacity .2s; pointer-events: none;
 }
 .chip-btn:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: var(--glow-soft); }
 .chip-btn:hover::before { opacity: 1; }
 .chip-btn:active { transform: scale(.97); }
+.chip-main {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px;
+  padding: 2px 0; border: none; background: none; color: inherit;
+  text-align: left; cursor: pointer; z-index: 1;
+}
+.chip-main:focus-visible { outline: 2px solid var(--accent-border); outline-offset: -2px; border-radius: 10px; }
 .chip-icon {
   width: 28px; height: 28px; border-radius: 9px; flex-shrink: 0;
   display: grid; place-items: center; font-size: 15px;
   background: var(--active-bg); border: 1px solid var(--accent-border);
 }
 .chip-text { font-size: 13px; line-height: 1.35; z-index: 1; }
-.chip-num {
-  margin-left: auto; flex-shrink: 0; z-index: 1;
-  width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center;
-  font-size: 10.5px; color: var(--text-dim); border: 1px solid var(--border); background: var(--surface);
+.chip-send {
+  flex: none; z-index: 1; margin-left: 2px;
+  width: 30px; height: 30px; border-radius: 12px; display: grid; place-items: center;
+  font-size: 14px; color: var(--text-dim);
+  border: 1px solid var(--border); background: var(--surface); cursor: pointer;
+  transition: all .2s;
 }
-.speak-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 0 4px 8px; }
+.chip-send:hover {
+  color: #fff; border-color: transparent;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  box-shadow: var(--glow-soft); transform: translateY(-1px);
+}
+.speak-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 0 0 8px; }
 .speak-btn {
   border: 1px dashed var(--border); background: transparent; color: var(--text-dim);
   border-radius: 999px; padding: 6px 13px; font-size: 12.5px; cursor: pointer;
@@ -1530,20 +1545,50 @@ body.custom-bg {
 }
 .sel-count { font-weight: 700; margin-right: auto; }
 
-/* ── chat header overflow menu (⋮) — secondary actions by category ─────────── */
+/* ── chat header menu (⋮) — each category is its own small dropdown ────────── */
+/* the popup has two panes: a rail of category buttons + the selected
+   category's actions — no more one giant flat list (and it never grows
+   taller than the window: max-height + internal scroll). */
 .chat-header { position: relative; }
 .header-more-btn { flex: none; }
 .header-menu {
   position: absolute; top: calc(100% + 6px); right: 14px; z-index: 40;
-  min-width: 240px; max-width: min(330px, calc(100vw - 24px));
+  display: flex; align-items: stretch;
+  /* fixed size = the largest category (6 actions + widest label), so the
+     popup never grows/shrinks while hovering the category rail */
+  width: 452px; height: 234px;
+  max-width: min(560px, calc(100vw - 24px));
+  max-height: min(560px, calc(100vh - 130px));
   background: var(--bg2); border: 1px solid var(--border); border-radius: 14px;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, .45); padding: 8px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .45); padding: 6px;
   animation: fadeUp .18s ease both;
 }
-.menu-cat {
-  font-size: 10px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase;
-  color: var(--text-dim); padding: 10px 10px 4px;
+.header-menu-rail {
+  flex: 0 0 auto; display: flex; flex-direction: column; gap: 2px;
+  min-width: 148px; padding: 4px 8px 4px 2px; margin-right: 4px;
+  border-right: 1px solid var(--border); overflow-y: auto;
 }
+.menu-rail-btn {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  padding: 8px 9px; border: none; border-radius: 9px; background: transparent;
+  color: var(--text-dim); font-size: 12.5px; cursor: pointer;
+  transition: background .15s, color .15s;
+}
+.menu-rail-btn:hover { background: var(--active-bg); color: var(--text); }
+.menu-rail-btn.on { background: var(--active-bg); color: var(--accent); font-weight: 700; }
+.menu-rail-btn .menu-ico { width: 20px; text-align: center; flex: none; }
+.menu-rail-lbl { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.menu-rail-count {
+  margin-left: auto; flex: none; font-size: 10px; font-weight: 700;
+  color: var(--text-dim); border: 1px solid var(--border); border-radius: 999px;
+  padding: 1px 6px; background: var(--surface);
+}
+.menu-rail-btn.on .menu-rail-count { color: var(--accent); border-color: var(--accent-border); }
+.header-menu-pane {
+  flex: 1 1 auto; min-width: 200px; overflow-y: auto; padding: 4px 2px 4px 6px;
+}
+.menu-section { display: flex; flex-direction: column; gap: 1px; }
+.menu-section[hidden] { display: none; }
 .menu-item {
   display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
   padding: 8px 10px; border-radius: 9px; border: none; background: transparent;
@@ -1551,7 +1596,13 @@ body.custom-bg {
 }
 .menu-item:hover { background: var(--active-bg); color: var(--accent); }
 .menu-ico { width: 22px; text-align: center; flex: none; }
-.menu-lbl { flex: 1; }
+.menu-lbl { flex: 1; line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 620px) {
+  .header-menu-rail { min-width: 0; padding-right: 4px; }
+  .menu-rail-btn { justify-content: center; padding: 8px 6px; }
+  .menu-rail-lbl, .menu-rail-count { display: none; }
+  .header-menu-pane { min-width: 0; }
+}
 
 /* ── card modal: ✨ Aide IA (idée → chips par champ) ───────────────────────── */
 .assist-panel {

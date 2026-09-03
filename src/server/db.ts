@@ -249,7 +249,7 @@ export interface ScenarioRow {
 }
 
 export function listScenarios(worldId?: number): ScenarioRow[] {
-  if (worldId) return db.query("SELECT * FROM scenarios WHERE world_id = ? AND trashed = 0 ORDER BY created_at").all(worldId) as ScenarioRow[];
+  if (worldId !== undefined) return db.query("SELECT * FROM scenarios WHERE world_id = ? AND trashed = 0 ORDER BY created_at").all(worldId) as ScenarioRow[];
   return db.query("SELECT * FROM scenarios WHERE trashed = 0 ORDER BY created_at").all() as ScenarioRow[];
 }
 

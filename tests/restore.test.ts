@@ -72,6 +72,32 @@ describe("JSON backup / restore fidelity", () => {
     expect(restored.summary_msg_id).toBe(restoredUser.id);
   });
 
+  test("restore keeps world locations, lorebook and relations with remapped world ids", async () => {
+    const world = db.createWorld({ name: "Monde plein" });
+    db.createLocation({ world_id: world.id, name: "La Taverne", description: "Fumée", x: 10, y: 20 });
+    db.createLorebookEntry({ world_id: world.id, name: "Guildes", triggers: "guilde", content: "Deux guildes rivales.", priority: 2, enabled: 1 });
+    db.createRelation({ world_id: world.id, from_name: "Alba", to_name: "Rin", kind: "alliées" });
+
+    const backup = await (await api(routes, "GET", "/api/export")).json();
+    expect(backup.locations.length).toBe(1);
+    expect(backup.lorebook.length).toBe(1);
+    expect(backup.relations.length).toBe(1);
+
+    const restore = await (await api(routes, "POST", "/api/backup", { backup })).json();
+    expect(restore.ok).toBe(true);
+    expect(restore.locations).toBe(1);
+    expect(restore.lorebook).toBe(1);
+    expect(restore.relations).toBe(1);
+
+    // the world got recreated with a fresh id — its sub-resources must follow
+    const restoredWorlds = db.listWorlds().filter((w) => w.id !== world.id);
+    const restoredWorld = restoredWorlds.find((w) => w.name === "Monde plein")!;
+    expect(restoredWorld).toBeDefined();
+    expect(db.listLocations(restoredWorld.id).map((l) => l.name)).toEqual(["La Taverne"]);
+    expect(db.listLorebook(restoredWorld.id).map((l) => l.name)).toEqual(["Guildes"]);
+    expect(db.listRelations(restoredWorld.id).map((r) => r.kind)).toEqual(["alliées"]);
+  });
+
   test("forced backups write distinct files instead of overwriting the day snapshot", async () => {
     const a = runBackup(true);
     const b = runBackup(true);
