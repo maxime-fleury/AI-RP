@@ -52,8 +52,28 @@ export function broadcast(job: JobRow): void {
   }
 }
 
+// ─── cancellation ─────────────────────────────────────────────────────────────
+// Every running/queued job owns an AbortController. Cancel aborts the signal:
+// work functions that accept a signal (image generation, LLM calls) stop at the
+// next await instead of grinding to completion after the row said "cancelled".
+const controllers = new Map<number, AbortController>();
+
+export function abortSignalFor(jobId: number): AbortSignal | undefined {
+  return controllers.get(jobId)?.signal;
+}
+
+function registerController(jobId: number): AbortController {
+  const ac = new AbortController();
+  controllers.set(jobId, ac);
+  return ac;
+}
+
+function releaseController(jobId: number): void {
+  controllers.delete(jobId);
+}
+
 // ─── retry handlers (registered per job type by the routers) ─────────────────
-type RetryFn = (payload: Record<string, unknown>) => Promise<void>;
+type RetryFn = (payload: Record<string, unknown>, signal?: AbortSignal) => Promise<void>;
 const retryHandlers = new Map<string, RetryFn>();
 
 export function registerJobRetry(type: string, fn: RetryFn): void {
@@ -120,15 +140,17 @@ export function jobCancel(job: JobRow, reason = "Annulé"): void {
  * Run `work` as a tracked job. The job starts queued, flips to running, then
  * completes or fails — unless it was cancelled meanwhile (a cancelled job
  * stays cancelled even if the underlying work finishes). Resolves with the
- * work function's return value.
+ * work function's return value. `api.signal` is the job's AbortController
+ * signal: pass it into provider/image calls so Cancel actually stops work.
  */
 export async function trackJob<T = void>(
   spec: JobSpec,
-  work: (job: JobRow, api: { progress: (p: number) => void }) => Promise<T>,
+  work: (job: JobRow, api: { progress: (p: number) => void; signal: AbortSignal }) => Promise<T>,
 ): Promise<{ job: JobRow; result: T }> {
   const job = startJob(spec);
+  const ac = registerController(job.id);
   jobRunning(job);
-  const api = { progress: (p: number) => jobProgress(job, p) };
+  const api = { progress: (p: number) => jobProgress(job, p), signal: ac.signal };
   try {
     const result = await work(job, api);
     const cur = getJob(job.id);
@@ -138,6 +160,8 @@ export async function trackJob<T = void>(
     const cur = getJob(job.id);
     if (!cur || cur.status === "running") jobFail(job, e, spec.retryable);
     throw e;
+  } finally {
+    releaseController(job.id);
   }
 }
 
@@ -183,12 +207,17 @@ export async function retryJob(id: number): Promise<JobRow | null> {
     payload,
     retryable: old.retryable === 1,
   });
+  const ac = registerController(fresh.id);
   jobRunning(fresh);
   try {
-    await handler(payload);
-    jobSucceed(fresh);
+    await handler(payload, ac.signal);
+    const cur = getJob(fresh.id);
+    if (cur && cur.status === "running") jobSucceed(fresh);
   } catch (e) {
-    jobFail(fresh, e, old.retryable === 1);
+    const cur = getJob(fresh.id);
+    if (!cur || cur.status === "running") jobFail(fresh, e, old.retryable === 1);
+  } finally {
+    releaseController(fresh.id);
   }
   return getJob(fresh.id);
 }
@@ -198,11 +227,14 @@ export function cancelJob(id: number): JobRow | null {
   if (!job) return null;
   if (job.status === "queued" || job.status === "pending") {
     jobCancel(job);
+    controllers.get(id)?.abort();
     return getJob(id);
   }
-  // running: mark cancelled; the tracked work will notice and stay cancelled
+  // running: mark cancelled AND abort the underlying work so the LLM/image
+  // call stops at the next await; the tracked work stays cancelled
   if (job.status === "running") {
     jobCancel(job);
+    controllers.get(id)?.abort();
     return getJob(id);
   }
   return null;
@@ -214,14 +246,23 @@ export function cancelJob(id: number): JobRow | null {
  * sseStream's onCancel); the listener is torn down when the stream closes.
  */
 export function jobStreamResponse(): Response {
+  // The listener must be removed when the client disconnects; sseStream calls
+  // onCancel for that, so detach is hoisted where both callbacks can reach it.
+  let detach: (() => void) | null = null;
   return sseStream(
     async (send) => {
-      const detach = onJobEvent((job) => send("job", jobView(job)));
+      // NOTE: onStart must never resolve for a live stream — resolving would
+      // close it. (Previously detach() sat unreachable behind a
+      // never-resolving promise and every client leaked a listener:
+      // broadcasts kept enqueueing into closed streams forever.)
+      detach = onJobEvent((job) => send("job", jobView(job)));
       const { listJobs } = await import("./db");
       send("snapshot", { jobs: listJobs().slice(0, 50).map(jobView) });
-      await new Promise<void>(() => {});
-      detach();
+      return new Promise<void>(() => {});
     },
-    () => {},
+    () => {
+      detach?.();
+      detach = null;
+    },
   );
 }

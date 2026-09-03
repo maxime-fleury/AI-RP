@@ -43,6 +43,42 @@ describe("routing", async () => {
     expect(await res.text()).toContain('"not found"');
   });
 
+  test("worlds accept settings as a JSON string (UI payload) and reject broken JSON", async () => {
+    // the world editor sends settings: JSON.stringify({...}) — a pre-serialized
+    // string, not an object; the API must accept both shapes
+    const created = await api(routes, "POST", "/api/worlds", {
+      name: "Eldoria",
+      settings: JSON.stringify({ negative: "mains" }),
+    });
+    expect(created.status).toBe(201);
+    const w = await created.json();
+    expect(JSON.parse(w.settings)).toEqual({ negative: "mains" });
+
+    const patched = await api(routes, "PATCH", `/api/worlds/${w.id}`, {
+      settings: JSON.stringify({ negative: "x" }),
+    });
+    expect(patched.status).toBe(200);
+    expect(JSON.parse((await patched.json()).settings)).toEqual({ negative: "x" });
+
+    const bad = await api(routes, "POST", "/api/worlds", { name: "W", settings: "{not json" });
+    expect(bad.status).toBe(400);
+  });
+
+  test("POST /worlds/:id/scenarios 404s on missing world and never trusts body.world_id", async () => {
+    const missing = await api(routes, "POST", "/api/worlds/999999/scenarios", { name: "S", world_id: 1 });
+    expect(missing.status).toBe(404);
+
+    const world = db.createWorld({ name: "Eldoria" });
+    const res = await api(routes, "POST", `/api/worlds/${world.id}/scenarios`, {
+      name: "S", world_id: 1, intro: "Début", notes: "n",
+    });
+    expect(res.status).toBe(201);
+    const s = await res.json();
+    // body.world_id must NOT override the path-owned id
+    expect(s.world_id).toBe(world.id);
+    expect(s.name).toBe("S");
+  });
+
   test("POST /conversations/:id/fork copies messages strictly before the given id", async () => {
     const conv = db.createConversation({ title: "Origine" });
     const m1 = db.createMessage({ conversation_id: conv.id, role: "assistant", name: "Narrateur", content: "*Début.*" });

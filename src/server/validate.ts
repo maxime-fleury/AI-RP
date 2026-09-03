@@ -111,6 +111,23 @@ export function obj(v: unknown, label: string): Record<string, unknown> {
   return v as Record<string, unknown>;
 }
 
+/**
+ * Settings payload: accept either a plain object or a pre-serialized JSON
+ * string (the world editor sends a JSON.stringify'd settings blob). Returns
+ * the settings as a JSON string for storage, or throws on bad JSON.
+ */
+export function settingsJson(v: unknown): string {
+  if (typeof v === "string") {
+    try {
+      JSON.parse(v);
+    } catch {
+      apiError(Codes.INVALID_JSON, "settings doit être du JSON valide");
+    }
+    return v;
+  }
+  return JSON.stringify(obj(v, "settings"));
+}
+
 export function arr(v: unknown, label: string): unknown[] {
   if (v === null || v === undefined) return [];
   if (!Array.isArray(v)) apiError(Codes.INVALID_BODY, `${label} doit être un tableau`);

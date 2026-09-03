@@ -186,6 +186,8 @@ export async function renderChat(convIdRaw) {
   const memoryBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Mémoire structurée (lieu, personnages, objectifs)", onclick: memoryModal }, "🧠");
   const dmBtn = el("button", { class: "btn btn-ghost btn-icon" + (dmPending(conv) ? " on" : ""), title: "Mode maître de jeu (directives pour le prochain tour)", onclick: () => { dmEnabled = !dmEnabled; dmPanel.hidden = !dmPanel.hidden; if (!dmPanel.hidden) dmPaint(); } }, "🎮");
   const validateBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Vérifier la cohérence du fil (IA)", onclick: validateModal }, "🛡");
+  const canonBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Faits canoniques : confirmés + propositions IA à approuver", onclick: canonModal }, "📖");
+  const contextBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Inspecter le contexte envoyé au modèle (prompt + messages)", onclick: contextModal }, "📡");
   const bookmarkFilterBtn = el("button", { class: "btn btn-ghost btn-icon", title: "Afficher seulement les favoris", onclick: () => {
     bookmarkFilter = !bookmarkFilter;
     bookmarkFilterBtn.classList.toggle("on", bookmarkFilter);
@@ -294,6 +296,51 @@ export async function renderChat(convIdRaw) {
       catch (e) { toast(e.message, "err"); }
     });
     const row = (label, control) => el("label", { class: "dm-row" }, el("span", { class: "dm-label" }, label), control);
+    // ── persistent scene directives (plan de scène) ──────────────────────────
+    // objectives, required/forbidden events, NPC agendas, reveal gates and free
+    // directives — they stay active across turns until the player edits them
+    const scLine = (rows, ph) => el("textarea", { class: "dm-sc-txt", rows, placeholder: ph });
+    const scObjectives = scLine(2, "un objectif par ligne — ex : Convaincre la garde de laisser entrer le groupe");
+    const scRequired = scLine(1, "un événement requis par ligne — ex : La lettre scellée est remise à Liora");
+    const scForbidden = scLine(1, "un événement interdit par ligne — ex : Aucun personnage ne meurt dans cette scène");
+    const scReveal = scLine(1, "une révélation par ligne — ex : Le mage avoue son pacte quand il est acculé");
+    const scAgendas = scLine(2, "Nom du PNJ → son agenda — ex : Varek → cherche à récupérer le médaillon");
+    const scDirectives = scLine(1, "directives libres — ex : Termine le tour par un cliffhanger");
+    const scEnabled = el("input", { type: "checkbox", "aria-label": "Activer le plan de scène" });
+    const scSaveBtn = el("button", { class: "btn btn-primary btn-sm" }, "💾 Enregistrer le plan");
+    scSaveBtn.addEventListener("click", async () => {
+      const lines = (t) => t.value.split(/\n/).map((s) => s.trim()).filter(Boolean);
+      const npc_agendas = {};
+      for (const line of scAgendas.value.split(/\n/)) {
+        const m = line.match(/^(.+?)\s*[→\-]\s*(.+)$/);
+        if (m) npc_agendas[m[1].trim()] = m[2].trim();
+      }
+      try {
+        await api(`/api/conversations/${convId}/scene-control`, { method: "PUT", body: { scene_control: {
+          enabled: scEnabled.checked,
+          objectives: lines(scObjectives),
+          required: lines(scRequired),
+          forbidden: lines(scForbidden),
+          reveal_gates: lines(scReveal),
+          npc_agendas,
+          directives: lines(scDirectives),
+        } } });
+        toast("Plan de scène enregistré ✓");
+      } catch (e) { toast(e.message, "err"); }
+    });
+    const scBlock = el("div", { class: "dm-sc" },
+      el("div", { class: "dm-sc-head" },
+        el("span", {}, "🧭 Plan de scène persistant"),
+        el("label", { class: "dm-sc-toggle", title: "Désactivé : le plan est ignoré au prochain tour" }, el("span", {}, "Actif"), scEnabled),
+      ),
+      row("🎯 Objectifs", scObjectives),
+      row("⚡ Événements requis", scRequired),
+      row("🚫 Événements interdits", scForbidden),
+      row("🔒 Révélations à préparer", scReveal),
+      row("🗣 Agendas des PNJ", scAgendas),
+      row("📜 Directives libres", scDirectives),
+      el("div", { style: { display: "flex", justifyContent: "flex-end" } }, scSaveBtn),
+    );
     dmPanel.replaceChildren(
       el("div", { class: "dm-head" },
         el("span", {}, "🎮 Directives du maître de jeu"),
@@ -308,7 +355,20 @@ export async function renderChat(convIdRaw) {
       ),
       row("Révéler", revealInput),
       el("div", { style: { display: "flex", justifyContent: "flex-end", marginTop: "10px" } }, applyBtn),
+      el("hr", { class: "dm-sep" }),
+      scBlock,
     );
+    // load the persisted plan (async — the panel is already visible)
+    api(`/api/conversations/${convId}/scene-control`).then((r) => {
+      const sc = r.scene_control || {};
+      scObjectives.value = (sc.objectives || []).join("\n");
+      scRequired.value = (sc.required || []).join("\n");
+      scForbidden.value = (sc.forbidden || []).join("\n");
+      scReveal.value = (sc.reveal_gates || []).join("\n");
+      scAgendas.value = Object.entries(sc.npc_agendas || {}).map(([k, v]) => `${k} → ${v}`).join("\n");
+      scDirectives.value = (sc.directives || []).join("\n");
+      scEnabled.checked = sc.enabled !== false;
+    }).catch(() => { /* réseau ou serveur indisponible : plan laissé vide */ });
   };
 
   // ── scene-state panel (collapsible, LLM-maintained) ──
@@ -383,7 +443,7 @@ export async function renderChat(convIdRaw) {
   const menu = el("div", { class: "header-menu", hidden: true });
   const closeHeaderMenu = () => { menu.hidden = true; };
   const sections = [
-    { title: "🎬 Scène & mémoire", items: [[sceneBtn, "État de la scène"], [memoryBtn, "Mémoire structurée"], [relBtn, "Relations (affinités)"], [dmBtn, "Directives du maître de jeu"], [branchesBtn, "Variantes"], [validateBtn, "Vérifier la cohérence"]] },
+    { title: "🎬 Scène & mémoire", items: [[sceneBtn, "État de la scène"], [canonBtn, "Faits canoniques"], [memoryBtn, "Mémoire structurée"], [relBtn, "Relations (affinités)"], [dmBtn, "Directives du maître de jeu"], [contextBtn, "Contexte envoyé au modèle"], [branchesBtn, "Variantes"], [validateBtn, "Vérifier la cohérence"]] },
     { title: "🔎 Fil & sélection", items: [[searchBtn, "Rechercher"], [bookmarkFilterBtn, "Favoris seulement"], [selectBtn, "Sélectionner plusieurs messages"]] },
     { title: "📤 Export", items: [[mdBtn, "Exporter en Markdown"], [copyThreadBtn, "Copier le fil"], [galleryBtn, "Galerie d'illustrations"], [exportBtn, "Exporter en ZIP"]] },
     { title: "🕘 Boucles de temps", items: [[checkpointBtn, "Marquer un checkpoint"], [returnBtn, "Revenir au checkpoint"], [loopsBtn, "Journal des boucles"]] },
@@ -1213,6 +1273,13 @@ async function doStream(content, opts = {}) {
         throw new Error(data.message || "Erreur inconnue");
       }
     });
+        // Stream ended without a "done" event and the user didn't press Stop:
+        // the connection was cut (network blip, server restart, idle timeout…)
+        // and the turn was never committed — surface it like any other failure
+        // instead of leaving the "…" bubble hanging with the timer running.
+        if (!streamDone && !stopRequested && !abortController?.signal.aborted) {
+          throw new Error("La connexion au modèle a été coupée — réponse incomplète. Réessaie.");
+        }
         await refreshAll();
         // keep the open party's state (messages, meta) fresh so actions on the
         // newest reply — Régénérer, favori, note, réactions — can find it
@@ -1574,6 +1641,7 @@ async function branchesModal() {
       } catch (e) { toast(e.message, "err"); }
     });
     const openBtn = el("button", { class: "mini-btn", title: "Ouvrir cette branche", onclick: () => { close(); navigate(`#/chat/${b.id}`); } }, ICONS.play);
+    const cmpBtn = el("button", { class: "mini-btn", title: "Comparer avec cette variante puis fusionner l'état (canon, quêtes, relations, scène, mémoire)", onclick: () => { close(); compareModal(currentConversation, b); } }, "⇄");
     const delBtn = el("button", { class: "mini-btn", style: { color: "var(--danger)" }, title: "Supprimer définitivement", onclick: async () => {
       if (!(await confirmModal({ title: "Supprimer la variante", message: `Supprimer définitivement « ${b.title} » ainsi que ses illustrations ?` }))) return;
       try {
@@ -1592,6 +1660,7 @@ async function branchesModal() {
       ),
       kindSel,
       openBtn,
+      cmpBtn,
       delBtn,
     );
     row.style.setProperty("--depth", String(depth));
@@ -1608,6 +1677,162 @@ async function branchesModal() {
     wide: true,
   });
   paint();
+}
+
+// ─── branch compare / merge (⇄) ──────────────────────────────────────────────
+// Diffs CURATED state (canon, quests, relations, scene, memory) between the
+// current branch and another variant — message histories are never concatenated.
+// The player picks what to import and resolves conflicts per item.
+async function compareModal(conv, other) {
+  const convId = conv.id;
+  // mirror of the server's assistKey: normalized key used for conflict ids
+  const assistKey = (s) => String(s ?? "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+  let d;
+  try { d = await api(`/api/conversations/${convId}/compare`, { method: "POST", body: { otherId: other.id } }); }
+  catch (e) { return toast(e.message, "err"); }
+
+  const conflicts = []; // { key, take: "theirs" } entries sent to the merge endpoint
+  const chosen = new Map();
+  const takeSel = (key, def) => {
+    const cur = chosen.get(key) ?? def;
+    const sel = el("select", { class: "mini-select", "aria-label": "Résoudre le conflit" },
+      el("option", { value: "mine", ...(cur === "mine" ? { selected: "" } : {}) }, "garder le mien"),
+      el("option", { value: "theirs", ...(cur === "theirs" ? { selected: "" } : {}) }, "prendre le leur"),
+    );
+    sel.addEventListener("change", () => {
+      chosen.set(key, sel.value);
+      const i = conflicts.findIndex((c) => c.key === key);
+      if (sel.value === "theirs") { if (i < 0) conflicts.push({ key, take: "theirs" }); }
+      else if (i >= 0) conflicts.splice(i, 1);
+    });
+    return el("div", { class: "cmp-take" }, "conflit :", sel);
+  };
+  const section = (title, ...children) => el("div", { class: "cmp-row" },
+    el("div", { class: "cmp-row-head" }, el("strong", {}, title)),
+    ...children,
+  );
+  const rows = el("div", { style: { display: "flex", flexDirection: "column", gap: "10px" } });
+  const include = { canon: false, quests: false, rels: false, scene: false, memory: false };
+  const onlyCanon = new Set();
+
+  // ── canon: per-item import + per-subject conflict resolution ──
+  if (d.canon.added.length || d.canon.conflicts.length || d.canon.removed.length) {
+    const kids = [];
+    for (const e of d.canon.added) {
+      const cb = el("input", { type: "checkbox", checked: "", "aria-label": "Importer ce fait" });
+      cb.addEventListener("change", () => { if (cb.checked) onlyCanon.add(e.id); else onlyCanon.delete(e.id); });
+      onlyCanon.add(e.id);
+      kids.push(el("div", { class: "cmp-item" },
+        el("label", {}, cb,
+          el("div", {},
+            el("strong", {}, esc(e.subject)), " — ",
+            el("span", { class: "cmp-fact" }, esc(String(e.fact).slice(0, 160))),
+            e.locked ? " 🔒" : "",
+          ),
+        ),
+      ));
+    }
+    if (d.canon.conflicts.length) kids.push(el("div", { class: "cmp-note" },
+      `Conflits : ${d.canon.conflicts.length} sujet${d.canon.conflicts.length > 1 ? "s" : ""} existe${d.canon.conflicts.length > 1 ? "nt" : ""} des deux côtés avec un fait différent.`,
+    ));
+    for (const c of d.canon.conflicts) {
+      kids.push(el("div", { class: "cmp-item cmp-conflict" },
+        el("div", { style: { flex: 1, minWidth: 0 } },
+          el("strong", {}, esc(c.subject)),
+          el("div", { class: "cmp-fact" }, `Mien : ${esc(String(c.mine.fact).slice(0, 120))}`),
+          el("div", { class: "cmp-fact" }, `Leur : ${esc(String(c.theirs.fact).slice(0, 120))}`),
+        ),
+        takeSel(`canon:${assistKey(c.subject)}`, "mine"),
+      ));
+    }
+    if (d.canon.removed.length) kids.push(el("div", { class: "cmp-note" },
+      `Faits présents seulement ici (inchangés) : ${d.canon.removed.map((r) => r.subject).join(", ")}`,
+    ));
+    rows.append(section(`📖 Canon — ${d.canon.added.length} à importer`, ...kids));
+    include.canon = true;
+  }
+
+  // ── quests ──
+  const qOther = d.state.quests.other || [];
+  if (qOther.length) {
+    const qCb = el("input", { type: "checkbox", checked: "", "aria-label": "Reprendre les quêtes" });
+    qCb.addEventListener("change", () => { include.quests = qCb.checked; });
+    const kids = [el("div", { class: "cmp-item" },
+      el("label", {}, qCb, el("span", {}, `Reprendre les ${qOther.length} quête${qOther.length > 1 ? "s" : ""} de « ${esc(other.title)} » (celles déjà présentes gardent leur statut)`)),
+    )];
+    if ((d.state.quests.mine || []).length) kids.push(takeSel("quests", "mine"));
+    rows.append(section("🗡 Quêtes", ...kids));
+  }
+
+  // ── relations ──
+  const rOther = d.state.rels.other || [];
+  if (rOther.length) {
+    const rCb = el("input", { type: "checkbox", checked: "", "aria-label": "Reprendre les relations" });
+    rCb.addEventListener("change", () => { include.rels = rCb.checked; });
+    const kids = [el("div", { class: "cmp-item" },
+      el("label", {}, rCb, el("span", {}, `Reprendre les ${rOther.length} relation${rOther.length > 1 ? "s" : ""} de « ${esc(other.title)} »`)),
+    )];
+    if ((d.state.rels.mine || []).length) kids.push(takeSel("rels", "mine"));
+    rows.append(section("💞 Relations", ...kids));
+  }
+
+  // ── scene state / plan / memory ──
+  if (d.state.scene.other || d.state.sceneControl.other) {
+    const sCb = el("input", { type: "checkbox", checked: "", "aria-label": "Reprendre l'état de scène" });
+    sCb.addEventListener("change", () => { include.scene = sCb.checked; });
+    const desc = [
+      d.state.scene.other ? `état de scène (${esc(d.state.scene.other.location || "sans lieu")}…)` : null,
+      d.state.sceneControl.other ? "plan de scène persistant" : null,
+    ].filter(Boolean).join(" et ");
+    const kids = [el("div", { class: "cmp-item" },
+      el("label", {}, sCb, el("span", {}, `Reprendre le ${desc} de « ${esc(other.title)} »`)),
+    )];
+    if (d.state.scene.mine || d.state.sceneControl.mine) kids.push(takeSel("scene", "mine"));
+    rows.append(section("🧭 Scène (état + plan)", ...kids));
+  }
+  const otherMem = d.state.memory.other;
+  if (otherMem && (otherMem.characters?.length || otherMem.location || otherMem.facts?.length || otherMem.goals?.length)) {
+    const mCb = el("input", { type: "checkbox", checked: "", "aria-label": "Reprendre la mémoire" });
+    mCb.addEventListener("change", () => { include.memory = mCb.checked; });
+    const kids = [el("div", { class: "cmp-item" },
+      el("label", {}, mCb, el("span", {}, "Reprendre la mémoire structurée de l'autre variante")),
+    )];
+    if (d.state.memory.mine) kids.push(takeSel("memory", "mine"));
+    rows.append(section("🧠 Mémoire", ...kids));
+  }
+
+  if (!rows.children.length) rows.append(el("div", { class: "empty" },
+    el("div", { class: "big" }, "✨"), el("h3", {}, "Rien de différent"),
+    el("p", {}, "Les deux variantes partagent le même canon, les mêmes quêtes et le même état de scène."),
+  ));
+
+  const head = el("div", { style: { display: "flex", justifyContent: "space-between", gap: "10px", flexWrap: "wrap", marginBottom: "10px" } },
+    el("div", { style: { color: "var(--text-dim)", fontSize: "12.5px" } },
+      `${d.sharedMessages} messages en commun — divergence à partir du message #${d.divergedAt || "—"}`,
+    ),
+    el("span", { class: "chip" }, `${d.mine.messageCount} msgs ici · ${d.other.messageCount} msgs là-bas`),
+  );
+
+  const mergeBtn = el("button", { class: "btn btn-primary" }, "🔀 Fusionner la sélection");
+  mergeBtn.addEventListener("click", async () => {
+    if (!Object.values(include).some(Boolean)) return toast("Sélectionne au moins une catégorie à fusionner.", "err");
+    mergeBtn.disabled = true;
+    try {
+      const r = await api(`/api/conversations/${convId}/merge`, { method: "POST", body: { fromId: other.id, include, onlyCanon: [...onlyCanon], conflicts } });
+      const rep = r.report || {};
+      toast(`Fusion ✓ · ${rep.canon} fait${rep.canon > 1 ? "s" : ""} canon · ${rep.quests} quête${rep.quests > 1 ? "s" : ""} · ${rep.rels} relation${rep.rels > 1 ? "s" : ""}` + (rep.scene ? " · scène" : "") + (rep.memory ? " · mémoire" : ""));
+      close();
+    } catch (e) { toast(e.message, "err"); mergeBtn.disabled = false; }
+  });
+  const cancelBtn = el("button", { class: "btn btn-ghost" }, "Annuler");
+  const { close } = openModal({
+    title: `⇄ Comparer avec « ${other.title} »`,
+    sub: "Seul l'état est comparé (canon, quêtes, relations, scène, mémoire) — les fils de messages restent indépendants, rien n'est concaténé.",
+    body: el("div", {}, head, rows),
+    footer: [cancelBtn, mergeBtn],
+    wide: true,
+  });
+  cancelBtn.addEventListener("click", close);
 }
 
 // ─── relationship graph (💞) — affinities that evolve during play ─────────────
@@ -1998,6 +2223,219 @@ async function memoryModal() {
     title: "🧠 Mémoire structurée",
     sub: "Mise à jour automatiquement par le résumé quand le fil devient trop long. Modifie-la si un détail compte pour la suite.",
     body: el("div", {}, body, el("div", { style: { marginTop: "14px", display: "flex", justifyContent: "flex-end" } }, saveBtn)),
+    wide: true,
+  });
+}
+
+// ─── player-owned canon (📖) ─────────────────────────────────────────────────
+// Facts the player pins or approves are injected into the prompt AHEAD of the
+// generated memory and summaries: they are the narrative authority. AI
+// proposals land here as « proposé » and must be approved to take effect.
+async function canonModal() {
+  if (!currentConversation) return;
+  const convId = currentConversation.id;
+  const list = el("div", { class: "canon-list" });
+  const summary = el("span", { class: "canon-summary" });
+  const proposeBtn = el("button", { class: "btn btn-ghost btn-sm", title: "Le modèle propose de nouveaux faits à partir du fil — à approuver ici" }, "🤖 Proposer des faits");
+  const STATUS_ARCHIVE = new Set(["rejected", "retired"]);
+
+  const load = async () => {
+    let data;
+    try { data = await api(`/api/conversations/${convId}/canon`); }
+    catch (e) { return toast(e.message, "err"); }
+    const entries = data.entries || [];
+    const confirmed = entries.filter((e) => e.status === "confirmed");
+    const proposed = entries.filter((e) => e.status === "proposed");
+    const archived = entries.filter((e) => STATUS_ARCHIVE.has(e.status));
+    summary.textContent = `${confirmed.length} fait${confirmed.length > 1 ? "s" : ""} confirmé${confirmed.length > 1 ? "s" : ""} · ${proposed.length} proposition${proposed.length > 1 ? "s" : ""} à approuver`;
+    // replaceChildren stringifies nulls into « null » text nodes — build the
+    // array first and let el() (or an explicit filter) drop the empty sections
+    const sections = [];
+    if (confirmed.length) sections.push(el("div", { class: "canon-sec" },
+      el("div", { class: "canon-sec-title" }, `✔ Faits confirmés (${confirmed.length})`),
+      ...confirmed.map((e) => canonRow(e, "confirmed")),
+    ));
+    if (proposed.length) sections.push(el("div", { class: "canon-sec" },
+      el("div", { class: "canon-sec-title" }, `⏳ Propositions IA (${proposed.length})`),
+      ...proposed.map((e) => canonRow(e, "proposed")),
+    ));
+    if (archived.length) sections.push(el("details", { class: "canon-sec" },
+      el("summary", { class: "canon-sec-title", style: { cursor: "pointer" } }, `Archivés (${archived.length})`),
+      ...archived.map((e) => canonRow(e, "archived")),
+    ));
+    if (!sections.length) sections.push(el("div", { class: "empty" },
+      el("div", { class: "big" }, "📖"), el("h3", {}, "Aucun fait canonique"),
+      el("p", {}, "Ajoute un fait à la main, ou laisse le modèle en proposer depuis le fil — ils n'entrent en vigueur qu'une fois approuvés."),
+    ));
+    list.replaceChildren(...sections);
+  };
+
+  const canonRow = (e, status) => {
+    const subjectEl = el("strong", { class: "canon-subject" }, esc(e.subject || ""));
+    const factEl = el("div", { class: "canon-fact" }, esc(e.fact || ""));
+    const act = el("div", { class: "canon-actions" });
+    const chips = el("div", { class: "canon-chips" },
+      el("span", { class: "chip tiny" }, e.scope === "world" ? "🌍 tout le monde" : "💬 cette partie"),
+      e.locked ? el("span", { class: "chip tiny" }, "🔒 verrouillé") : null,
+      e.origin === "ai" ? el("span", { class: "chip tiny" }, "proposé par IA") : null,
+    );
+    const row = el("div", { class: "canon-row" + (status === "proposed" ? " proposed" : "") },
+      el("div", { class: "canon-main" }, subjectEl, factEl, chips),
+      act,
+    );
+
+    const edit = () => {
+      const sub = el("input", { class: "canon-input", value: e.subject || "", maxlength: 120 });
+      const fac = el("textarea", { class: "canon-input", rows: 2, maxlength: 2000 }); fac.value = e.fact || "";
+      const save = el("button", { class: "mini-btn", onclick: async () => {
+        try {
+          const up = await api(`/api/conversations/${convId}/canon/${e.id}`, { method: "PATCH", body: { subject: sub.value.trim(), fact: fac.value.trim() } });
+          e.subject = up.subject; e.fact = up.fact;
+          subjectEl.textContent = e.subject; factEl.textContent = e.fact;
+          toast("Fait mis à jour ✓");
+          paint();
+        } catch (err) { toast(err.message, "err"); }
+      } }, "✓");
+      const cancel = el("button", { class: "mini-btn", onclick: paint }, "✕");
+      act.replaceChildren(save, cancel);
+      sub.focus();
+    };
+    const paint = () => act.replaceChildren(...actions());
+    const editBtn = () => el("button", { class: "mini-btn", title: "Modifier", onclick: edit }, "✏️");
+    const actions = () => {
+      if (status === "proposed") {
+        const ok = el("button", { class: "mini-btn", style: { color: "var(--ok, #35c27a)" }, title: "Approuver — devient un fait confirmé", onclick: async () => {
+          try { await api(`/api/conversations/${convId}/canon/${e.id}/status`, { method: "POST", body: { status: "confirmed" } }); toast("Fait confirmé ✓"); load(); }
+          catch (err) { toast(err.message, "err"); }
+        } }, "✓ Approuver");
+        const no = el("button", { class: "mini-btn", title: "Rejeter la proposition", onclick: async () => {
+          try { await api(`/api/conversations/${convId}/canon/${e.id}/status`, { method: "POST", body: { status: "rejected" } }); toast("Proposition rejetée"); load(); }
+          catch (err) { toast(err.message, "err"); }
+        } }, "✗ Rejeter");
+        return [ok, no, editBtn()];
+      }
+      const lock = el("button", { class: "mini-btn", title: e.locked ? "Déverrouiller" : "Verrouiller — prioritaire dans le prompt", onclick: async () => {
+        try {
+          await api(`/api/conversations/${convId}/canon/${e.id}`, { method: "PATCH", body: { locked: !e.locked } });
+          e.locked = !e.locked;
+          toast(e.locked ? "Fait verrouillé 🔒" : "Fait déverrouillé");
+          load();
+        } catch (err) { toast(err.message, "err"); }
+      } }, e.locked ? "🔓" : "🔒");
+      const del = el("button", { class: "mini-btn", style: { color: "var(--danger)" }, title: "Supprimer définitivement", onclick: async () => {
+        if (!(await confirmModal({ title: "Supprimer le fait", message: `Supprimer « ${e.subject} : ${String(e.fact).slice(0, 80)} » ?` }))) return;
+        try { await api(`/api/conversations/${convId}/canon/${e.id}`, { method: "DELETE" }); toast("Fait supprimé"); load(); }
+        catch (err) { toast(err.message, "err"); }
+      } }, "🗑");
+      return [editBtn(), lock, del];
+    };
+    paint();
+    return row;
+  };
+
+  const addSubject = el("input", { class: "canon-input", placeholder: "Sujet — ex : Élara", maxlength: 120 });
+  const addFact = el("textarea", { class: "canon-input", rows: 2, placeholder: "Fait — ex : Élara a juré de protéger le médaillon", maxlength: 2000 });
+  const addScope = el("select", { class: "mini-select", "aria-label": "Portée" },
+    el("option", { value: "conversation" }, "💬 cette partie"),
+    el("option", { value: "world" }, "🌍 tout le monde"),
+  );
+  const addLocked = el("input", { type: "checkbox", "aria-label": "Verrouiller le fait" });
+  const addBtn = el("button", { class: "btn btn-primary btn-sm" }, "➕ Ajouter");
+  addBtn.addEventListener("click", async () => {
+    const subject = addSubject.value.trim();
+    const fact = addFact.value.trim();
+    if (!subject || !fact) return toast("Sujet et fait sont requis.", "err");
+    try {
+      await api(`/api/conversations/${convId}/canon`, { method: "POST", body: { subject, fact, scope: addScope.value, locked: addLocked.checked } });
+      addSubject.value = ""; addFact.value = "";
+      toast("Fait confirmé ajouté ✓");
+      load();
+    } catch (e) { toast(e.message, "err"); }
+  });
+
+  proposeBtn.addEventListener("click", async () => {
+    proposeBtn.disabled = true;
+    try {
+      const r = await api(`/api/conversations/${convId}/canon/propose`, { method: "POST", body: {} });
+      const n = (r.proposed || []).length;
+      toast(n ? `${n} proposition${n > 1 ? "s" : ""} ajoutée${n > 1 ? "s" : ""} ✓` : "Aucun nouveau fait à proposer.");
+      load();
+    } catch (e) { toast(e.message, "err"); }
+    finally { proposeBtn.disabled = false; }
+  });
+
+  const { close } = openModal({
+    title: "📖 Faits canoniques",
+    sub: "Autorité narrative : injectés dans le prompt avant la mémoire et le résumé. Les propositions IA n'entrent en vigueur qu'une fois approuvées.",
+    body: el("div", {},
+      el("div", { class: "canon-head" }, summary, proposeBtn),
+      list,
+      el("div", { class: "modal-section" }, "Ajouter un fait"),
+      el("div", { class: "canon-add" },
+        el("div", { class: "canon-add-grid" }, addSubject, addScope),
+        addFact,
+        el("div", { class: "canon-add-foot" },
+          el("label", { class: "setting-row slim" }, el("span", { class: "lbl" }, "🔒 Verrouillé (prioritaire)"), addLocked),
+          addBtn,
+        ),
+      ),
+    ),
+    wide: true,
+  });
+  load();
+}
+
+// ─── context inspector (📡) ───────────────────────────────────────────────────
+// Shows EXACTLY what the model will receive at the next turn: the same system
+// prompt and the same packed message list the server builds for generation.
+async function contextModal() {
+  if (!currentConversation) return;
+  const convId = currentConversation.id;
+  let r;
+  try { r = await api(`/api/conversations/${convId}/context`); }
+  catch (e) { return toast(e.message, "err"); }
+
+  const bar = el("div", { class: "ctx-bar" }, el("div", { class: "ctx-fill", style: { width: `${Math.min(100, r.budget)}%` } }));
+  const stat = (label, value) => el("div", { class: "ctx-stat" }, el("strong", {}, value), el("small", {}, label));
+  const chips = el("div", { class: "ctx-chips" },
+    el("span", { class: "chip" }, `📖 ${r.canon.count} faits canoniques`),
+    r.directives.one_shot_dm ? el("span", { class: "chip" }, "🎮 directives DM actives") : null,
+    r.directives.persistent_scene_control ? el("span", { class: "chip" }, "🧭 plan de scène actif") : null,
+    r.summaryUsed ? el("span", { class: "chip" }, "📚 résumé utilisé") : null,
+    r.memoryUsed ? el("span", { class: "chip" }, "🧠 mémoire utilisée") : null,
+  );
+  const sysBlock = el("details", { class: "ctx-block" },
+    el("summary", {}, `📜 Prompt système (${r.systemTokens.toLocaleString("fr-FR")} tokens)`),
+    el("pre", { class: "ctx-pre" }, esc(r.system)),
+  );
+  const msgs = el("div", { class: "ctx-msgs" });
+  const shown = r.messages.slice(-20);
+  msgs.replaceChildren(...shown.map((m) =>
+    el("details", { class: "ctx-msg" },
+      el("summary", {}, `${m.role === "user" ? "🧑 vous" : "🎭 narrateur"} · ${String(m.content).length} caractères`),
+      el("pre", { class: "ctx-pre" }, esc(m.content)),
+    ),
+  ));
+
+  openModal({
+    title: "📡 Contexte envoyé au modèle",
+    sub: "Ce que le modèle recevra au prochain tour : canon, directives, mémoire, résumé, puis messages récents.",
+    body: el("div", { class: "ctx-body" },
+      el("div", { class: "ctx-stats" },
+        stat("tokens envoyés", r.tokens.toLocaleString("fr-FR")),
+        stat("messages gardés", `${r.keptMessages} / ${r.messageCount}`),
+        stat("budget tokens", r.budgetTokens.toLocaleString("fr-FR")),
+        stat("plafond", r.capSource === "tokens" ? "tokens" : "tours"),
+      ),
+      bar,
+      el("div", { class: "ctx-budget-note" }, `Budget utilisé : ${r.budget}%`),
+      chips,
+      sysBlock,
+      el("div", { class: "ctx-block" },
+        el("summary", {}, `💬 Messages envoyés (${r.messages.length} — aperçu des ${shown.length} derniers)`),
+        msgs,
+      ),
+    ),
     wide: true,
   });
 }

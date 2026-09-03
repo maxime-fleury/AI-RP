@@ -2,11 +2,11 @@
  * conversations resource router (extracted from the monolithic routes.ts).
  * Returns null when no route matches; throws are mapped by index.ts.
  */
-import { CHAPTER_MIN_MESSAGES, type Quest, RECAP_MIN_MESSAGES, type RecapData, conversationView, forkTail, generateCaptions, generateQuests, generateSceneState, generateSuggestions, handleStream, json, messageView, readJson, recapOf, relsOf, renderRecapShots, scanRelations, storyMessages, suggestChapter, suggestLore, suggestNpcs, suggestRecap, summarizeLoop, validateNarrative } from "./core";
-import { type ConversationRow, type MessageRow, createCard, createConversation, createMessage, deleteConversation, deleteMessagesAfter, getCard, getConversation, getMessage, getPersona, getScenario, getSetting, getWorld, lastMessageOf, listBranches, listConversations, listMessages, updateConversation, updateMessage } from "../db";
+import { CHAPTER_MIN_MESSAGES, type Quest, RECAP_MIN_MESSAGES, type RecapData, assistKey, computeKept, contextConfig, conversationView, forkTail, generateCaptions, generateQuests, generateSceneState, generateSuggestions, handleStream, json, messageView, proposeCanonFacts, readJson, recapOf, relsOf, renderRecapShots, scanRelations, storyMessages, suggestChapter, suggestLore, suggestNpcs, suggestRecap, summarizeLoop, validateNarrative } from "./core";
+import { type CanonRow, type ConversationRow, type MessageRow, createCanon, createCard, createConversation, createMessage, deleteCanon, deleteConversation, deleteMessagesAfter, getCanon, getCard, getConversation, getMessage, getPersona, getScenario, getSetting, getWorld, lastMessageOf, listBranches, listCanon, listConversations, listMessages, updateCanon, updateConversation, updateMessage } from "../db";
 import { errorResponse } from "../http";
 import { trackJob } from "../jobs";
-import { Codes, apiError, en, fkId, intArray, obj, str } from "../validate";
+import { Codes, apiError, en, fkId, int, intArray, obj, settingsJson, str } from "../validate";
 import { runBackup } from "../backup";
 import { zipFiles } from "../zip";
 import { IMAGES_DIR } from "../paths";
@@ -42,7 +42,7 @@ if (p === "/api/conversations" && method === "POST") {
         scenario_id: scenarioId,
         cast: JSON.stringify(cast),
         group_mode: body.group_mode ? 1 : 0,
-        settings: JSON.stringify(obj(body.settings, "settings")),
+        settings: settingsJson(body.settings),
       });
       // opening: scenario intro (or first card greeting)
       let convSettings: Record<string, unknown> = {};
@@ -109,7 +109,7 @@ if (parts[1] === "conversations" && parts[2] && !parts[3] && method === "PATCH")
         patch.cast = JSON.stringify(cast);
       }
       if (body.settings !== undefined) {
-        patch.settings = JSON.stringify(obj(body.settings, "settings"));
+        patch.settings = settingsJson(body.settings);
       }
       if (typeof body.branch_kind === "string") {
         patch.branch_kind = en(body.branch_kind, "branch_kind", ["main", "canon", "alternative", "draft", "abandoned"]);
@@ -253,7 +253,7 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "relations" && !par
           payload: { conversationId: convId, force: manual },
           retryable: true,
         },
-        () => scanRelations(convId, manual),
+        (job, api) => scanRelations(convId, manual, api.signal),
       );
       return json(result);
     }
@@ -471,6 +471,82 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "lore" && method ==
       return json({ entries });
     }
 
+// ─── player-owned canon: facts the player (or an approved AI proposal) pins ───
+if (parts[1] === "conversations" && parts[2] && parts[3] === "canon" && !parts[4] && method === "GET") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const status = url.searchParams.get("status") || undefined;
+      return json({ entries: listCanon(conv.id, status) });
+    }
+
+if (parts[1] === "conversations" && parts[2] && parts[3] === "canon" && !parts[4] && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const body = await readJson(req);
+      const scope = en(String(body.scope ?? "conversation"), "scope", ["conversation", "world"]);
+      if (scope === "world" && !conv.world_id) apiError(Codes.INVALID_FIELD, "scope world impossible sans monde attaché");
+      const entry = createCanon({
+        conversation_id: conv.id,
+        world_id: conv.world_id,
+        subject: str(body.subject, "subject", { max: 120 }),
+        fact: str(body.fact, "fact", { max: 2000 }),
+        scope,
+        status: "confirmed",
+        locked: body.locked ? 1 : 0,
+        origin: "player",
+      });
+      return json(entry, 201);
+    }
+
+if (parts[1] === "conversations" && parts[2] && parts[3] === "canon" && parts[4] && !parts[5] && method === "PATCH") {
+      const conv = getConversation(Number(parts[2]));
+      const entry = getCanon(Number(parts[4]));
+      if (!conv || !entry || entry.conversation_id !== conv.id) return json({ error: "not found" }, 404);
+      const body = await readJson(req);
+      const patch: Partial<CanonRow> = {};
+      if (body.subject !== undefined) patch.subject = str(body.subject, "subject", { max: 120 });
+      if (body.fact !== undefined) patch.fact = str(body.fact, "fact", { max: 2000 });
+      if (body.locked !== undefined) patch.locked = body.locked ? 1 : 0;
+      if (body.priority !== undefined) patch.priority = int(body.priority, "priority", 1, 100);
+      const updated = updateCanon(entry.id, patch);
+      return updated ? json(updated) : json({ error: "not found" }, 404);
+    }
+
+if (parts[1] === "conversations" && parts[2] && parts[3] === "canon" && parts[4] && parts[5] === "status" && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      const entry = getCanon(Number(parts[4]));
+      if (!conv || !entry || entry.conversation_id !== conv.id) return json({ error: "not found" }, 404);
+      const body = await readJson(req);
+      const status = en(String(body.status ?? ""), "status", ["confirmed", "proposed", "rejected", "retired"]);
+      const updated = updateCanon(entry.id, { status });
+      return json(updated);
+    }
+
+if (parts[1] === "conversations" && parts[2] && parts[3] === "canon" && parts[4] && !parts[5] && method === "DELETE") {
+      const conv = getConversation(Number(parts[2]));
+      const entry = getCanon(Number(parts[4]));
+      if (!conv || !entry || entry.conversation_id !== conv.id) return json({ error: "not found" }, 404);
+      deleteCanon(entry.id);
+      return json({ ok: true });
+    }
+
+if (parts[1] === "conversations" && parts[2] && parts[3] === "canon" && parts[4] === "propose" && method === "POST") {
+      const convId = Number(parts[2]);
+      if (!getConversation(convId)) return json({ error: "not found" }, 404);
+      // tracked job: visible in the activity panel, retryable from there
+      const { result } = await trackJob(
+        {
+          type: "canon",
+          title: "Propositions de canon",
+          conversationId: convId,
+          payload: { conversationId: convId },
+          retryable: true,
+        },
+        (job, api) => proposeCanonFacts(convId, listMessages(convId), api.signal),
+      );
+      return json({ proposed: result });
+    }
+
 if (parts[1] === "conversations" && parts[2] && parts[3] === "quests" && method === "POST") {
       const convId = Number(parts[2]);
       const conv = getConversation(convId);
@@ -580,6 +656,49 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "scene" && method =
       return json({ state, updatedAt: Date.now() });
     }
 
+// ─── persistent scene directives (settings.scene_control) ────────────────────
+// Objectives, required/forbidden events, NPC agendas, reveal gates and free
+// directives — they stay active across turns until the player edits them.
+if (parts[1] === "conversations" && parts[2] && parts[3] === "scene-control" && method === "GET") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      let cs: Record<string, any> = {};
+      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+      return json({ scene_control: cs.scene_control ?? null });
+    }
+
+if (parts[1] === "conversations" && parts[2] && parts[3] === "scene-control" && method === "PUT") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const body = await readJson(req);
+      const raw = obj(body.scene_control, "scene_control");
+      const strArr = (v: unknown, label: string, max = 300): string[] => {
+        const a = Array.isArray(v) ? v : [];
+        return a.map((x) => String(x ?? "").trim().slice(0, max)).filter(Boolean).slice(0, 20);
+      };
+      const agendas: Record<string, string> = {};
+      if (raw.npc_agendas && typeof raw.npc_agendas === "object" && !Array.isArray(raw.npc_agendas)) {
+        for (const [k, v] of Object.entries(raw.npc_agendas)) {
+          const t = String(v ?? "").trim().slice(0, 300);
+          if (t) agendas[String(k).trim().slice(0, 80)] = t;
+        }
+      }
+      const scene_control = {
+        enabled: raw.enabled !== false,
+        objectives: strArr(raw.objectives, "objectives"),
+        required: strArr(raw.required, "required"),
+        forbidden: strArr(raw.forbidden, "forbidden"),
+        npc_agendas: agendas,
+        reveal_gates: strArr(raw.reveal_gates, "reveal_gates"),
+        directives: strArr(raw.directives, "directives", 600),
+      };
+      let cs: Record<string, any> = {};
+      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+      cs.scene_control = scene_control;
+      updateConversation(conv.id, { settings: JSON.stringify(cs) });
+      return json({ scene_control });
+    }
+
 if (parts[1] === "conversations" && parts[2] && parts[3] === "branches" && method === "GET") {
       const conv = getConversation(Number(parts[2]));
       if (!conv) return json({ error: "not found" }, 404);
@@ -593,6 +712,150 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "branches" && metho
       for (const c of listBranches(conv.id)) family.set(c.id, c);
       const list = [...family.values()].sort((a, b) => a.created_at - b.created_at);
       return json({ branches: list.map((c) => conversationView(c.id)) });
+    }
+
+// ─── branch diff / merge: compare two variants, then merge CURATED state ─────
+// (canon facts, quests, relations, scene state, memory). Message histories stay
+// independent — merging never concatenates threads.
+if (parts[1] === "conversations" && parts[2] && parts[3] === "compare" && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const body = await readJson(req);
+      const other = getConversation(Number(body.otherId));
+      if (!other) return json({ error: "not found" }, 404);
+      const a = listMessages(conv.id).map(messageView);
+      const b = listMessages(other.id).map(messageView);
+      let shared = 0;
+      while (shared < a.length && shared < b.length && a[shared].content === b[shared].content) shared++;
+      const divergedAt = shared < a.length || shared < b.length ? (a[shared]?.id ?? b[shared]?.id ?? 0) : 0;
+      // subject-level diff: a fact whose subject exists on both sides is a
+      // CONFLICT (mine vs theirs), not an add/remove pair
+      const subjA = new Map<string, CanonRow>();
+      const subjB = new Map<string, CanonRow>();
+      for (const e of listCanon(conv.id)) if (e.status === "confirmed") subjA.set(assistKey(e.subject), e);
+      for (const e of listCanon(other.id)) if (e.status === "confirmed") subjB.set(assistKey(e.subject), e);
+      const added = [...subjB.entries()].filter(([k]) => !subjA.has(k)).map(([, e]) => e);
+      const removed = [...subjA.entries()].filter(([k]) => !subjB.has(k)).map(([, e]) => e);
+      const conflicts = [...subjA.entries()]
+        .filter(([k, a]) => subjB.has(k) && assistKey(a.fact) !== assistKey(subjB.get(k)!.fact))
+        .map(([k, a]) => ({ subject: a.subject, mine: a, theirs: subjB.get(k)! }));
+      const st = (c: ConversationRow): Record<string, any> => { try { return JSON.parse(c.settings || "{}"); } catch { return {}; } };
+      const sa = st(conv), sb = st(other);
+      return json({
+        mine: { id: conv.id, title: conv.title, messageCount: a.length },
+        other: { id: other.id, title: other.title, messageCount: b.length },
+        sharedMessages: shared,
+        divergedAt,
+        canon: { added, removed, conflicts },
+        state: {
+          memory: { mine: parseMemory(conv.memory_json), other: parseMemory(other.memory_json) },
+          quests: { mine: sa.quests ?? [], other: sb.quests ?? [] },
+          rels: { mine: sa.rels?.pairs ?? [], other: sb.rels?.pairs ?? [] },
+          scene: { mine: sa.scene_state ?? null, other: sb.scene_state ?? null },
+          sceneControl: { mine: sa.scene_control ?? null, other: sb.scene_control ?? null },
+        },
+      });
+    }
+
+if (parts[1] === "conversations" && parts[2] && parts[3] === "merge" && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const body = await readJson(req);
+      const from = getConversation(Number(body.fromId));
+      if (!from) return json({ error: "not found" }, 404);
+      const include = body.include && typeof body.include === "object" && !Array.isArray(body.include) ? body.include : {};
+      const conflicts = Array.isArray(body.conflicts) ? body.conflicts : [];
+      const take = (key: string): "mine" | "theirs" => {
+        const c = conflicts.find((x: any) => x?.key === key);
+        if (c?.take === "theirs") return "theirs";
+        // category fallback: { key: "canon", take: "theirs" } resolves every
+        // canon:… conflict unless a specific key overrides it
+        const cat = conflicts.find((x: any) => x?.key === key.split(":")[0] && x?.take === "theirs");
+        return cat ? "theirs" : "mine";
+      };
+      let cs: Record<string, any> = {};
+      try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+      let fs: Record<string, any> = {};
+      try { fs = JSON.parse(from.settings || "{}"); } catch { /* ignore */ }
+      const report = { canon: 0, quests: 0, rels: 0, scene: false, memory: false };
+      if (include.canon) {
+        // per-item selection: onlyCanon = [ids] keeps just the checked facts
+        const onlyIds = Array.isArray(body.onlyCanon) ? new Set(body.onlyCanon.map((n: any) => Number(n))) : null;
+        const mine = listCanon(conv.id).filter((e) => e.status === "confirmed");
+        for (const e of listCanon(from.id)) {
+          if (e.status !== "confirmed") continue;
+          // per-item selection only gates NEW facts; a conflict (subject already
+          // present here) always participates in the take() resolution below
+          if (onlyIds && !onlyIds.has(e.id) && !mine.some((x) => assistKey(x.subject) === assistKey(e.subject))) continue;
+          const key = assistKey(e.subject);
+          const mineRow = mine.find((x) => assistKey(x.subject) === key);
+          if (!mineRow) {
+            createCanon({ conversation_id: conv.id, world_id: conv.world_id, subject: e.subject, fact: e.fact, status: "confirmed", locked: e.locked, source_message_id: null, origin: "ai" });
+            report.canon++;
+          } else if (take(`canon:${key}`) === "theirs" && mineRow.fact !== e.fact) {
+            updateCanon(mineRow.id, { fact: e.fact, locked: e.locked });
+            report.canon++;
+          }
+        }
+      }
+      if (include.quests && Array.isArray(fs.quests)) {
+        const mineQ = new Map<string, any>((Array.isArray(cs.quests) ? cs.quests : []).map((q: any) => [assistKey(q?.title ?? ""), q] as [string, any]));
+        for (const q of fs.quests) {
+          if (!q?.title) continue;
+          const key = assistKey(q.title);
+          const mine = mineQ.get(key);
+          if (!mine) {
+            mineQ.set(key, { title: String(q.title).slice(0, 140), status: ["active", "done", "dropped"].includes(q.status) ? q.status : "active", notes: String(q.notes || "").slice(0, 400) });
+            report.quests++;
+          } else if (take(`quest:${key}`) === "theirs") {
+            mine.status = ["active", "done", "dropped"].includes(q.status) ? q.status : mine.status;
+            mine.notes = String(q.notes || "").slice(0, 400);
+            report.quests++;
+          }
+        }
+        cs.quests = [...mineQ.values()];
+      }
+      if (include.rels && Array.isArray(fs.rels?.pairs)) {
+        const rKey = (a: string, b: string) => `${a}\u241f${b}`;
+        const minePairs = new Map<string, any>((Array.isArray(cs.rels?.pairs) ? cs.rels.pairs : []).map((p: any) => [rKey(p.a, p.b), p] as [string, any]));
+        for (const p of fs.rels.pairs) {
+          if (!p?.a || !p?.b) continue;
+          const key = rKey(p.a, p.b);
+          const mine = minePairs.get(key);
+          if (!mine) {
+            minePairs.set(key, { a: p.a, b: p.b, value: Math.max(-100, Math.min(100, Number(p.value) || 0)), note: String(p.note || "").slice(0, 200), at: Date.now() });
+            report.rels++;
+          } else if (take(`rel:${key}`) === "theirs") {
+            mine.value = Math.max(-100, Math.min(100, Number(p.value) || 0));
+            mine.note = String(p.note || "").slice(0, 200);
+            mine.at = Date.now();
+            report.rels++;
+          }
+        }
+        cs.rels = { at: Date.now(), last_msg_id: cs.rels?.last_msg_id ?? 0, pairs: [...minePairs.values()] };
+      }
+      // the scene layer: LLM-maintained state + the player's persistent plan
+      if (include.scene) {
+        const takeScene = take("scene") === "theirs";
+        if (fs.scene_state && (takeScene || !cs.scene_state)) {
+          cs.scene_state = fs.scene_state;
+          cs.scene_updated_at = fs.scene_updated_at ?? Date.now();
+          report.scene = true;
+        }
+        if (fs.scene_control && (takeScene || !cs.scene_control)) {
+          cs.scene_control = fs.scene_control;
+          report.scene = true;
+        }
+      }
+      if (include.memory) {
+        const otherMem = parseMemory(from.memory_json);
+        if (otherMem && (take("memory") === "theirs" || !conv.memory_json)) {
+          updateConversation(conv.id, { memory_json: JSON.stringify(otherMem), summary: memoryToText(otherMem) });
+          report.memory = true;
+        }
+      }
+      updateConversation(conv.id, { settings: JSON.stringify(cs) });
+      return json({ ok: true, report });
     }
 
 if (parts[1] === "conversations" && parts[2] && parts[3] === "validate" && method === "POST") {
@@ -611,33 +874,41 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "context" && method
       if (!conv) return json({ error: "not found" }, 404);
       const view = conversationView(conv.id)!;
       const msgs = listMessages(conv.id);
+      // the inspector shows EXACTLY what the model receives: the same packing
+      // (computeKept) and the same system prompt (buildMessages auto-loads canon)
+      const kept = computeKept(conv, msgs);
       const { system, messages } = buildMessages(
         { world: view.world, persona: view.persona, cards: view.cards, scenario: view.scenario, conversation: conv, summary: conv.summary || undefined, memory: parseMemory(conv.memory_json) || undefined },
-        msgs,
+        kept,
       );
       const tokens = estimateTokens(system) + messages.reduce((acc, m) => acc + estimateTokens(m.content), 0);
-      // context budget: tokens used vs the configured window (conversation or world cap)
+      const cfg = contextConfig(conv);
+      const estPerMsg = Math.max(80, Math.round(tokens / Math.max(1, messages.length)));
+      const budgetTokens = cfg.maxTokens > 0 ? cfg.maxTokens : cfg.maxMsgs * estPerMsg;
       let cs: Record<string, unknown> = {};
       try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
-      let maxMsgs = Number(cs.context_max_messages ?? getSetting("context_max_messages", 20));
-      let capSource = "partie";
-      const world = conv.world_id ? getWorld(conv.world_id) : null;
-      if (world) {
-        let ws: Record<string, unknown> = {};
-        try { ws = JSON.parse(world.settings || "{}"); } catch { /* ignore */ }
-        const worldCap = Number(ws.context_max_messages ?? getSetting("world_context_max_messages", 0));
-        if (worldCap > 0 && worldCap < maxMsgs) { maxMsgs = worldCap; capSource = "monde"; }
-      }
-      const estPerMsg = Math.max(80, Math.round(tokens / Math.max(1, messages.length)));
-      const budgetTokens = maxMsgs * estPerMsg;
+      const sceneCtrl = (cs.scene_control && typeof cs.scene_control === "object" && !Array.isArray(cs.scene_control) ? cs.scene_control : null) as Record<string, unknown> | null;
+      const hasDm = Boolean(cs.dm && cs.dm_pending);
+      const directives = {
+        one_shot_dm: hasDm,
+        persistent_scene_control: Boolean(sceneCtrl && sceneCtrl.enabled !== false && Object.keys(sceneCtrl).some((k) => k !== "enabled" && Array.isArray((sceneCtrl as any)[k]) && (sceneCtrl as any)[k].length)),
+      };
+      const canon = view.canon && Array.isArray(view.canon) ? view.canon.filter((e: any) => e.status === "confirmed") : [];
       return json({
         tokens,
         systemTokens: estimateTokens(system),
         messageCount: messages.length,
-        keptMessages: Math.min(messages.length, maxMsgs),
+        keptMessages: Math.min(messages.length, cfg.maxMsgs),
         budgetTokens,
         budget: Math.min(100, Math.round((tokens / Math.max(1, budgetTokens)) * 100)),
-        capSource,
+        capSource: cfg.capSource,
+        // inspector payload: the real system prompt + the real message list
+        system,
+        messages: messages.map((m) => ({ role: m.role, content: m.content.slice(0, 2000) })),
+        canon: { count: canon.length, entries: canon.slice(0, 20) },
+        directives,
+        summaryUsed: Boolean(conv.summary),
+        memoryUsed: Boolean(conv.memory_json),
       });
     }
 
@@ -794,7 +1065,7 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "gallery" && parts[
             payload: { conversationId: convId, count: items.length },
             retryable: true,
           },
-          async () => generateCaptions(convId),
+          async (job, api) => generateCaptions(convId, api.signal),
         );
         return json({ captions: result });
       } catch (e) {

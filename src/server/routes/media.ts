@@ -39,7 +39,7 @@ export async function handleMedia(req: Request, url: URL, parts: string[], metho
           cancellable: true,
           retryable: true,
         },
-        async () => generateMessageIllustration(convId, mid, { kind, seed, vary, variation }),
+        async (job, api) => generateMessageIllustration(convId, mid, { kind, seed, vary, variation }, api.signal),
       );
       // the work function stored the meta; same response shape as before, plus
       // the job row so the surface can show progress

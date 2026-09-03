@@ -62,11 +62,27 @@ function serveFile(filePath: string, rootDir?: string): Response | null {
   });
 }
 
+// Set by findAvailablePort once the server is up; needed to lift the per-
+// connection idle timeout on SSE streams (Bun counts a quiet SSE stream as
+// idle and closes it after `idleTimeout` seconds — mid-generation).
+let httpServer: Bun.Server<undefined> | null = null;
+
+async function handleApiRequest(req: Request, url: URL): Promise<Response> {
+  const res = await handleApi(req, url);
+  // Long generations can stream for minutes; without this, Bun closes the
+  // connection at idleTimeout (255s) and the reply is cut off mid-word. Only
+  // streaming responses get the exemption, regular requests keep the timeout.
+  if (httpServer && (res.headers.get("content-type") || "").includes("text/event-stream")) {
+    httpServer.timeout(req, 0);
+  }
+  return res;
+}
+
 function handler(req: Request): Response | Promise<Response> {
   const url = new URL(req.url);
   const p = url.pathname;
 
-  if (p.startsWith("/api/")) return handleApi(req, url);
+  if (p.startsWith("/api/")) return handleApiRequest(req, url);
 
   // static data dirs
   if (p.startsWith("/images/")) {
@@ -101,7 +117,9 @@ function findAvailablePort(start: number, end: number) {
   for (let port = from; port <= to; port++) {
     if (EXCLUDED.has(port)) continue;
     try {
-      return Bun.serve({ port, fetch: handler, idleTimeout: 255 });
+      const s = Bun.serve({ port, fetch: handler, idleTimeout: 255 });
+      httpServer = s;
+      return s;
     } catch {
       console.log(`  port ${port} busy — trying ${port + 1}…`);
     }

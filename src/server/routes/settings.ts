@@ -5,7 +5,6 @@
 import { SECRET_KEYS, json, publicSettings, readJson } from "./core";
 import { getSetting, setSetting } from "../db";
 import { errorResponse } from "../http";
-import { num } from "../validate";
 import { getProvider } from "../../llm/providers";
 
 export async function handleSettings(req: Request, url: URL, parts: string[], method: string): Promise<Response | null> {

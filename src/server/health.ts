@@ -61,8 +61,12 @@ export function resetHealth(): void {
 
 /** Wrap a provider so every call is timed and recorded. */
 export function tracked(provider: ChatProvider): ChatProvider {
-  return {
-    ...provider,
+  // Object.create preserves the prototype chain: class providers define
+  // configured()/models()/… on their prototype, and a plain object spread
+  // ({ ...provider }) copies only own enumerable props, silently dropping
+  // them (configured() was undefined on the wrapper).
+  const wrapped: ChatProvider = Object.create(provider);
+  return Object.assign(wrapped, {
     async *stream(opts: StreamOptions): AsyncGenerator<string> {
       const t0 = Date.now();
       try {
@@ -95,5 +99,5 @@ export function tracked(provider: ChatProvider): ChatProvider {
         throw e;
       }
     },
-  };
+  });
 }

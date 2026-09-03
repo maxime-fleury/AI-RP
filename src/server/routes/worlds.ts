@@ -6,7 +6,7 @@ import { NEGATIVE_PROMPT, buildIllustrationPrompt, generateScenarioIntro, json, 
 import { createLocation, createLorebookEntry, createRelation, createScenario, createTimelineEvent, createWorld, deleteLocation, deleteLorebookEntry, deleteRelation, deleteScenario, deleteTimelineEvent, deleteWorld, getScenario, getSetting, getWorld, listConversations, listLocations, listLorebook, listMessages, listRelations, listScenarios, listTimeline, listWorlds, updateLocation, updateLorebookEntry, updateRelation, updateScenario, updateTimelineEvent, updateWorld } from "../db";
 import { errorResponse } from "../http";
 import { trackJob } from "../jobs";
-import { Codes, apiError, en, fkId, intArray, obj, optStr, str } from "../validate";
+import { Codes, apiError, en, fkId, intArray, optStr, settingsJson, str } from "../validate";
 import { generateAndSave } from "../image";
 import { zipFiles } from "../zip";
 import { applyWorldTemplate, listWorldTemplates } from "../templates";
@@ -31,7 +31,7 @@ if (p === "/api/worlds" && method === "POST") {
         tone: optStr(body.tone, "tone", 200),
         narration_style: optStr(body.narration_style, "narration_style", 200),
         language: optStr(body.language, "language", 20),
-        settings: body.settings !== undefined ? JSON.stringify(obj(body.settings, "settings")) : undefined,
+        settings: settingsJson(body.settings),
       });
       return json(w, 201);
     }
@@ -63,7 +63,7 @@ if (parts[1] === "worlds" && parts[2] && !parts[3] && method === "PATCH") {
       if (body.narration_style !== undefined) patch.narration_style = optStr(body.narration_style, "narration_style", 200);
       if (body.cover !== undefined) patch.cover = optStr(body.cover, "cover", 300);
       if (body.map !== undefined) patch.map = optStr(body.map, "map", 300);
-      if (body.settings !== undefined) patch.settings = JSON.stringify(obj(body.settings, "settings"));
+      if (body.settings !== undefined) patch.settings = settingsJson(body.settings);
       const w = updateWorld(Number(parts[2]), patch);
       return w ? json(w) : json({ error: "not found" }, 404);
     }
@@ -318,7 +318,9 @@ if (parts[1] === "worlds" && parts[2] && parts[3] === "export" && method === "GE
     }
 
 if (parts[1] === "worlds" && parts[2] && parts[3] === "scenarios" && method === "GET") {
-      return json({ scenarios: listScenarios(Number(parts[2])) });
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
+      return json({ scenarios: listScenarios(world.id) });
     }
 
 if (parts[1] === "worlds" && parts[2] && parts[3] === "scenarios" && parts[4] === "generate" && method === "POST") {
@@ -333,8 +335,17 @@ if (parts[1] === "worlds" && parts[2] && parts[3] === "scenarios" && parts[4] ==
     }
 
 if (parts[1] === "worlds" && parts[2] && parts[3] === "scenarios" && method === "POST") {
+      const world = getWorld(Number(parts[2]));
+      if (!world) return json({ error: "not found" }, 404);
       const body = await readJson(req);
-      const s = createScenario({ world_id: Number(parts[2]), ...body });
+      // whitelist fields like /api/scenarios: never trust `world_id` in the
+      // body (the path owns it) and never spread arbitrary fields through
+      const s = createScenario({
+        world_id: world.id,
+        name: str(body.name, "name", { max: 160 }),
+        intro: optStr(body.intro, "intro", 8000),
+        notes: optStr(body.notes, "notes", 4000),
+      });
       return json(s, 201);
     }
 

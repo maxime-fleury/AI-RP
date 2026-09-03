@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { PYTHON_DIR, IMAGES_DIR } from "./paths";
+import { combineSignals } from "./signal";
 
 const PORT = 8770;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -186,7 +187,7 @@ export interface ImageResult {
   ms: number;
 }
 
-export async function generateImage(req: ImageRequest): Promise<ImageResult> {
+export async function generateImage(req: ImageRequest, signal?: AbortSignal): Promise<ImageResult> {
   if (!(await ensureImageServer())) throw new Error(lastError || "Serveur d'images indisponible.");
   // generous timeout: GPU inference can take minutes, but a wedged sidecar must
   // not hold the caller's connection open forever
@@ -196,9 +197,13 @@ export async function generateImage(req: ImageRequest): Promise<ImageResult> {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req),
-      signal: AbortSignal.timeout(300_000),
+      signal: combineSignals(signal, 300_000),
     });
   } catch (e) {
+    // a user-initiated cancel is NOT a wedged sidecar: abort cleanly, do NOT
+    // kill the Python server (that would force a full model reload for the
+    // next request)
+    if (signal?.aborted) throw new Error("Génération annulée");
     // network failure or watchdog timeout → the sidecar is likely wedged on a
     // tight GPU. Reset it NOW so the NEXT request spawns a fresh server instead
     // of every subsequent generation hanging on the dead one.
@@ -250,6 +255,7 @@ export function cacheKeyFor(subdir: string, req: ImageRequest): string {
 export async function generateAndSave(
   subdir: string,
   req: ImageRequest,
+  signal?: AbortSignal,
 ): Promise<SavedImage> {
   const dir = path.join(IMAGES_DIR, subdir);
   fs.mkdirSync(dir, { recursive: true });
@@ -261,11 +267,11 @@ export async function generateAndSave(
     if (fs.existsSync(hit)) {
       return { url: `/images/${subdir}/${key}.png`, seed: req.seed, ms: 0 };
     }
-    const res = await generateImage(req);
+    const res = await generateImage(req, signal);
     fs.writeFileSync(path.join(dir, `${key}.png`), Buffer.from(res.image_base64, "base64"));
     return { url: `/images/${subdir}/${key}.png`, seed: res.seed, ms: res.ms };
   }
-  const res = await generateImage(req);
+  const res = await generateImage(req, signal);
   const file = path.join(dir, `${Date.now()}.png`);
   fs.writeFileSync(file, Buffer.from(res.image_base64, "base64"));
   return { url: `/images/${subdir}/${path.basename(file)}`, seed: res.seed, ms: res.ms };

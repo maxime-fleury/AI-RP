@@ -24,6 +24,8 @@ import {
   listTimeline, createTimelineEvent, updateTimelineEvent, deleteTimelineEvent,
   createJob, listJobs, updateJob, pendingJobs,
   listBranches,
+  listCanon, getCanon, createCanon, updateCanon, deleteCanon, activeCanon,
+  type CanonRow,
 } from "../db";
 import { importFile, scanDirectory, sizeLimitFor, type ImportResult } from "../importCards";
 import { getProvider, defaultModelFor, type ChatMessage } from "../../llm/providers";
@@ -37,6 +39,7 @@ import { IMAGES_DIR, UPLOADS_DIR } from "../paths";
 import { withCharaChunk, placeholderPng } from "../cardExport";
 import { registerJobRetry, trackJob } from "../jobs";
 import { HttpError } from "../http";
+import { combineSignals } from "../signal";
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 // HTTP plumbing, embedded-media helpers and SSE are shared modules — see the
@@ -170,7 +173,7 @@ export function conversationView(id: number): any {
   } catch { /* ignore */ }
   const memory = parseMemory(conv.memory_json);
   const { memory_json, ...rest } = conv;
-  return { ...rest, memory, world, persona, scenario, cards };
+  return { ...rest, memory, world, persona, scenario, cards, canon: listCanon(conv.id) };
 }
 
 export function messageView(m: any) {
@@ -644,6 +647,7 @@ export const NPC_FMT = '{"npcs":[{"name":"Prénom","description":"2 phrases visu
 export async function llmJson(
   prompt: string, sys: string, maxTokens = 700, temperature = 0.7, timeoutMs = 120_000,
   validate?: (parsed: Record<string, unknown> | null) => string | null,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown> | null> {
   const provider = getProvider();
   let model = defaultModelFor(provider.id);
@@ -661,7 +665,7 @@ export async function llmJson(
           { role: "system", content: sys + (extraSys ? " " + extraSys : "") },
           { role: "user", content: prompt },
         ],
-        model, temperature: temp, maxTokens, noThinking: true, signal: AbortSignal.timeout(timeoutMs),
+        model, temperature: temp, maxTokens, noThinking: true, signal: combineSignals(signal, timeoutMs),
       });
       return parseCardAssistJson(text || "");
     } catch (e) {
@@ -792,6 +796,51 @@ export async function suggestLore(conv: ConversationRow, msgs: MessageRow[]): Pr
       .filter((x) => x.name && x.content);
   } catch { /* offline */ }
   return [];
+}
+
+// ─── player-owned canon: AI proposals ────────────────────────────────────────
+// The model reads the recent fiction and proposes stable facts (identities,
+// relations, possessions, promises…). Proposals land in status "proposed" and
+// are only injected into the prompt once the player approves them.
+export const CANON_FMT = '{"facts":[{"subject":"Alba","fact":"Alba est une revenante."}]}';
+
+export async function proposeCanonFacts(convId: number, msgs: MessageRow[], signal?: AbortSignal): Promise<CanonRow[]> {
+  const conv = getConversation(convId);
+  if (!conv) return [];
+  const story = storyMessages(msgs).slice(-20);
+  if (story.length < 2) return [];
+  const existing = listCanon(convId).filter((e) => e.status === "confirmed" || e.status === "proposed");
+  const known = new Set(existing.map((e) => assistKey(e.subject)));
+  const sys = [
+    "Tu es le conservateur du canon d'une partie de roleplay.",
+    "À partir de la fiction ci-dessous, extrais les FAITS STABLES que le joueur doit garder en mémoire : identités, relations durables, lieux visités, objets possédés, promesses, règles du monde révélées.",
+    "Exclus les émotions de scène, les actions ponctuelles, les détails ambigus et ce qui n'est pas encore certain.",
+    "Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : " + CANON_FMT,
+    "Chaque fait est une phrase simple au présent, autonome (pas de pronoms ambigus). 2 à 5 faits maximum.",
+    "JSON complet, non tronqué.",
+  ].join(" ");
+  const p = await llmJson(transcriptFor(story, 40), sys, 800, 0.4, 120_000, undefined, signal);
+  const raw = Array.isArray(p?.facts) ? p.facts : [];
+  const created: CanonRow[] = [];
+  const seen = new Set<string>();
+  for (const f of raw) {
+    const subject = String(f?.subject ?? "").trim().slice(0, 120);
+    const fact = String(f?.fact ?? "").trim().slice(0, 2000);
+    const key = assistKey(subject);
+    if (!subject || !fact || !key) continue;
+    if (known.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    created.push(createCanon({
+      conversation_id: convId,
+      world_id: conv.world_id,
+      subject,
+      fact,
+      status: "proposed",
+      origin: "ai",
+      source_message_id: story[story.length - 1]?.id ?? null,
+    }));
+  }
+  return created;
 }
 
 export async function suggestChapter(title: string, msgs: MessageRow[]): Promise<{ title: string; summary: string } | null> {
@@ -999,7 +1048,7 @@ export function mergeRels(prev: RelState | null, fresh: RelPair[]): { pairs: Rel
   return { pairs, changed };
 }
 
-export async function suggestRelations(known: string[], msgs: MessageRow[]): Promise<RelPair[] | null> {
+export async function suggestRelations(known: string[], msgs: MessageRow[], signal?: AbortSignal): Promise<RelPair[] | null> {
   const knownTxt = known.length ? known.join(", ") : "aucun — utilise les noms tels qu'écrits dans la fiction";
   const sys = [
     "Tu suis une partie de roleplay et tu mets à jour les affinités entre personnages.",
@@ -1010,7 +1059,7 @@ export async function suggestRelations(known: string[], msgs: MessageRow[]): Pro
     'Réponds STRICTEMENT en JSON valide, sans aucun texte autour : {"relations":[{"a":"Personnage A","b":"Personnage B","value":42,"note":"une phrase"}]}.',
     "Quelques liens forts valent mieux qu'un catalogue exhaustif. N'invente jamais un lien absent des scènes ; si personne n'interagit, renvoie {\"relations\":[]}. JSON complet, non tronqué.",
   ].join(" ");
-  const p = await llmJson(transcriptFor(msgs, REL_SCAN_WINDOW), sys, 1200, 0.6);
+  const p = await llmJson(transcriptFor(msgs, REL_SCAN_WINDOW), sys, 1200, 0.6, 120_000, undefined, signal);
   const list = Array.isArray(p?.relations) ? p.relations : null;
   if (!list) return null;
   const strip = (s: unknown) => String(s ?? "").trim().replace(/\s+/g, " ").slice(0, 40);
@@ -1203,15 +1252,80 @@ export function parseCardAssistJson(text: string): Record<string, unknown> | nul
 }
 
 // ─── context window management ────────────────────────────────────────────────
-// Keep only the last N messages for the model; older messages are compressed
+// Keep only the recent messages for the model; older messages are compressed
 // into a rolling summary (updated in the background by the LLM itself).
+// Packing is deterministic and budget-driven: when `context_max_tokens` is set
+// the kept window is sized by TOKENS (complete user/assistant exchanges only),
+// otherwise it falls back to the legacy message-count cap.
 export const SUMMARY_PREFIX = "(Session antérieure résumée)\n";
 
+export function contextConfig(conv: ConversationRow): { maxMsgs: number; maxTokens: number; capSource: string } {
+  let cs: Record<string, unknown> = {};
+  try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  // per-world caps act as a hard ceiling over the conversation's own values,
+  // so a world with a small model can protect every party in it
+  let maxMsgs = Number(cs.context_max_messages ?? getSetting("context_max_messages", 20));
+  let maxTokens = Number(cs.context_max_tokens ?? getSetting("context_max_tokens", 0));
+  let capSource = "partie";
+  const world = conv.world_id ? getWorld(conv.world_id) : null;
+  if (world) {
+    let ws: Record<string, unknown> = {};
+    try { ws = JSON.parse(world.settings || "{}"); } catch { /* ignore */ }
+    const worldMsgs = Number(ws.context_max_messages ?? getSetting("world_context_max_messages", 0));
+    if (worldMsgs > 0) { maxMsgs = Math.min(maxMsgs, worldMsgs); capSource = "monde"; }
+    const worldTokens = Number(ws.context_max_tokens ?? getSetting("world_context_max_tokens", 0));
+    if (worldTokens > 0) {
+      if (maxTokens <= 0) capSource = "monde";
+      maxTokens = maxTokens > 0 ? Math.min(maxTokens, worldTokens) : worldTokens;
+    }
+  }
+  return { maxMsgs: Math.max(4, Math.round(maxMsgs)), maxTokens: Math.max(0, Math.round(maxTokens)), capSource };
+}
+
+/**
+ * Greedy token-budget pack from the END of the thread, keeping complete
+ * user/assistant exchanges. Orphaned assistant replies (a reply whose question
+ * fell outside the window) are dropped so the model never answers into a void.
+ */
+export function packByTokens(history: MessageRow[], msgBudget: number): MessageRow[] {
+  const kept: MessageRow[] = [];
+  let used = 0;
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    const cost = estimateTokens(m.content);
+    if (kept.length && used + cost > msgBudget) break;
+    kept.unshift(m);
+    used += cost;
+  }
+  // drop orphaned assistant replies (no preceding user question in the window)
+  return kept.filter((m, i) => !(m.role === "assistant" && (i === 0 || kept[i - 1].role !== "user")));
+}
+
+/**
+ * Serialized per-conversation summary queue: batches run one after another, so
+ * an older background batch can never overwrite a newer one's state. Each run
+ * also re-checks the watermark and skips when a newer summary already covered
+ * the range (see summarizeMessages).
+ */
+const summaryQueues = new Map<number, Promise<void>>();
+
 export function summarizeOverflow(convId: number, conv: ConversationRow, newMsgs: MessageRow[]): void {
-  // tracked job: queued → running → completed/failed, visible in the activity
-  // panel and retryable from there (the payload keeps the exact message ids so
-  // a retry re-runs the same batch — on failure nothing was committed yet)
-  void trackJob(
+  const prev = summaryQueues.get(convId) ?? Promise.resolve();
+  const next = prev
+    .then(() => runSummarize(convId, newMsgs))
+    .catch((e) => console.error(`[summary] failed (#${convId}):`, String(e?.message ?? e).slice(0, 200)));
+  summaryQueues.set(convId, next);
+  void next.finally(() => {
+    if (summaryQueues.get(convId) === next) summaryQueues.delete(convId);
+  });
+}
+
+async function runSummarize(convId: number, newMsgs: MessageRow[]): Promise<void> {
+  const conv = getConversation(convId);
+  if (!conv) return;
+  const maxId = newMsgs.reduce((a, m) => Math.max(a, m.id), 0);
+  if (Number(conv.summary_msg_id ?? 0) >= maxId) return; // already covered
+  await trackJob(
     {
       type: "summary",
       title: "Résumé du fil",
@@ -1219,10 +1333,30 @@ export function summarizeOverflow(convId: number, conv: ConversationRow, newMsgs
       payload: { conversationId: convId, messageIds: newMsgs.map((m) => m.id) },
       retryable: true,
     },
-    async () => {
-      await summarizeMessages(convId, conv, newMsgs);
+    async (job, api) => {
+      const fresh = getConversation(convId);
+      if (!fresh || Number(fresh.summary_msg_id ?? 0) >= maxId) return;
+      await summarizeMessages(convId, fresh, newMsgs, api.signal);
     },
   ).catch((e) => console.error("[summary] failed:", String(e?.message ?? e).slice(0, 200)));
+}
+
+/**
+ * Pure window computation (no side effects): the message list the model will
+ * actually receive. Token-budget packing when context_max_tokens is set, else
+ * the legacy message-count cap. Shared by applyContextWindow and the context
+ * inspector so what the UI shows is exactly what gets sent.
+ */
+export function computeKept(conv: ConversationRow, history: MessageRow[]): MessageRow[] {
+  const cfg = contextConfig(conv);
+  if (cfg.maxTokens > 0 && history.length > 2) {
+    const msgBudget = Math.max(200, cfg.maxTokens - Math.min(1500, Math.round(cfg.maxTokens * 0.3)));
+    let kept = packByTokens(history, msgBudget);
+    // the message-count cap still acts as a hard ceiling on the number of turns
+    if (kept.length > cfg.maxMsgs) kept = kept.slice(-cfg.maxMsgs);
+    return kept;
+  }
+  return history.slice(-cfg.maxMsgs);
 }
 
 export function applyContextWindow(
@@ -1230,21 +1364,9 @@ export function applyContextWindow(
   conv: ConversationRow,
   history: MessageRow[],
 ): { kept: MessageRow[]; summary?: string; memory?: MemoryState } {
-  let cs: Record<string, unknown> = {};
-  try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
-  // per-world cap acts as a hard ceiling over the conversation's own value,
-  // so a world with a small model can protect every party in it
-  let maxMsgs = Number(cs.context_max_messages ?? getSetting("context_max_messages", 20));
-  const world = conv.world_id ? getWorld(conv.world_id) : null;
-  if (world) {
-    let ws: Record<string, unknown> = {};
-    try { ws = JSON.parse(world.settings || "{}"); } catch { /* ignore */ }
-    const worldCap = Number(ws.context_max_messages ?? getSetting("world_context_max_messages", 0));
-    if (worldCap > 0) maxMsgs = Math.min(maxMsgs, worldCap);
-  }
+  const kept = computeKept(conv, history);
   const memory = parseMemory(conv.memory_json) || undefined;
-  if (history.length <= maxMsgs) return { kept: history, summary: conv.summary || undefined, memory };
-  const kept = history.slice(-maxMsgs);
+  if (kept.length === history.length) return { kept, summary: conv.summary || undefined, memory };
   const firstKeptId = kept[0]?.id ?? 0;
   const overflow = history.filter((m) => m.id < firstKeptId);
   const newMsgs = overflow.filter((m) => m.id > (conv.summary_msg_id ?? 0));
@@ -1437,10 +1559,18 @@ export async function generateSuggestions(ctx: CastContext, history: MessageRow[
   return [];
 }
 
+// one in-flight generation per conversation: a second tab (or a double-click)
+// must never start a parallel turn on the same party
+const activeStreams = new Set<number>();
+
 export async function handleStream(req: Request, convId: number): Promise<Response> {
   const body = await readJson(req);
   const conv = getConversation(convId);
   if (!conv) return json({ error: "conversation not found" }, 404);
+  if (activeStreams.has(convId)) {
+    return json({ error: "Une génération est déjà en cours pour cette partie.", code: "CONFLICT" }, 409);
+  }
+  activeStreams.add(convId);
   // idempotent retries: the client tags every attempt with a uid and re-posts
   // the SAME uid when the connection dropped before any token arrived. If a
   // previous attempt with this uid partially committed (user turn + possibly a
@@ -1610,6 +1740,26 @@ export async function handleStream(req: Request, convId: number): Promise<Respon
       } catch (e) {
         console.warn(`[chat] suggestions échouées (partie #${convId}):`, String(e?.message ?? e).slice(0, 160));
       }
+      // player-owned canon: optional AI proposals after each turn (opt-in via
+      // settings.canon_auto) — proposals land in "proposed" and need approval
+      try {
+        let cs2: Record<string, unknown> = {};
+        try { cs2 = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+        if (cs2.canon_auto) {
+          void trackJob(
+            {
+              type: "canon",
+              title: "Propositions de canon",
+              conversationId: convId,
+              payload: { conversationId: convId },
+              retryable: true,
+            },
+            async (job, api) => {
+              await proposeCanonFacts(convId, listMessages(convId), api.signal);
+            },
+          ).catch((e) => console.warn(`[canon] auto-propose failed (#${convId}):`, String(e?.message ?? e).slice(0, 160)));
+        }
+      } catch { /* ignore */ }
       close();
     } catch (e: any) {
       const aborted = e?.name === "AbortError" || e?.name === "TimeoutError" || /abort/i.test(String(e));
@@ -1655,11 +1805,13 @@ export async function handleStream(req: Request, convId: number): Promise<Respon
       close();
     } finally {
       clearTimeout(llmTimer);
+      activeStreams.delete(convId);
     }
   },
     () => {
       // client disconnected (Stop / tab closed): stop the model generation and
       // clean up the pending exchange
+      activeStreams.delete(convId);
       clientStopped = true;
       llmAbort.abort();
     },
@@ -1676,6 +1828,7 @@ export async function generateMessageIllustration(
   conversationId: number,
   messageId: number,
   opts: { kind?: string; seed?: number; vary?: boolean; variation?: string } = {},
+  signal?: AbortSignal,
 ): Promise<{ url: string; seed?: number; kind: string; character: string | null }> {
   const conv = getConversation(conversationId);
   const m = getMessage(messageId);
@@ -1732,7 +1885,7 @@ export async function generateMessageIllustration(
     seed,
     init_image,
     strength: Number(getSetting("image_ref_strength", 0.55)),
-  });
+  }, signal);
   const meta = { ...messageView(m).meta, image: res.url, image_seed: res.seed, image_kind: kind, image_char: char?.name ?? undefined };
   updateMessage(messageId, { meta: JSON.stringify(meta) });
   return { url: res.url, seed: res.seed, kind, character: char?.name ?? null };
@@ -1743,7 +1896,7 @@ export async function generateMessageIllustration(
  * model writes one-line captions for every illustration, merged into the
  * conversation's captions.json. Returns the merged captions map.
  */
-export async function generateCaptions(conversationId: number): Promise<Record<string, string>> {
+export async function generateCaptions(conversationId: number, signal?: AbortSignal): Promise<Record<string, string>> {
   const conv = getConversation(conversationId);
   if (!conv) throw new HttpError(404, "not found");
   const capFile = path.join(IMAGES_DIR, "conversations", String(conversationId), "captions.json");
@@ -1765,9 +1918,10 @@ export async function generateCaptions(conversationId: number): Promise<Record<s
     for await (const delta of provider.stream({
       messages: [{ role: "system", content: sys }, { role: "user", content: `Illustrations à légender :\n\n${list}` }],
       model, temperature: 0.8, maxTokens: 800, noThinking: true,
-      signal: AbortSignal.timeout(120_000),
+      signal: combineSignals(signal, 120_000),
     })) { text += delta; }
   } catch (e) {
+    if (signal?.aborted) throw new Error("Annulé");
     throw new HttpError(502, `Le modèle n'a pas pu écrire les légendes : ${(e as any)?.message ?? e}`);
   }
   const captions: Record<string, string> = {};
@@ -1789,7 +1943,7 @@ export async function generateCaptions(conversationId: number): Promise<Record<s
  * the recent story and updates the directed affinity graph; refuses politely
  * (reason: empty/threshold/throttle) when a scan isn't due yet.
  */
-export async function scanRelations(conversationId: number, force: boolean): Promise<any> {
+export async function scanRelations(conversationId: number, force: boolean, signal?: AbortSignal): Promise<any> {
   const conv = getConversation(conversationId);
   if (!conv) throw new HttpError(404, "not found");
   const { cs, rels } = relsOf(conv);
@@ -1819,7 +1973,7 @@ export async function scanRelations(conversationId: number, force: boolean): Pro
     if (po?.name) known.push(po.name);
   }
   for (const p of rels?.pairs ?? []) { known.push(p.a, p.b); }
-  const proposed = await suggestRelations([...new Set(known)], story.slice(-REL_SCAN_WINDOW));
+  const proposed = await suggestRelations([...new Set(known)], story.slice(-REL_SCAN_WINDOW), signal);
   if (!proposed) {
     throw new HttpError(502, "L'analyse des relations a échoué — vérifie la connexion au modèle.");
   }
@@ -1833,7 +1987,7 @@ export async function scanRelations(conversationId: number, force: boolean): Pro
 }
 
 /** Rolling-summary work, shared by the tracked job and its retry. */
-async function summarizeMessages(convId: number, conv: ConversationRow, newMsgs: MessageRow[]): Promise<void> {
+async function summarizeMessages(convId: number, conv: ConversationRow, newMsgs: MessageRow[], signal?: AbortSignal): Promise<void> {
   let cs: Record<string, unknown> = {};
   try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
   const provider = getProvider((cs.provider as string) || undefined);
@@ -1851,11 +2005,16 @@ async function summarizeMessages(convId: number, conv: ConversationRow, newMsgs:
   ];
   const text = await provider.complete({
     messages: chat, model, temperature: 0.4, maxTokens: 400, noThinking: true,
-    signal: AbortSignal.timeout(90_000),
+    signal: combineSignals(signal, 90_000),
   });
   const raw = (text || "").trim();
   if (!raw) return;
   const lastId = newMsgs[newMsgs.length - 1]?.id ?? 0;
+  // stale-guard: a NEWER summary already covered this batch's range → drop the
+  // write (prevents an older async batch from clobbering newer state, even
+  // outside the serialized queue — e.g. a retry racing an auto-run).
+  const cur = getConversation(convId);
+  if (!cur || Number(cur.summary_msg_id ?? 0) >= lastId) return;
   const mem = parseMemory(raw);
   if (mem) {
     // structured memory wins: store JSON + keep the readable rendering in sync
@@ -1875,10 +2034,10 @@ async function summarizeMessages(convId: number, conv: ConversationRow, newMsgs:
 // ─── job retry handlers ───────────────────────────────────────────────────────
 // Registered once at module load: a failed/retryable job can be re-queued from
 // the activity panel, re-running the same operation with its stored payload.
-registerJobRetry("captions", async (payload) => {
-  await generateCaptions(Number(payload.conversationId));
+registerJobRetry("captions", async (payload, signal) => {
+  await generateCaptions(Number(payload.conversationId), signal);
 });
-registerJobRetry("image", async (payload) => {
+registerJobRetry("image", async (payload, signal) => {
   const op = String(payload.op || "message");
   if (op === "recap-shot") {
     await renderRecapShot(Number(payload.conversationId), Number(payload.shotIndex));
@@ -1888,17 +2047,22 @@ registerJobRetry("image", async (payload) => {
       seed: payload.seed ? Number(payload.seed) : undefined,
       vary: Boolean(payload.vary),
       variation: String(payload.variation || ""),
-    });
+    }, signal);
   }
 });
-registerJobRetry("relations", async (payload) => {
-  await scanRelations(Number(payload.conversationId), true);
+registerJobRetry("relations", async (payload, signal) => {
+  await scanRelations(Number(payload.conversationId), true, signal);
 });
-registerJobRetry("summary", async (payload) => {
+registerJobRetry("summary", async (payload, signal) => {
   const conv = getConversation(Number(payload.conversationId));
   if (!conv) return;
   const all = listMessages(conv.id);
   const ids = Array.isArray(payload.messageIds) ? payload.messageIds.map(Number) : [];
   const msgs = (ids.length ? ids.map((id) => all.find((m) => m.id === id)).filter(Boolean) : all.slice(-30)) as MessageRow[];
-  if (msgs.length) await summarizeMessages(conv.id, conv, msgs);
+  if (msgs.length) await summarizeMessages(conv.id, conv, msgs, signal);
+});
+registerJobRetry("canon", async (payload, signal) => {
+  const conv = getConversation(Number(payload.conversationId));
+  if (!conv) return;
+  await proposeCanonFacts(conv.id, listMessages(conv.id), signal);
 });

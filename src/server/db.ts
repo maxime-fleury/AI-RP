@@ -141,9 +141,26 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at INTEGER NOT NULL,
   completed_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS canon_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  world_id INTEGER REFERENCES worlds(id) ON DELETE CASCADE,
+  subject TEXT NOT NULL DEFAULT '',
+  fact TEXT NOT NULL DEFAULT '',
+  scope TEXT NOT NULL DEFAULT 'conversation',
+  status TEXT NOT NULL DEFAULT 'confirmed',
+  locked INTEGER NOT NULL DEFAULT 0,
+  source_message_id INTEGER,
+  origin TEXT NOT NULL DEFAULT 'player',
+  priority INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_conv_world ON conversations(world_id);
 CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at);
+CREATE INDEX IF NOT EXISTS idx_canon_conv ON canon_entries(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_canon_status ON canon_entries(status);
 `);
 
 // migrations for pre-existing databases (columns added later)
@@ -750,4 +767,85 @@ export function listBranches(parentId: number): ConversationRow[] {
 
 export function setBranchKind(id: number, kind: string): void {
   db.query("UPDATE conversations SET branch_kind = ? WHERE id = ?").run(kind, id);
+}
+
+// ─── canon entries (player-owned narrative facts) ────────────────────────────
+// Facts the player (or an AI proposal the player approved) pins as canon.
+// status: confirmed (active) | proposed (AI, awaiting approval) | rejected |
+// retired (was confirmed, later overruled — kept for history, never injected).
+// locked entries are immutable by the model: they are marked in the prompt as
+// facts that must never be contradicted.
+export interface CanonRow {
+  id: number;
+  conversation_id: number;
+  world_id: number | null;
+  subject: string;
+  fact: string;
+  scope: string;
+  status: string;
+  locked: number;
+  source_message_id: number | null;
+  origin: string;
+  priority: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export function listCanon(conversationId: number, status?: string): CanonRow[] {
+  if (status) {
+    return db.query("SELECT * FROM canon_entries WHERE conversation_id = ? AND status = ? ORDER BY priority DESC, created_at").all(conversationId, status) as CanonRow[];
+  }
+  return db.query("SELECT * FROM canon_entries WHERE conversation_id = ? ORDER BY priority DESC, created_at").all(conversationId) as CanonRow[];
+}
+
+export function getCanon(id: number): CanonRow | null {
+  return db.query("SELECT * FROM canon_entries WHERE id = ?").get(id) as CanonRow | null;
+}
+
+export function createCanon(c: Partial<CanonRow>): CanonRow {
+  const t = now();
+  const r = db.query(
+    `INSERT INTO canon_entries (conversation_id, world_id, subject, fact, scope, status, locked, source_message_id, origin, priority, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    c.conversation_id ?? 0, c.world_id ?? null, c.subject ?? "", c.fact ?? "",
+    c.scope ?? "conversation", c.status ?? "confirmed", c.locked ? 1 : 0,
+    c.source_message_id ?? null, c.origin ?? "player", c.priority ?? 1, t, t,
+  );
+  return getCanon(Number(r.lastInsertRowid))!;
+}
+
+export function updateCanon(id: number, c: Partial<CanonRow>): CanonRow | null {
+  const cur = getCanon(id);
+  if (!cur) return null;
+  const merged = { ...cur, ...c, id };
+  db.query(
+    `UPDATE canon_entries SET subject=?, fact=?, scope=?, status=?, locked=?, source_message_id=?, priority=?, updated_at=? WHERE id=?`,
+  ).run(
+    merged.subject, merged.fact, merged.scope, merged.status, merged.locked ? 1 : 0,
+    merged.source_message_id, merged.priority, now(), id,
+  );
+  return getCanon(id);
+}
+
+export function deleteCanon(id: number): void {
+  db.query("DELETE FROM canon_entries WHERE id = ?").run(id);
+}
+
+/**
+ * Canon that is currently injected into the model prompt: confirmed entries,
+ * conversation-scoped plus (when a world is attached) world-scoped ones.
+ * Rejected/retired/proposed entries never reach the prompt.
+ */
+export function activeCanon(conversationId: number, worldId: number | null): CanonRow[] {
+  if (worldId != null) {
+    return db.query(
+      `SELECT * FROM canon_entries
+       WHERE status = 'confirmed' AND (conversation_id = ? OR (scope = 'world' AND world_id = ?))
+       ORDER BY priority DESC, created_at`,
+    ).all(conversationId, worldId) as CanonRow[];
+  }
+  return db.query(
+    "SELECT * FROM canon_entries WHERE conversation_id = ? AND status = 'confirmed' ORDER BY priority DESC, created_at",
+  ).all(conversationId) as CanonRow[];
 }

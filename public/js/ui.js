@@ -164,13 +164,19 @@ export function closeAllModals() {
 
 export function confirmModal({ title, message, confirmLabel = "Supprimer", danger = true }) {
   return new Promise((resolve) => {
+    // settle only once: the footer buttons win, but backdrop-click / Escape /
+    // route change (all of which just call close()) must also resolve —
+    // otherwise the awaiting caller hangs forever
+    let settled = false;
+    const finish = (v) => { if (settled) return; settled = true; resolve(v); };
     const { close } = openModal({
       title,
       body: el("p", { style: { lineHeight: "1.6", color: "var(--text-dim)" } }, message),
       footer: [
-        el("button", { class: "btn btn-ghost", onclick: () => { close(); resolve(false); } }, "Annuler"),
-        el("button", { class: `btn ${danger ? "btn-danger" : "btn-primary"}`, onclick: () => { close(); resolve(true); } }, confirmLabel),
+        el("button", { class: "btn btn-ghost", onclick: () => { finish(false); close(); } }, "Annuler"),
+        el("button", { class: `btn ${danger ? "btn-danger" : "btn-primary"}`, onclick: () => { finish(true); close(); } }, confirmLabel),
       ],
+      onClose: () => finish(false),
     });
   });
 }

@@ -331,7 +331,8 @@ function toggleSidebar() {
 
 function providerDot() {
   const p = store.settings.provider;
-  if (p === "openrouter") return store.settings.openrouter_key ? "ok" : "";
+  // openrouter_key is redacted by the server (secret); the presence flag is sent instead
+  if (p === "openrouter") return store.settings.openrouter_key_set ? "ok" : "";
   return "warn";
 }
 function providerLabel() {
@@ -2246,14 +2247,23 @@ async function renderSettings() {
 
   const refreshModels = async () => {
     try {
-      const models = await api(`/api/health`).catch(() => null); // just to keep import
-      void models;
       const prov = providerSel.input.value;
       const res = await apiFetch(`/api/models?provider=${prov}`, { method: "GET" }).catch(() => null);
       let list = [];
       if (res?.ok) list = (await res.json()).models || [];
-      if (prov === "lmstudio" && list.length) {
+      if (!list.length) return;
+      if (prov === "lmstudio") {
         lmModel.input.replaceChildren(...list.map((m) => el("option", { value: m, ...(m === s.lmstudio_model ? { selected: "" } : {}) }, m)));
+      } else {
+        // OpenRouter: catalog is huge, so suggest via a datalist instead of
+        // forcing a select — previously the list was fetched then discarded.
+        let dl = document.getElementById("or-model-suggestions");
+        if (!dl) {
+          dl = el("datalist", { id: "or-model-suggestions" });
+          document.body.append(dl);
+        }
+        dl.replaceChildren(...list.map((m) => el("option", { value: m }, m)));
+        orModel.input.setAttribute("list", "or-model-suggestions");
       }
     } catch { /* ignore */ }
   };
@@ -2559,7 +2569,7 @@ async function renderSettings() {
   const jobsRefresh = el("button", { class: "chip-btn slim", style: { marginLeft: "auto" }, title: "Actualiser", onclick: () => paintJobs() }, "↻");
   const jobsHead = el("div", { class: "jobs-head" }, el("span", { style: { fontSize: "13px", color: "var(--text-dim)" } }, "Images, résumés et légendes s'enregistrent ici (file persistante, reprise après redémarrage)."), jobsRefresh);
   container.append(jobsHead, jobsCard);
-  const statusLabel = { pending: "en attente", running: "en cours", done: "terminé", failed: "échec" };
+  const JOB_GLYPH = { queued: "⏳", running: "⏳", completed: "✓", failed: "✗", retryable: "✗", cancelled: "—" };
   let jobsTimer = null;
   const paintJobs = async () => {
     try {
@@ -2568,16 +2578,17 @@ async function renderSettings() {
         jobs.length
           ? el("div", { class: "jobs-list" }, jobs.map((j) =>
               el("div", { class: "job-row" },
-                el("span", { class: `job-status st-${j.status}` }, j.status === "done" ? "✓" : j.status === "failed" ? "✗" : "⏳"),
+                // the server serializes canonical statuses (queued/running/completed/…)
+                el("span", { class: `job-status st-${j.status}` }, JOB_GLYPH[j.status] || "·"),
                 el("span", { class: "job-type" }, esc(j.type)),
-                el("span", { class: "job-meta" }, `${statusLabel[j.status] || j.status}${j.progress ? " · " + j.progress + "%" : ""} · ${fmtTime(j.created_at)}`),
+                el("span", { class: "job-meta" }, `${j.statusLabel || j.status}${j.progress ? " · " + j.progress + "%" : ""} · ${fmtTime(j.created_at)}`),
                 j.error ? el("span", { class: "job-error" }, esc(String(j.error).slice(0, 90))) : null,
               ),
             ))
           : el("p", { style: { color: "var(--text-dim)", fontSize: "13px" } }, "Aucune tâche enregistrée pour l'instant."),
       );
-      // live refresh while something is still running
-      if (jobs.some((j) => j.status === "running" || j.status === "pending")) {
+      // live refresh while something is still queued or running
+      if (jobs.some((j) => j.status === "queued" || j.status === "running")) {
         clearTimeout(jobsTimer);
         jobsTimer = setTimeout(paintJobs, 4000);
       }

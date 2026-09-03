@@ -2,8 +2,8 @@
  * SillyTavern-inspired prompt assembly for roleplay, plus parsing of assistant
  * output into segments (narration / character dialogue) for display.
  */
-import type { CardRow, ConversationRow, LorebookRow, MessageRow, PersonaRow, ScenarioRow, WorldRow } from "../server/db";
-import { getSetting, activeLorebook } from "../server/db";
+import type { CanonRow, CardRow, ConversationRow, LorebookRow, MessageRow, PersonaRow, ScenarioRow, WorldRow } from "../server/db";
+import { getSetting, activeLorebook, activeCanon } from "../server/db";
 
 export interface NarratorPreset {
   label: string;
@@ -166,6 +166,7 @@ export interface CastContext {
   summary?: string; // rolling summary of events older than the kept history
   memory?: MemoryState; // structured memory (location, characters, goals, facts…)
   lore?: LorebookRow[]; // active lorebook entries (triggers matched), injected below
+  canon?: CanonRow[]; // player-owned canon facts (confirmed only), injected first
 }
 
 export function buildSystemPrompt(ctx: CastContext): string {
@@ -184,6 +185,21 @@ export function buildSystemPrompt(ctx: CastContext): string {
       `## Monde : ${world.name}\n${world.description ? world.description + "\n" : ""}` +
         (world.lore ? `Lore / univers :\n${world.lore}\n` : "") +
         (world.tone ? `Tonalité : ${world.tone}.\n` : ""),
+    );
+  }
+
+  // player-owned canon: confirmed facts inject FIRST (highest authority). Locked
+  // entries are marked as immutable — the model must never contradict them.
+  if (ctx.canon?.length) {
+    const lines = ctx.canon.map((e) => {
+      const tag = e.locked ? " 🔒" : "";
+      const subj = e.subject.trim() ? `${e.subject} — ` : "";
+      return `- ${subj}${e.fact.trim()}${tag}`;
+    });
+    const hasLocked = ctx.canon.some((e) => e.locked);
+    parts.push(
+      `## Canon du récit (faits établis, autorité absolue)\n${lines.join("\n")}\n` +
+        (hasLocked ? "RÈGLE : les faits marqués 🔒 sont verrouillés. Ne les contredis jamais, ne les oublie pas, ne les modifie pas.\n" : ""),
     );
   }
 
@@ -229,6 +245,37 @@ export function buildSystemPrompt(ctx: CastContext): string {
     try { cs = JSON.parse(ctx.conversation.settings || "{}"); } catch { /* ignore */ }
     const preset = presetFromKey(cs.preset);
     if (preset) parts.push(`## Directives de style (« ${preset.label} »)\n${preset.directive}\n`);
+  }
+
+  // persistent scene directives (settings.scene_control) — objectives, required
+  // / forbidden events, NPC agendas, reveal gates. They stay active across turns
+  // (unlike the one-shot DM block below) until the player edits them.
+  {
+    let cs: Record<string, unknown> = {};
+    try { cs = JSON.parse(ctx.conversation.settings || "{}"); } catch { /* ignore */ }
+    const sc = cs.scene_control as Record<string, any> | undefined;
+    if (sc && sc.enabled !== false) {
+      const lines: string[] = [];
+      const arr = (v: unknown) => (Array.isArray(v) ? v.map((x) => String(x ?? "").trim()).filter(Boolean) : []);
+      const objectives = arr(sc.objectives);
+      if (objectives.length) lines.push(`Objectifs de la scène : ${objectives.join(" ; ")}.`);
+      const required = arr(sc.required);
+      if (required.length) lines.push(`Événements à faire advenir : ${required.join(" ; ")}.`);
+      const forbidden = arr(sc.forbidden);
+      if (forbidden.length) lines.push(`Interdits (ne les fais JAMAIS advenir) : ${forbidden.join(" ; ")}.`);
+      if (sc.npc_agendas && typeof sc.npc_agendas === "object" && !Array.isArray(sc.npc_agendas)) {
+        const agenda = Object.entries(sc.npc_agendas as Record<string, unknown>)
+          .map(([k, v]) => `${k} : ${String(v ?? "").trim()}`).filter((s) => s.includes(":") && s.length > 2);
+        if (agenda.length) lines.push(`Agendas des personnages : ${agenda.join(" ; ")}.`);
+      }
+      const gates = arr(sc.reveal_gates);
+      if (gates.length) lines.push(`Révélations à réserver : ${gates.join(" ; ")}.`);
+      const dirs = arr(sc.directives);
+      if (dirs.length) lines.push(dirs.join(" "));
+      if (lines.length) {
+        parts.push(`## Directives de scène persistantes (à respecter tant qu'elles sont actives)\n${lines.join("\n")}\n`);
+      }
+    }
   }
 
   // game-master mode (10.A): one-shot directives applied to the NEXT turn only —
@@ -345,6 +392,11 @@ export function buildMessages(ctx: CastContext, history: MessageRow[]): { system
     if (ctx.world) active.push(...activeLorebook(ctx.world.id, recent));
     active.push(...activeConvLore(ctx.conversation.settings || "{}", recent));
     if (active.length) ctx.lore = active;
+  }
+  // player-owned canon loads automatically when the caller didn't provide it
+  if (!ctx.canon) {
+    const active = activeCanon(ctx.conversation.id, ctx.world?.id ?? null);
+    if (active.length) ctx.canon = active;
   }
   const system = buildSystemPrompt(ctx);
   const personaName = ctx.persona?.name ?? "Moi";
