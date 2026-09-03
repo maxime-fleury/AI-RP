@@ -10,6 +10,7 @@
  */
 import { createJob, getJob, updateJob, type JobRow } from "./db";
 import { sseStream } from "./http";
+import { log } from "./log";
 
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "retryable";
 
@@ -73,7 +74,19 @@ function releaseController(jobId: number): void {
 }
 
 // ─── retry handlers (registered per job type by the routers) ─────────────────
-type RetryFn = (payload: Record<string, unknown>, signal?: AbortSignal) => Promise<void>;
+// Handlers may RETURN a value: it is persisted on the job row (`result`) so a
+// retried assist job actually shows its fresh proposals (see jobView/"Voir").
+type RetryFn = (payload: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
+export const MAX_RESULT_BYTES = 20000;
+
+export function packResult(v: unknown): string {
+  if (v === undefined || v === null) return "";
+  try {
+    return JSON.stringify(v).slice(0, MAX_RESULT_BYTES);
+  } catch {
+    return "";
+  }
+}
 const retryHandlers = new Map<string, RetryFn>();
 
 export function registerJobRetry(type: string, fn: RetryFn): void {
@@ -120,16 +133,22 @@ export function jobProgress(job: JobRow, p: number): void {
   setJob(job.id, { progress: Math.max(0, Math.min(100, Math.round(p))) });
 }
 
-export function jobSucceed(job: JobRow, progress = 100): void {
-  setJob(job.id, { status: "completed", progress, completed_at: Date.now() });
+export function jobSucceed(job: JobRow, progress = 100, result?: unknown): void {
+  setJob(job.id, {
+    status: "completed", progress, completed_at: Date.now(),
+    ...(result !== undefined ? { result: packResult(result) } : {}),
+  });
+  log("jobs", "completed", { jobId: job.id, type: job.type, conversationId: job.conversation_id ?? null });
 }
 
 export function jobFail(job: JobRow, error: unknown, retryable = false): void {
+  const msg = String(error instanceof Error ? error.message : error).slice(0, 400);
   setJob(job.id, {
     status: retryable ? "retryable" : "failed",
-    error: String(error instanceof Error ? error.message : error).slice(0, 400),
+    error: msg,
     completed_at: Date.now(),
   });
+  log("jobs", retryable ? "retryable" : "failed", { jobId: job.id, type: job.type, error: msg.slice(0, 160) });
 }
 
 export function jobCancel(job: JobRow, reason = "Annulé"): void {
@@ -154,8 +173,11 @@ export async function trackJob<T = void>(
   try {
     const result = await work(job, api);
     const cur = getJob(job.id);
-    if (cur && cur.status === "running") jobSucceed(job);
-    return { job, result };
+    if (cur && cur.status === "running") jobSucceed(job, 100, result);
+    // the `job` captured above predates the run (status/progress/result all
+    // changed meanwhile) — return the FRESH row so callers never read stale
+    // fields off it
+    return { job: getJob(job.id) ?? job, result };
   } catch (e) {
     const cur = getJob(job.id);
     if (!cur || cur.status === "running") jobFail(job, e, spec.retryable);
@@ -175,9 +197,17 @@ export function jobView(j: JobRow): any {
   try {
     payloadObj = JSON.parse(j.payload || "{}");
   } catch { /* ignore */ }
+  let resultObj: unknown = null;
+  try {
+    resultObj = j.result ? JSON.parse(j.result) : null;
+  } catch {
+    resultObj = { raw: String(j.result).slice(0, 2000) };
+  }
   return {
     ...j,
     payloadObj,
+    resultObj,
+    hasResult: resultObj !== null && resultObj !== undefined,
     status: canonicalStatus(j.status),
     statusLabel: STATUS_LABELS[canonicalStatus(j.status)] ?? j.status,
   };
@@ -210,9 +240,9 @@ export async function retryJob(id: number): Promise<JobRow | null> {
   const ac = registerController(fresh.id);
   jobRunning(fresh);
   try {
-    await handler(payload, ac.signal);
+    const result = await handler(payload, ac.signal);
     const cur = getJob(fresh.id);
-    if (cur && cur.status === "running") jobSucceed(fresh);
+    if (cur && cur.status === "running") jobSucceed(fresh, 100, result);
   } catch (e) {
     const cur = getJob(fresh.id);
     if (!cur || cur.status === "running") jobFail(fresh, e, old.retryable === 1);

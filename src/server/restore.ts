@@ -34,6 +34,14 @@ export interface BackupPreview {
 
 /** Analyze a parsed backup payload WITHOUT writing anything (restore preview). */
 export function analyzeBackup(b: any): BackupPreview {
+  if (!b || typeof b !== "object") {
+    return {
+      app: null, version: null, exported_at: null, valid: false,
+      counts: { worlds: 0, scenarios: 0, cards: 0, personas: 0, conversations: 0, locations: 0, lorebook: 0, relations: 0, timeline: 0, media: 0 },
+      names: { worlds: [], conversations: [], cards: [], personas: [], scenarios: [] },
+      mediaMB: 0,
+    };
+  }
   const count = (k: string) => (Array.isArray(b[k]) ? b[k].length : 0);
   const names = (k: string, max = 8) =>
     Array.isArray(b[k])

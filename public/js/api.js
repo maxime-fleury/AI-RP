@@ -38,7 +38,12 @@ export async function api(path, opts = {}) {
     throw err;
   }
   const ct = res.headers.get("content-type") || "";
-  return ct.includes("application/json") ? res.json() : res;
+  if (ct.includes("application/json")) {
+    const text = await res.text();
+    if (!text) return {};
+    try { return JSON.parse(text); } catch { return {}; }
+  }
+  return res;
 }
 
 export async function apiFetch(path, options = {}) {
@@ -56,7 +61,11 @@ export async function apiForm(path, formData) {
     try { msg = (await res.json()).error || msg; } catch { /* ignore */ }
     throw new Error(msg);
   }
-  return res.json();
+  const ct = res.headers.get("content-type") || "";
+  if (!ct.includes("application/json")) return {};
+  const text = await res.text();
+  if (!text) return {};
+  try { return JSON.parse(text); } catch { return {}; }
 }
 
 // Read a SSE stream from a fetch response; calls onEvent(type, data)
@@ -82,7 +91,7 @@ export async function readSseStream(res, onEvent, onClose) {
         let data = "";
         for (const line of block.split("\n")) {
           if (line.startsWith("event:")) event = line.slice(6).trim();
-          else if (line.startsWith("data:")) data += line.slice(5).trim();
+          else if (line.startsWith("data:")) data += (data ? "\n" : "") + line.slice(5).replace(/^\s/, "");
         }
         if (data) {
           // parse first, dispatch once: if onEvent itself throws (a handler
@@ -101,16 +110,17 @@ export async function readSseStream(res, onEvent, onClose) {
 }
 
 export function uploadFiles(files) {
-  // files: FileList → [{name, base64}]
+  // files: FileList → [{name, base64, skipped?}]
+  if (!files || typeof files.length !== "number") return Promise.resolve([]);
   const tasks = Array.from(files).map((f) =>
     new Promise((resolve) => {
       if (f.size > 50 * 1024 * 1024) {
-        resolve({ name: f.name, base64: "" });
+        resolve({ name: f.name, base64: "", skipped: `Fichier trop volumineux (>50 Mo) : ${f.name}` });
         return;
       }
       const fr = new FileReader();
-      fr.onload = () => resolve({ name: f.name, base64: String(fr.result).split(",")[1] });
-      fr.onerror = () => resolve({ name: f.name, base64: "" });
+      fr.onload = () => resolve({ name: f.name, base64: String(fr.result).split(",")[1] || "" });
+      fr.onerror = () => resolve({ name: f.name, base64: "", skipped: `Lecture impossible : ${f.name}` });
       fr.readAsDataURL(f);
     }),
   );

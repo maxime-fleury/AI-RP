@@ -6,7 +6,8 @@ import { CHAPTER_MIN_MESSAGES, type Quest, RECAP_MIN_MESSAGES, type RecapData, a
 import { type CanonRow, type ConversationRow, type MessageRow, createCanon, createCard, createConversation, createMessage, deleteCanon, deleteConversation, deleteMessagesAfter, getCanon, getCard, getConversation, getMessage, getPersona, getScenario, getSetting, getWorld, lastMessageOf, listBranches, listCanon, listConversations, listMessages, updateCanon, updateConversation, updateMessage } from "../db";
 import { errorResponse } from "../http";
 import { trackJob } from "../jobs";
-import { Codes, apiError, en, fkId, int, intArray, obj, settingsJson, str } from "../validate";
+import { Codes, apiError, en, fkId, int, intArray, obj, str } from "../validate";
+import { CONVERSATION_SETTING_DEFS, objectSettingsJson } from "../settingsSchema";
 import { runBackup } from "../backup";
 import { zipFiles } from "../zip";
 import { IMAGES_DIR } from "../paths";
@@ -42,7 +43,7 @@ if (p === "/api/conversations" && method === "POST") {
         scenario_id: scenarioId,
         cast: JSON.stringify(cast),
         group_mode: body.group_mode ? 1 : 0,
-        settings: settingsJson(body.settings),
+        settings: objectSettingsJson(body.settings ?? {}, CONVERSATION_SETTING_DEFS, "settings"),
       });
       // opening: scenario intro (or first card greeting)
       let convSettings: Record<string, unknown> = {};
@@ -109,7 +110,7 @@ if (parts[1] === "conversations" && parts[2] && !parts[3] && method === "PATCH")
         patch.cast = JSON.stringify(cast);
       }
       if (body.settings !== undefined) {
-        patch.settings = settingsJson(body.settings);
+        patch.settings = objectSettingsJson(body.settings, CONVERSATION_SETTING_DEFS, "settings");
       }
       if (typeof body.branch_kind === "string") {
         patch.branch_kind = en(body.branch_kind, "branch_kind", ["main", "canon", "alternative", "draft", "abandoned"]);
@@ -556,6 +557,11 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "quests" && method 
       try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
       let quests: Quest[] = [];
       try { quests = Array.isArray(cs.quests) ? cs.quests : []; } catch { /* ignore */ }
+      // refresh + manual list together: refresh wins — say so instead of
+      // silently dropping the manual list
+      const note = body.refresh && Array.isArray(body.quests)
+        ? "analyse IA demandée : la liste manuelle jointe a été ignorée"
+        : undefined;
       if (body.refresh) {
         console.log(`[quests] 📜 conversation #${convId} « ${(conv.title || "").slice(0, 50)} » — analyse IA`);
         try {
@@ -578,7 +584,7 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "quests" && method 
       }
       cs.quests = quests;
       updateConversation(convId, { settings: JSON.stringify(cs) });
-      return json({ quests });
+      return json(note ? { quests, note } : { quests });
     }
 
 if (parts[1] === "conversations" && parts[2] && parts[3] === "fork" && method === "POST") {

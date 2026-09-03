@@ -44,8 +44,32 @@ function u32(v: number): Uint8Array {
   return new Uint8Array([v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
 }
 
+/** Sanitize an archive path against Zip-Slip (no `..`, no absolute, no drive). */
+export function safeZipPath(p: string): string {
+  let s = String(p || "").replace(/\\/g, "/");
+  s = s.replace(/^\uFEFF/, "");
+  // strip drive letters, leading slashes and null bytes
+  s = s.replace(/^[a-zA-Z]:/, "").replace(/\0/g, "");
+  const parts = s.split("/").filter((seg) => seg && seg !== "." && seg !== "..");
+  return parts.join("/").slice(0, 256) || "file";
+}
+
 /** Build a ZIP archive (store-only). `files` = [{ path, data }] with forward-slash paths. */
 export function zipFiles(files: { path: string; data: Uint8Array | string }[]): Uint8Array {
+  if (files.length > 65000) throw new Error("Trop de fichiers pour une archive ZIP");
+  const seen = new Set<string>();
+  files = files.map((f, i) => {
+    let p = safeZipPath(f.path);
+    // dedupe identical names inside one archive (second file would shadow the first)
+    if (seen.has(p)) {
+      const dot = p.lastIndexOf(".");
+      const stem = dot > 0 ? p.slice(0, dot) : p;
+      const ext = dot > 0 ? p.slice(dot) : "";
+      p = `${stem}-${i}${ext}`;
+    }
+    seen.add(p);
+    return { ...f, path: p };
+  });
   const localParts: Uint8Array[] = [];
   const centralParts: Uint8Array[] = [];
   let offset = 0;

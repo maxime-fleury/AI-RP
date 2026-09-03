@@ -78,45 +78,79 @@ export async function handleBackups(req: Request, url: URL, parts: string[], met
     }
 
     if (p === "/api/export" && method === "GET") {
-      const conversations = listConversations().map((c) => {
-        let cast: unknown = [];
-        let settings: unknown = {};
-        try { cast = JSON.parse(c.cast); } catch { /* ignore */ }
-        try { settings = JSON.parse(c.settings); } catch { /* ignore */ }
-        // parse the JSON-stringified columns (segments, meta) so the backup file
-        // is clean JSON — restoring it must not double-encode them
-        return { ...c, cast, settings, messages: listMessages(c.id).map(messageView) };
-      });
-      const payload: any = {
-        app: "innsekai",
-        version: 1,
-        exported_at: new Date().toISOString(),
-        worlds: listWorlds(),
-        locations: listWorlds().flatMap((w) => listLocations(w.id)),
-        lorebook: listWorlds().flatMap((w) => listLorebook(w.id)),
-        relations: listWorlds().flatMap((w) => listRelations(w.id)),
-        scenarios: listScenarios(),
-        cards: listCards(),
-        personas: listPersonas(),
-        conversations,
-        timeline_events: listWorlds().flatMap((w) => listTimeline(w.id)),
-      };
-      // make the export self-contained: embed every referenced illustration /
-      // avatar as base64, so a restore brings the images back too
+      // STREAMED export: sections are serialized one at a time instead of
+      // building the whole backup (DB rows + every image as base64) as a
+      // single giant string. Peak memory is one section / one file, not the
+      // entire library. Shape note: "media" is now always present (possibly
+      // {}) — restore/preview treat {} and missing identically.
+      const worlds = listWorlds();
+      const encoder = new TextEncoder();
       const urls = new Set<string>();
-      collectMediaUrls(payload, urls);
-      const media: Record<string, string> = {};
-      for (const u of urls) {
-        const file = mediaFileFor(u);
-        if (!file) continue;
-        try {
-          const st = fs.statSync(file);
-          if (!st.isFile()) continue;
-          media[u] = fs.readFileSync(file).toString("base64");
-        } catch { /* vanished between scan and read */ }
-      }
-      if (Object.keys(media).length) payload.media = media;
-      return json(payload);
+      const stream = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          const send = (s: string) => controller.enqueue(encoder.encode(s));
+          try {
+            send(`{"app":"innsekai","version":1,"exported_at":${JSON.stringify(new Date().toISOString())},`);
+            const section = (name: string, items: unknown[]) => {
+              send(`${JSON.stringify(name)}:[`);
+              items.forEach((it, i) => {
+                collectMediaUrls(it, urls);
+                if (i) send(",");
+                send(JSON.stringify(it));
+              });
+              send("],");
+            };
+            section("worlds", worlds);
+            section("locations", worlds.flatMap((w) => listLocations(w.id)));
+            section("lorebook", worlds.flatMap((w) => listLorebook(w.id)));
+            section("relations", worlds.flatMap((w) => listRelations(w.id)));
+            section("scenarios", listScenarios());
+            section("cards", listCards());
+            section("personas", listPersonas());
+            // conversations + parsed columns, one party at a time
+            send(`"conversations":[`);
+            const convs = listConversations();
+            convs.forEach((c, i) => {
+              let cast: unknown = [];
+              let settings: unknown = {};
+              try { cast = JSON.parse(c.cast); } catch { /* ignore */ }
+              try { settings = JSON.parse(c.settings); } catch { /* ignore */ }
+              // parse the JSON-stringified columns (segments, meta) so the
+              // backup file is clean JSON — restoring it must not
+              // double-encode them
+              const row = { ...c, cast, settings, messages: listMessages(c.id).map(messageView) };
+              collectMediaUrls(row, urls);
+              if (i) send(",");
+              send(JSON.stringify(row));
+            });
+            send("],");
+            section("timeline_events", worlds.flatMap((w) => listTimeline(w.id)));
+            // self-contained media: embed every referenced illustration /
+            // avatar as base64, one file at a time
+            send(`"media":{`);
+            let first = true;
+            for (const u of urls) {
+              const file = mediaFileFor(u);
+              if (!file) continue;
+              try {
+                const st = fs.statSync(file);
+                if (!st.isFile()) continue;
+                const b64 = fs.readFileSync(file).toString("base64");
+                if (!first) send(",");
+                first = false;
+                send(`${JSON.stringify(u)}:${JSON.stringify(b64)}`);
+              } catch { /* vanished between scan and read */ }
+            }
+            send("}}");
+            controller.close();
+          } catch (e) {
+            controller.error(e);
+          }
+        },
+      });
+      return new Response(stream, {
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+      });
     }
 
     return null;

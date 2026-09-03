@@ -19,6 +19,7 @@ jobs:
       - run: |
           # strict ESM parse (sloppy node --check lets TS-annotations slip through)
           for f in public/js/*.js; do node --input-type=module --check < "$f"; done
-          N=$(grep -ho '?v=[0-9]*' public/index.html public/js/app.js public/js/chat.js | sort -u | wc -l)
+          N=$(grep -ho '?v=[0-9]*' public/index.html public/js/*.js | sort -u | wc -l)
           test "$N" = "1" || (echo "❌ cache-buster ?v= désynchronisés ($N versions trouvées)" && exit 1)
+      - run: bun run typecheck
       - run: bun run check

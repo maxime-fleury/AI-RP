@@ -121,8 +121,21 @@ function jobRow(j) {
       } catch (e) { toast(e.message, "err"); }
     } }, "↻ Réessayer"));
   }
+  // persisted work result (assist proposals, image URL, scan summary…) —
+  // without this, retrying an assist job completed invisibly
+  if (j.hasResult && j.resultObj) {
+    actions.push(el("button", { class: "mini-btn", title: "Voir le résultat enregistré de cette tâche", onclick: () => {
+      const { close } = openModal({
+        title: `Résultat — ${title}`,
+        sub: "Enregistré à la fin de la tâche. Pour réutiliser une proposition d'assistance, relance l'éditeur correspondant.",
+        body: el("pre", { class: "ctx-pre", style: { maxHeight: "50vh", overflow: "auto" } }, JSON.stringify(j.resultObj, null, 2)),
+        footer: [el("button", { class: "btn btn-ghost", onclick: () => close() }, "Fermer")],
+      });
+    } }, "👁 Voir"));
+  }
   const title = j.title || j.type;
   const metaBits = [];
+  if (JOB_TYPE_LABEL[j.type]) metaBits.push(JOB_TYPE_LABEL[j.type]);
   if (j.conversation_id) metaBits.push(`partie #${j.conversation_id}`);
   if (j.progress > 0 && j.progress < 100 && (j.status === "queued" || j.status === "running")) metaBits.push(`${j.progress} %`);
   metaBits.push(fmtTime(j.created_at));
@@ -141,13 +154,60 @@ function jobRow(j) {
   );
 }
 
+const JOB_TYPE_LABEL = {
+  image: "🖼 Image", captions: "🏷 Légendes", relations: "💞 Relations", summary: "📝 Résumé",
+  canon: "📖 Canon", assist: "✨ Assistance", "recap-shot": "🎬 Récap",
+};
+let activityFilter = "all"; // all | active | failed
+
 export function openActivityPanel() {
   const box = el("div", { class: "activity-panel" });
+  const filterBar = el("div", { class: "job-filters" });
   const render = () => {
-    const list = jobs.list.length
-      ? el("div", { class: "jobs-list" }, ...jobs.list.map(jobRow))
-      : el("p", { style: { color: "var(--text-dim)", fontSize: "13px" } }, "Aucune tâche enregistrée — images, récaps, légendes et analyses IA apparaîtront ici.");
-    box.replaceChildren(list);
+    const counts = {
+      active: jobs.list.filter((j) => j.status === "queued" || j.status === "running").length,
+      failed: jobs.list.filter((j) => j.status === "failed" || j.status === "retryable" || j.status === "cancelled").length,
+    };
+    const chip = (key, label) => el("button", {
+      class: `chip-btn${activityFilter === key ? " on" : ""}`,
+      onclick: () => { activityFilter = key; render(); },
+    }, label);
+    const retryable = jobs.list.filter((j) =>
+      (j.status === "failed" || j.status === "retryable" || j.status === "cancelled") && j.retryable);
+    const retryAll = retryable.length
+      ? el("button", {
+        class: "mini-btn", title: `Relancer ${retryable.length} tâche(s) en échec`,
+        onclick: async (e) => {
+          e.currentTarget.disabled = true;
+          let ok = 0;
+          for (const j of retryable) {
+            try { const r = await api(`/api/jobs/${j.id}/retry`, { body: {} }); upsertJob(r.job); ok++; }
+            catch { /* keep going — each row reports its own error */ }
+          }
+          toast(ok ? `${ok} tâche(s) relancée(s) ✓` : "Relance impossible", ok ? "ok" : "err");
+          paintActivityBadge();
+          render();
+        },
+      }, `↻ Tout réessayer (${retryable.length})`)
+      : null;
+    filterBar.replaceChildren(
+      chip("all", `Toutes (${jobs.list.length})`),
+      chip("active", `En cours (${counts.active})`),
+      chip("failed", `En échec (${counts.failed})`),
+      retryAll,
+    );
+    const visible = jobs.list.filter((j) => {
+      if (activityFilter === "active") return j.status === "queued" || j.status === "running";
+      if (activityFilter === "failed") return j.status === "failed" || j.status === "retryable" || j.status === "cancelled";
+      return true;
+    });
+    const list = visible.length
+      ? el("div", { class: "jobs-list" }, ...visible.map(jobRow))
+      : el("p", { style: { color: "var(--text-dim)", fontSize: "13px" } },
+        activityFilter === "all"
+          ? "Aucune tâche enregistrée — images, récaps, légendes et analyses IA apparaîtront ici."
+          : "Rien dans cette catégorie.");
+    box.replaceChildren(filterBar, list);
   };
   const modal = openModal({
     title: "Activité en arrière-plan",
@@ -349,10 +409,11 @@ function globalSearch(query) {
   const q = query.trim().toLowerCase();
   if (!q) return [];
   const results = [];
-  for (const c of store.conversations) if (!c.archived && `${c.title} ${c.last_message}`.toLowerCase().includes(q)) results.push({ type: "Partie", label: c.title, href: `#/chat/${c.id}` });
-  for (const w of store.worlds) if (`${w.name} ${w.description} ${w.lore}`.toLowerCase().includes(q)) results.push({ type: "Monde", label: w.name, href: `#/world/${w.id}` });
-  for (const c of store.cards) if (`${c.name} ${c.description} ${c.personality} ${c.tags || ""}`.toLowerCase().includes(q)) results.push({ type: "Carte", label: c.name, href: "#/cards" });
-  for (const p of store.personas) if (`${p.name} ${p.description}`.toLowerCase().includes(q)) results.push({ type: "Persona", label: p.name, href: "#/personas" });
+  const text = (...parts) => parts.map((p) => (p == null ? "" : String(p))).join(" ").toLowerCase();
+  for (const c of store.conversations) if (!c.archived && text(c.title, c.last_message).includes(q)) results.push({ type: "Partie", label: c.title, href: `#/chat/${c.id}` });
+  for (const w of store.worlds) if (text(w.name, w.description, w.lore).includes(q)) results.push({ type: "Monde", label: w.name, href: `#/world/${w.id}` });
+  for (const c of store.cards) if (text(c.name, c.description, c.personality, c.tags || "").includes(q)) results.push({ type: "Carte", label: c.name, href: "#/cards" });
+  for (const p of store.personas) if (text(p.name, p.description).includes(q)) results.push({ type: "Persona", label: p.name, href: "#/personas" });
   return results.slice(0, 20);
 }
 
@@ -372,7 +433,7 @@ function openCommandPalette() {
   const paint = () => {
     const q = input.value.trim();
     const matches = q ? globalSearch(q).map((r) => [r.label, () => navigate(r.href), r.type]) : commands.map((r) => [r[0], r[1], "Commande"]);
-    results.replaceChildren(...matches.map(([label, action, type]) => el("button", { class: "palette-item", onclick: () => { close(); action(); } }, el("span", { class: "chip" }, type), el("span", {}, label))));
+    results.replaceChildren(...matches.map(([label, action, type], i) => el("button", { class: `palette-item${i === 0 ? " selected" : ""}`, onclick: () => { close(); action(); } }, el("span", { class: "chip" }, type), el("span", {}, label))));
     if (!matches.length) results.append(el("div", { class: "palette-empty" }, "Aucun résultat"));
     selectedIndex = 0;
   };
@@ -529,7 +590,10 @@ document.addEventListener("keydown", (e) => {
 // ─── mobile sidebar drawer ────────────────────────────────────────────────────
 const menuBtn = () => document.getElementById("menu-btn");
 menuBtn()?.addEventListener("click", () => {
-  document.getElementById("sidebar")?.classList.toggle("open");
+  const bar = document.getElementById("sidebar");
+  bar?.classList.toggle("open");
+  const btn = menuBtn();
+  if (btn) btn.setAttribute("aria-expanded", String(bar?.classList.contains("open") ?? false));
 });
 document.getElementById("sidebar")?.addEventListener("click", (e) => {
   if (e.target.closest("a")) document.getElementById("sidebar")?.classList.remove("open");
@@ -915,7 +979,7 @@ function worldModal(existing) {
                 toast(`Modèle « ${t.name} » appliqué ✓ — tout est modifiable dans le monde`);
                 announce(`Monde créé depuis le modèle ${t.name}`);
                 await refreshAll();
-                navigate(`#/worlds/${r.worldId}`);
+                navigate(`#/world/${r.worldId}`);
               } catch (e) {
                 toast(e.message, "err");
                 templateBox.classList.remove("busy");
@@ -1023,9 +1087,11 @@ async function renderWorldDetail(id) {
         const blob = await res.blob();
         const a = document.createElement("a");
         a.href = URL.createObjectURL(blob);
-        a.download = `${world.name.replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-") || "monde"}.zip`;
+        a.download = `${String(world.name || "").replace(/[^\p{L}\p{N}\- ]+/gu, "").trim().replace(/\s+/g, "-") || "monde"}.zip`;
+        document.body.append(a);
         a.click();
-        URL.revokeObjectURL(a.href);
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 1000);
         toast("Monde exporté (ZIP) ✓");
       } catch (err) { toast(err.message, "err"); }
       b.disabled = false;
@@ -1041,10 +1107,11 @@ async function renderWorldDetail(id) {
         img.addEventListener("load", () => {
           const pins = el("div", { class: "map-pins" });
           locations.forEach((name, i) => {
-            pins.append(el("div", { class: "map-pin", style: { left: (12 + ((i * 53 + 17) % 76)) + "%", top: (12 + ((i * 37 + 29) % 70)) + "%" }, title: name }, "📍"));
+            const label = String(name ?? "");
+            pins.append(el("div", { class: "map-pin", style: { left: (12 + ((i * 53 + 17) % 76)) + "%", top: (12 + ((i * 37 + 29) % 70)) + "%" }, title: label, "aria-label": label }, "📍"));
           });
           mapBox.replaceChildren(img, pins);
-          if (locations.length) mapBox.append(el("div", { class: "map-legend" }, locations.map((l) => el("span", { class: "chip" }, "📍 " + esc(l)))));
+          if (locations.length) mapBox.append(el("div", { class: "map-legend" }, locations.map((l) => el("span", { class: "chip" }, "📍 " + esc(String(l ?? ""))))));
         });
         img.addEventListener("error", () => mapBox.replaceChildren(el("div", { class: "empty", style: { padding: "22px" } }, el("p", {}, "Carte introuvable — régénère-la."))));
       } else {
@@ -1792,7 +1859,10 @@ async function doImport(files) {
   if (!files || !files.length) return;
   try {
     const list = await uploadFiles(files);
-    const res = await api("/api/import", { body: { files: list } });
+    for (const f of list) if (f.skipped) toast(f.skipped, "warn");
+    const payload = list.filter((f) => f.base64);
+    if (!payload.length) { toast("Aucun fichier importable", "warn"); return; }
+    const res = await api("/api/import", { body: { files: payload } });
     const report = res.report || [];
     const imported = report.filter((r) => r.status === "imported").length;
     const duplicates = report.filter((r) => r.status === "duplicate");
@@ -2023,6 +2093,7 @@ function cardModal(existing) {
       assistStatus.textContent = any ? "Choisis ta préférée dans chaque champ ✨" : "Le modèle n'a rien proposé — réessaie ou vérifie la connexion IA.";
       assistRegen.hidden = !any;
       if (any) toast("Propositions générées ✓", "ok");
+      if (r.truncated) toast(r.note || "Idée tronquée.", "warn");
     } catch (e) {
       assistStatus.hidden = true;
       toast(String(e?.message || e), "err");
@@ -2195,6 +2266,13 @@ function personaModal(existing) {
 // ─── settings ─────────────────────────────────────────────────────────────────
 async function renderSettings() {
   const s = store.settings;
+  // single source of truth: the server schema drives field bounds + save-time
+  // pre-validation (best-effort — the server re-validates everything anyway)
+  let settingsSchema = null;
+  api("/api/settings/schema").then((r) => {
+    settingsSchema = r.settings || null;
+    applySchemaBounds();
+  }).catch(() => { /* offline — fall back to hardcoded bounds */ });
   const container = el("div", {},
     el("div", { class: "page-head" },
       el("div", {},
@@ -2226,7 +2304,10 @@ async function renderSettings() {
   });
   const lmUrl = field("URL LM Studio (API)", s.lmstudio_url || "http://localhost:1234/v1", { placeholder: "http://localhost:1234/v1" });
   const orKey = field("Clé API OpenRouter", s.openrouter_key || "", { type: "password", placeholder: "sk-or-v1-…" });
-  const lmModel = field("Modèle LM Studio", s.lmstudio_model || "", { placeholder: "Chargement…" });
+  const lmModel = field("Modèle LM Studio", s.lmstudio_model || "", {
+    type: "select",
+    options: s.lmstudio_model ? [[s.lmstudio_model, s.lmstudio_model]] : [["", "Chargement…"]],
+  });
   const orModel = field("Modèle OpenRouter", s.openrouter_model || "", { placeholder: "Ex: anthropic/claude-3.7-sonnet" });
   // ── narrator style presets (built-ins + user overrides, editable below) ──
   const narrMap = {}; // key → { label, prompt, custom, dirty }
@@ -2253,7 +2334,10 @@ async function renderSettings() {
       if (res?.ok) list = (await res.json()).models || [];
       if (!list.length) return;
       if (prov === "lmstudio") {
-        lmModel.input.replaceChildren(...list.map((m) => el("option", { value: m, ...(m === s.lmstudio_model ? { selected: "" } : {}) }, m)));
+        const cur = lmModel.input.value || s.lmstudio_model || "";
+        const opts = list.includes(cur) ? list : (cur ? [cur, ...list] : list);
+        lmModel.input.replaceChildren(...opts.map((m) => el("option", { value: m, ...(m === cur ? { selected: "" } : {}) }, m)));
+        if (cur) lmModel.input.value = cur;
       } else {
         // OpenRouter: catalog is huge, so suggest via a datalist instead of
         // forcing a select — previously the list was fetched then discarded.
@@ -2282,9 +2366,33 @@ async function renderSettings() {
     el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "12px" } },
       "LM Studio : lance le serveur local (onglet Developer → Start Server, port 1234). OpenRouter : colle ta clé API — les deux peuvent être utilisés et le choix se fait au lancement de partie. Le style du narrateur s'applique aux nouvelles réponses.",
     ),
-    el("div", { style: { marginTop: "14px" } },
+    el("div", { style: { marginTop: "14px", display: "flex", gap: "8px", flexWrap: "wrap" } },
       el("button", { class: "btn btn-ghost btn-sm", onclick: testServices }, "🧪 Tester tous les services"),
-      el("div", { id: "services-test", style: { marginTop: "10px" } }),
+      el("button", {
+        class: "btn btn-ghost btn-sm", title: "Copie versions, santé des fournisseurs et erreurs récentes — à coller dans un rapport de bug",
+        onclick: async (e) => {
+          const b = e.currentTarget;
+          b.disabled = true;
+          try {
+            const d = await api("/api/diagnostics");
+            const text = JSON.stringify(d, null, 2);
+            try { await navigator.clipboard.writeText(text); }
+            catch {
+              const ta = document.createElement("textarea");
+              ta.value = text;
+              ta.style.position = "fixed";
+              ta.style.opacity = "0";
+              document.body.append(ta);
+              ta.select();
+              document.execCommand("copy");
+              ta.remove();
+            }
+            toast("Diagnostic copié — colle-le dans ton rapport de bug ✓");
+          } catch (err) { toast(err.message, "err"); }
+          b.disabled = false;
+        },
+      }, "📋 Copier le diagnostic"),
+      el("div", { id: "services-test", style: { marginTop: "10px", flexBasis: "100%" } }),
     ),
     el("div", { style: { marginTop: "18px", borderTop: "1px solid var(--border)", paddingTop: "14px" } },
       el("div", { class: "row", style: { justifyContent: "space-between" } },
@@ -2510,8 +2618,10 @@ async function renderSettings() {
           const a = document.createElement("a");
           a.href = URL.createObjectURL(blob);
           a.download = `innsekai-backup-${new Date().toISOString().slice(0, 10)}.json`;
+          document.body.append(a);
           a.click();
-          URL.revokeObjectURL(a.href);
+          a.remove();
+          setTimeout(() => URL.revokeObjectURL(a.href), 1000);
           toast("Sauvegarde téléchargée ✓");
         } catch (e) { toast(e.message, "err"); }
       } }, "⬇️ Exporter tout (mondes, cartes, parties)"),
@@ -2596,9 +2706,48 @@ async function renderSettings() {
   };
   paintJobs();
 
+  // apply server schema bounds to the number fields (provider options stay
+  // hardcoded — the enum rarely changes and the select needs labels anyway)
+  const schemaNumFields = [
+    [llmTimeout, "llm_timeout"],
+    [imgSteps, "image_steps"],
+    [imgCfg, "image_cfg"],
+  ];
+  function applySchemaBounds() {
+    if (!settingsSchema) return;
+    for (const [f, key] of schemaNumFields) {
+      const def = settingsSchema[key];
+      if (!def) continue;
+      if (def.min !== undefined) f.input.setAttribute("min", String(def.min));
+      if (def.max !== undefined) f.input.setAttribute("max", String(def.max));
+    }
+  }
+  // client-side pre-validation: catch out-of-range numbers BEFORE the PATCH
+  // so the user sees which field is wrong (server would 400 the whole save)
+  function prevalidateSettings() {
+    if (!settingsSchema) return null;
+    for (const [f, key] of schemaNumFields) {
+      const def = settingsSchema[key];
+      if (!def) continue;
+      const n = Number(f.input.value);
+      if (!Number.isFinite(n)) return { key, msg: `${def.desc} doit être un nombre` };
+      if ((def.min !== undefined && n < def.min) || (def.max !== undefined && n > def.max)) {
+        return { key, msg: `${def.desc} doit être entre ${def.min} et ${def.max}` };
+      }
+    }
+    return null;
+  }
+
   container.append(el("div", { class: "settings-save" },
     el("button", { class: "btn btn-primary", style: { padding: "12px 30px" }, onclick: async () => {
       try {
+        const bad = prevalidateSettings();
+        if (bad) {
+          const hit = schemaNumFields.find(([, k]) => k === bad.key);
+          hit?.[0]?.input?.focus?.();
+          toast(bad.msg, "err");
+          return;
+        }
         await api("/api/settings", {
           method: "PATCH",
           body: {
@@ -3020,6 +3169,7 @@ function guidedWizard() {
       const r = await api("/api/assist/build", { body: { stage: "worlds", description: st.desc, feedback: feedback || "" } });
       if (requestId !== st.requests.worlds || viewVersion !== st.viewVersion) return;
       st.memo.worlds = r;
+      if (r.truncated) toast(r.note || "Description tronquée.", "warn");
       paintBatch(r);
     } catch (e) {
       if (requestId !== st.requests.worlds || viewVersion !== st.viewVersion) return;
@@ -3108,6 +3258,7 @@ function guidedWizard() {
       if (requestId !== st.requests.personas || viewVersion !== st.viewVersion) return;
       st.memo.personas = r;
       st.memo.personasKey = batchKey;
+      if (r.truncated) toast(r.note || "Description tronquée.", "warn");
       paintBatch(r);
     } catch (e) {
       if (requestId !== st.requests.personas || viewVersion !== st.viewVersion) return;
@@ -3166,6 +3317,7 @@ function guidedWizard() {
       paint();
       try {
         const r = await api("/api/assist/build", { body: { stage: "cards", description: st.desc, world: st.world, character: { name: ch.name, role: ch.role, detail: ch.detail || "" }, feedback: feedback || "" } });
+        if (r.truncated) toast(r.note || "Description tronquée.", "warn");
         ch.cards = (r.proposals || []).filter((p2) => p2 && p2.name).slice(0, 4);
         ch.status = "";
         if (!ch.cards.length) ch.status = "Le modèle n'a rien proposé pour « " + ch.name + " » — affine ci-dessous.";
@@ -3267,6 +3419,7 @@ function guidedWizard() {
     try {
       const r = await api("/api/assist/build", { body: { stage: "characters", description: st.desc, world: st.world, persona: st.persona, feedback: "" } });
       if (requestId !== st.requests.characters || viewVersion !== st.viewVersion) return;
+      if (r.truncated) toast(r.note || "Description tronquée.", "warn");
       status.hidden = true;
       // Keep a manual character added while the extraction request was in
       // flight; the user should never lose edits because the model answered.

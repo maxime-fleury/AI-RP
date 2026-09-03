@@ -7,7 +7,7 @@
     "dev": "bun run --watch src/index.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "check": "bun build src/index.ts --outdir /tmp/innsekai-build --target=bun && bun test"
+    "check": "bun run typecheck && bun build src/index.ts --outdir /tmp/innsekai-build --target=bun && bun test"
   },
   "devDependencies": {
     "@types/bun": "latest",

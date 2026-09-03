@@ -14,15 +14,40 @@ const BACKUPS_DIR = path.join(DATA_DIR, "backups");
 const KEEP = 7; // calendar-day snapshots kept
 const KEEP_FORCED = 14; // extra safety-net snapshots kept (they can pile up)
 
+/** SHA-256 of a file without loading it whole into RAM (1 MB slices). */
+function sha256File(file: string): string {
+  const fd = fs.openSync(file, "r");
+  try {
+    const hasher = new Bun.CryptoHasher("sha256");
+    const buf = Buffer.alloc(1024 * 1024);
+    let pos = 0;
+    for (;;) {
+      const n = fs.readSync(fd, buf, 0, buf.length, pos);
+      if (n <= 0) break;
+      hasher.update(buf.subarray(0, n));
+      pos += n;
+    }
+    return hasher.digest("hex");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function dirSize(dir: string): number {
   if (!fs.existsSync(dir)) return 0;
   // a plain file (the SQLite db) counts its own size
-  if (fs.statSync(dir).isFile()) return fs.statSync(dir).size;
+  try {
+    if (fs.statSync(dir).isFile()) return fs.statSync(dir).size;
+  } catch { return 0; }
   let total = 0;
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+  let entries: fs.Dirent[] = [];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return 0; }
+  for (const entry of entries) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) total += dirSize(full);
-    else if (entry.isFile()) total += fs.statSync(full).size;
+    else if (entry.isFile()) {
+      try { total += fs.statSync(full).size; } catch { /* deleted mid-scan */ }
+    }
   }
   return total;
 }
@@ -39,9 +64,7 @@ export function storageInfo() {
       let checksumOk = false;
       try {
         const want = fs.readFileSync(full + ".sha256", "utf8").trim();
-        const hasher = new Bun.CryptoHasher("sha256");
-        hasher.update(fs.readFileSync(full));
-        checksumOk = hasher.digest("hex") === want;
+        checksumOk = sha256File(full) === want;
       } catch { /* no sidecar yet */ }
       return {
         file: f,
@@ -76,11 +99,21 @@ export interface OrphanFile {
 export function analyzeOrphans(): { orphans: OrphanFile[]; orphanCount: number; totalMB: number } {
   const referenced = new Set<string>();
   const norm = (p: string) => (p.startsWith("/") ? p : "/" + p);
+  const collectUrls = (v: unknown) => {
+    if (typeof v === "string") {
+      if (v.startsWith("/images/") || v.startsWith("/uploads/")) referenced.add(norm(v));
+      return;
+    }
+    if (Array.isArray(v)) { for (const x of v) collectUrls(x); return; }
+    if (v && typeof v === "object") { for (const x of Object.values(v)) collectUrls(x); }
+  };
   for (const c of listConversations()) {
+    // settings hold live media too (recap storyboard shots, scene captures…)
+    try { collectUrls(JSON.parse((c as any).settings || "{}")); } catch { /* ignore */ }
     for (const m of listMessages(c.id)) {
       try {
         const meta = JSON.parse(m.meta || "{}") as any;
-        if (meta?.image) referenced.add(norm(String(meta.image)));
+        collectUrls(meta);
       } catch { /* ignore */ }
     }
   }
@@ -166,9 +199,7 @@ export function runBackup(force = false): string | null {
     db.exec(`VACUUM INTO '${tmp.replace(/'/g, "''")}'`);
     fs.renameSync(tmp, dest);
     // checksum sidecar so a restore can verify integrity
-    const hasher = new Bun.CryptoHasher("sha256");
-    hasher.update(fs.readFileSync(dest));
-    fs.writeFileSync(dest + ".sha256", hasher.digest("hex"));
+    fs.writeFileSync(dest + ".sha256", sha256File(dest));
   } catch (e) {
     console.error("[backup] failed:", e);
     return null;

@@ -2,10 +2,13 @@
  * settings resource router (extracted from the monolithic routes.ts).
  * Returns null when no route matches; throws are mapped by index.ts.
  */
-import { SECRET_KEYS, json, publicSettings, readJson } from "./core";
-import { getSetting, setSetting } from "../db";
+import { json, publicSettings, readJson } from "./core";
+import { getSetting, listCards, listConversations, listPersonas, listWorlds, setSetting } from "../db";
 import { errorResponse } from "../http";
 import { getProvider } from "../../llm/providers";
+import { validateSettingsPatch } from "../settingsSchema";
+import { providerHealth } from "../health";
+import { jobView } from "../jobs";
 
 export async function handleSettings(req: Request, url: URL, parts: string[], method: string): Promise<Response | null> {
   const p = url.pathname;
@@ -35,20 +38,41 @@ if (p === "/api/settings" && method === "GET") {
 
 if (p === "/api/settings" && method === "PATCH") {
       const body = await readJson(req);
-      for (const [k, v] of Object.entries(body)) {
-        if (SECRET_KEYS.has(k) && (v === undefined || v === null || String(v) === "")) continue;
-        // validate numeric settings
-        if (typeof v === "number" || (typeof v === "string" && /^[\d.]+$/.test(v))) {
-          const num = Number(v);
-          if (k === "context_max_messages" && (num < 2 || num > 200)) continue;
-          if (k === "image_steps" && (num < 1 || num > 50)) continue;
-          if (k === "temperature" && (num < 0 || num > 2)) continue;
-          if (k === "max_tokens" && (num < 64 || num > 16384)) continue;
-          if (k === "image_cfg" && (num < 1 || num > 20)) continue;
-        }
-        setSetting(k, v);
-      }
+      // single schema: unknown keys and out-of-range values are rejected with
+      // a 400 (nothing is persisted) instead of being silently stored/dropped
+      const entries = validateSettingsPatch(body);
+      for (const [k, v] of entries) setSetting(k, v);
       return json(publicSettings());
+    }
+
+if (p === "/api/settings/schema" && method === "GET") {
+      const { SETTING_DEFS } = await import("../settingsSchema");
+      return json({ settings: SETTING_DEFS });
+    }
+
+if (p === "/api/diagnostics" && method === "GET") {
+      // one-click bug-report bundle: versions, provider health, recent job
+      // outcomes (errors included, payloads stripped), redacted settings.
+      // Payloads can contain prompt text — only metadata is exposed.
+      const { listJobs } = await import("../db");
+      const jobs = listJobs().slice(0, 20).map((j) => {
+        const v = jobView(j);
+        const { payload, payloadObj, result, resultObj, ...rest } = v;
+        return { ...rest, hasResult: v.hasResult };
+      });
+      return json({
+        app: "innsekai",
+        at: new Date().toISOString(),
+        providers: providerHealth(),
+        jobs,
+        settings: publicSettings(),
+        counts: {
+          worlds: listWorlds().length,
+          cards: listCards().length,
+          personas: listPersonas().length,
+          conversations: listConversations().length,
+        },
+      });
     }
     return null;
   } catch (e) {

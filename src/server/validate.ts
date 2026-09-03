@@ -51,6 +51,7 @@ export function fkId(v: unknown, label: string, allowNull = true): number | null
     if (allowNull) return null;
     apiError(Codes.INVALID_ID, `${label} requis`);
   }
+  if (typeof v === "boolean") apiError(Codes.INVALID_ID, `${label} invalide`);
   const n = Number(v);
   if (!Number.isInteger(n) || n <= 0) apiError(Codes.INVALID_ID, `${label} invalide`);
   return n;
@@ -118,10 +119,14 @@ export function obj(v: unknown, label: string): Record<string, unknown> {
  */
 export function settingsJson(v: unknown): string {
   if (typeof v === "string") {
+    let parsed: unknown;
     try {
-      JSON.parse(v);
+      parsed = JSON.parse(v);
     } catch {
       apiError(Codes.INVALID_JSON, "settings doit être du JSON valide");
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      apiError(Codes.INVALID_JSON, "settings doit être un objet JSON");
     }
     return v;
   }
@@ -138,6 +143,7 @@ export function intArray(v: unknown, label: string): number[] {
   const a = arr(v, label);
   const out: number[] = [];
   for (const x of a) {
+    if (typeof x === "boolean") apiError(Codes.INVALID_ID, `${label} : id invalide dans le tableau`);
     const n = Number(x);
     if (!Number.isInteger(n) || n <= 0) apiError(Codes.INVALID_ID, `${label} : id invalide dans le tableau`);
     out.push(n);
@@ -179,8 +185,8 @@ export function sniffImage(ext: string, bytes: Uint8Array): boolean {
       const h = head(3);
       return h === "ffd8ff";
     }
-    case "webp": return head(4) === "52494646" && bytes.length > 12 && String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]) === "WEBP";
+    case "webp": return head(4) === "52494646" && bytes.length >= 12 && String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]) === "WEBP";
     case "gif": return head(4) === "47494638";
-    default: return true; // unknown ext — no signature to check
+    default: return false; // unknown ext — reject rather than skip the check
   }
 }

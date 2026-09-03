@@ -138,6 +138,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   title TEXT NOT NULL DEFAULT '',
   cancellable INTEGER NOT NULL DEFAULT 0,
   retryable INTEGER NOT NULL DEFAULT 0,
+  result TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   completed_at INTEGER
 );
@@ -182,6 +183,7 @@ CREATE INDEX IF NOT EXISTS idx_canon_status ON canon_entries(status);
   if (!jobCols.has("title")) db.exec("ALTER TABLE jobs ADD COLUMN title TEXT NOT NULL DEFAULT ''");
   if (!jobCols.has("cancellable")) db.exec("ALTER TABLE jobs ADD COLUMN cancellable INTEGER NOT NULL DEFAULT 0");
   if (!jobCols.has("retryable")) db.exec("ALTER TABLE jobs ADD COLUMN retryable INTEGER NOT NULL DEFAULT 0");
+  if (!jobCols.has("result")) db.exec("ALTER TABLE jobs ADD COLUMN result TEXT NOT NULL DEFAULT ''");
   // soft-delete (trash) support: deletes move rows here, restore brings them back
   for (const [table, cols] of [["worlds", worldCols], ["scenarios", null], ["cards", cardCols], ["personas", null]] as [string, Set<string> | null][]) {
     if (cols && cols.has("trashed")) continue;
@@ -712,7 +714,8 @@ export function deleteTimelineEvent(id: number): void {
 export interface JobRow {
   id: number; type: string; status: string; progress: number; conversation_id: number | null;
   message_id: number | null; payload: string; error: string; title: string;
-  cancellable: number; retryable: number; created_at: number; completed_at: number | null;
+  cancellable: number; retryable: number; result: string;
+  created_at: number; completed_at: number | null;
 }
 
 export function createJob(j: Partial<JobRow>): JobRow {
@@ -737,8 +740,8 @@ export function updateJob(id: number, j: Partial<JobRow>): JobRow | null {
   const cur = getJob(id);
   if (!cur) return null;
   const merged = { ...cur, ...j, id };
-  db.query("UPDATE jobs SET status=?, progress=?, error=?, completed_at=? WHERE id=?").run(
-    merged.status, merged.progress, merged.error, merged.completed_at, id,
+  db.query("UPDATE jobs SET status=?, progress=?, error=?, completed_at=?, result=? WHERE id=?").run(
+    merged.status, merged.progress, merged.error, merged.completed_at, merged.result ?? "", id,
   );
   return getJob(id);
 }

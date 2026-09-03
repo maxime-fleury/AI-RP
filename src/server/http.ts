@@ -21,8 +21,18 @@ export function json(body: unknown, status = 200): Response {
   });
 }
 
-export async function readJson(req: Request): Promise<any> {
+const MAX_JSON_BYTES = 60 * 1024 * 1024;
+
+async function readTextLimited(req: Request): Promise<string> {
   const text = await req.text();
+  if (text.length > MAX_JSON_BYTES) {
+    throw new HttpError(413, "Corps de requête trop volumineux", "TOO_LONG");
+  }
+  return text;
+}
+
+export async function readJson(req: Request): Promise<any> {
+  const text = await readTextLimited(req);
   if (!text) return {};
   try {
     return JSON.parse(text);
@@ -33,7 +43,7 @@ export async function readJson(req: Request): Promise<any> {
 
 /** Read a request body as raw text + parsed JSON (checksum flows need the raw bytes). */
 export async function readJsonRaw(req: Request): Promise<{ raw: string; body: any }> {
-  const raw = await req.text();
+  const raw = await readTextLimited(req);
   let body: any = {};
   if (raw) {
     try {
@@ -54,8 +64,8 @@ export function errorResponse(e: unknown): Response {
   if (e instanceof HttpError) {
     return json({ error: e.message, code: e.code }, e.status);
   }
-  const msg = e instanceof Error ? e.message : String(e);
-  return json({ error: msg, code: "INTERNAL" }, 500);
+  console.error("[api] internal error:", e instanceof Error ? (e.stack || e.message) : e);
+  return json({ error: "Erreur interne", code: "INTERNAL" }, 500);
 }
 
 export function sseStream(

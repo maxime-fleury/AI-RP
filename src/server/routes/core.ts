@@ -40,6 +40,7 @@ import { withCharaChunk, placeholderPng } from "../cardExport";
 import { registerJobRetry, trackJob } from "../jobs";
 import { HttpError } from "../http";
 import { combineSignals } from "../signal";
+import { log } from "../log";
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 // HTTP plumbing, embedded-media helpers and SSE are shared modules — see the
@@ -1601,7 +1602,7 @@ export async function handleStream(req: Request, convId: number): Promise<Respon
   const userText = (body.content ?? "").trim();
   const modelText = (body.prompt ?? body.content ?? "").trim(); // slash commands rewrite the model input
   const directive = (body.directive ?? "").trim();
-  if (!userText && !directive) return json({ error: "message vide" }, 400);
+  if (!userText && !directive) { activeStreams.delete(convId); return json({ error: "message vide" }, 400); }
   // keep the model-facing input on the user message so "Régénérer" can replay
   // it exactly (slash commands and directives rewrite the raw content)
   const userMeta: Record<string, string> = {};
@@ -1625,22 +1626,33 @@ export async function handleStream(req: Request, convId: number): Promise<Respon
   // interpellation directive (e.g. "ask the narrator / a character to speak")
   if (directive) messages[messages.length - 1].content += `\n\n[Directive : ${directive}]`;
 
-  const settings = JSON.parse(conv.settings || "{}");
+  let settings: any = {};
+  try {
+    settings = JSON.parse(conv.settings || "{}");
+    if (!settings || typeof settings !== "object") settings = {};
+  } catch {
+    activeStreams.delete(convId);
+    return json({ error: "Réglages de la partie corrompus — réinitialise-les depuis les réglages.", code: "INVALID_JSON" }, 422);
+  }
   const preset = presetFromKey(settings.preset);
   const provider = getProvider((settings.provider as string) || undefined);
   const model = (settings.model as string) || defaultModelFor(provider.id);
-  const temperature = Number(settings.temperature ?? preset?.temperature ?? getSetting("temperature", 0.9));
-  const maxTokens = Number(settings.max_tokens ?? preset?.maxTokens ?? getSetting("max_tokens", 2048));
+  const rawTemp = Number(settings.temperature ?? preset?.temperature ?? getSetting("temperature", 0.9));
+  const temperature = Number.isFinite(rawTemp) ? Math.min(2, Math.max(0, rawTemp)) : 0.9;
+  const rawMax = Number(settings.max_tokens ?? preset?.maxTokens ?? getSetting("max_tokens", 2048));
+  const maxTokens = Number.isFinite(rawMax) ? Math.min(8192, Math.max(64, Math.round(rawMax))) : 2048;
 
-  // server-side trace of every generation (see the console while playing)
+  // server-side trace of every generation (structured — see log.ts)
   const genLabel = (userText || directive || "").replace(/\s+/g, " ").trim().slice(0, 90);
   const genStart = Date.now();
-  console.log(`\n[chat] ▶  Génération lancée — partie #${convId} « ${conv.title || "sans titre"} »`);
-  console.log(`[chat]    message : ${genLabel || "(directive)"}`);
-  console.log(`[chat]    modèle : ${provider.id} / ${model || "défaut"} · temp ${temperature} · max ${maxTokens} tokens`);
+  log("chat", "generation started", {
+    convId, title: (conv.title || "sans titre").slice(0, 60), message: genLabel || "(directive)",
+    provider: provider.id, model: model || "défaut", temperature, maxTokens,
+  });
 
   // hard timeout: a stuck model must not leave the UI on "…" forever
-  const timeoutSec = Math.max(20, Number(getSetting("llm_timeout", 150)));
+  const rawTimeout = Number(getSetting("llm_timeout", 150));
+  const timeoutSec = Number.isFinite(rawTimeout) ? Math.min(900, Math.max(20, rawTimeout)) : 150;
   const llmAbort = new AbortController();
   const llmTimer = setTimeout(() => llmAbort.abort(), timeoutSec * 1000);
   let clientStopped = false;
@@ -1682,7 +1694,7 @@ export async function handleStream(req: Request, convId: number): Promise<Respon
       }
       clearTimeout(llmTimer);
       const genSecs = ((Date.now() - genStart) / 1000).toFixed(1);
-      console.log(`[chat] ✔  Réponse générée en ${genSecs}s — ${full.trim().length} caractères, ${Math.max(1, Math.round(estimateTokens(full) / 100) * 100)} tokens ≈`);
+      log("chat", "generation completed", { convId, secs: genSecs, chars: full.trim().length });
       if (!full.trim()) {
         // try to get the model list for a nicer error
         const models = await provider.models().catch(() => []);
@@ -1793,7 +1805,7 @@ export async function handleStream(req: Request, convId: number): Promise<Respon
           deleteMessage(userMsg.id);
         }
       } else {
-        console.log(`[chat] ✖  Échec après ${((Date.now() - genStart) / 1000).toFixed(1)}s — ${String(e?.message ?? e).slice(0, 160)}`);
+        log("chat", "generation failed", { convId, secs: ((Date.now() - genStart) / 1000).toFixed(1), error: String(e?.message ?? e).slice(0, 160), aborted });
         send("error", {
           message: aborted
             ? `Le modèle n'a pas répondu dans le délai de ${timeoutSec} s (il est peut-être en train de charger). Réessaie, ou augmente le timeout dans les réglages.`

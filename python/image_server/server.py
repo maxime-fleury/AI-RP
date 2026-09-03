@@ -83,32 +83,65 @@ def generate(req: dict):
     import torch
     from PIL import Image
 
-    prompt = req.get("prompt", "").strip()
-    negative = req.get("negative") or (
-        "worst quality, low quality, lowres, bad anatomy, bad hands, missing fingers, extra digits, "
-        "fewer digits, extra limbs, mutated hands and fingers, deformed, disfigured, blurry, out of focus, "
-        "ugly, duplicate, monochrome, text, watermark, signature, logo, jpeg artifacts, frame, border"
-    )
-    steps = int(req.get("steps", 28))
-    cfg = float(req.get("cfg", 7.0))
-    width = int(req.get("width", 768))
-    height = int(req.get("height", 1152))
-    seed = int(req.get("seed", -1))
+    raw_prompt = req.get("prompt", "")
+    if not isinstance(raw_prompt, str):
+        raise ValueError("prompt must be a string")
+    prompt = raw_prompt.strip()
+    if not prompt:
+        raise ValueError("prompt is required")
+    if len(prompt) > 2000:
+        raise ValueError("prompt too long (max 2000 chars)")
+    raw_negative = req.get("negative", None)
+    if raw_negative is None:
+        negative = (
+            "worst quality, low quality, lowres, bad anatomy, bad hands, missing fingers, extra digits, "
+            "fewer digits, extra limbs, mutated hands and fingers, deformed, disfigured, blurry, out of focus, "
+            "ugly, duplicate, monochrome, text, watermark, signature, logo, jpeg artifacts, frame, border"
+        )
+    elif not isinstance(raw_negative, str):
+        raise ValueError("negative must be a string")
+    else:
+        negative = raw_negative[:2000]
+    try:
+        steps = int(req.get("steps", 28))
+        cfg = float(req.get("cfg", 7.0))
+        width = int(req.get("width", 768))
+        height = int(req.get("height", 1152))
+        seed = int(req.get("seed", -1))
+    except (TypeError, ValueError):
+        raise ValueError("steps/cfg/width/height/seed must be numbers")
+    import math
+    if not 8 <= steps <= 60:
+        raise ValueError("steps must be between 8 and 60")
+    if not math.isfinite(cfg) or not 1 <= cfg <= 20:
+        raise ValueError("cfg must be between 1 and 20")
+    if (width, height) not in ((512, 512), (768, 768), (768, 1152), (1152, 768), (832, 1216), (1216, 832)):
+        raise ValueError("unsupported width/height")
+    if not -1 <= seed <= 2**32 - 1:
+        raise ValueError("seed out of range")
     if seed < 0:
         seed = int(uuid.uuid4().int % (2**32))
     generator = torch.Generator(device="cpu").manual_seed(seed)
     t0 = time.time()
     # img2img: an optional base64 init image (character portrait ref) + strength
     init_b64 = req.get("init_image") or ""
-    strength = float(req.get("strength", 0.6))
+    if init_b64 and len(init_b64) > 15 * 1024 * 1024:
+        raise ValueError("init_image too large (max ~11 MB)")
+    try:
+        strength = float(req.get("strength", 0.6))
+    except (TypeError, ValueError):
+        raise ValueError("strength must be a number")
+    import math as _math
+    if not _math.isfinite(strength):
+        raise ValueError("strength must be a number")
     kwargs = {}
     if init_b64:
         try:
-            init_img = Image.open(io.BytesIO(base64.b64decode(init_b64))).convert("RGB")
+            init_img = Image.open(io.BytesIO(base64.b64decode(init_b64, validate=True))).convert("RGB")
             kwargs["image"] = init_img
             kwargs["strength"] = max(0.05, min(1.0, strength))
         except Exception as e:
-            print(f"[image] init_image ignored: {e}", flush=True)
+            raise ValueError(f"invalid init_image: {e}")
     image = _pipe(
         prompt=prompt,
         negative_prompt=negative,
@@ -158,8 +191,13 @@ def main(port: int):
                 finally:
                     # free cached VRAM after every render (success or failure)
                     free_vram()
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        except RuntimeError as e:
+            return JSONResponse({"error": str(e)}, status_code=503)
         except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=500)
+            print(f"[image] generate failed: {e}", flush=True)
+            return JSONResponse({"error": "generation failed"}, status_code=500)
 
     # load the model before serving so /health reflects readiness
     try:

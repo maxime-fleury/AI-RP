@@ -6,7 +6,8 @@ import { NEGATIVE_PROMPT, buildIllustrationPrompt, generateScenarioIntro, json, 
 import { createLocation, createLorebookEntry, createRelation, createScenario, createTimelineEvent, createWorld, deleteLocation, deleteLorebookEntry, deleteRelation, deleteScenario, deleteTimelineEvent, deleteWorld, getScenario, getSetting, getWorld, listConversations, listLocations, listLorebook, listMessages, listRelations, listScenarios, listTimeline, listWorlds, updateLocation, updateLorebookEntry, updateRelation, updateScenario, updateTimelineEvent, updateWorld } from "../db";
 import { errorResponse } from "../http";
 import { trackJob } from "../jobs";
-import { Codes, apiError, en, fkId, intArray, optStr, settingsJson, str } from "../validate";
+import { Codes, apiError, en, fkId, intArray, optStr, str } from "../validate";
+import { WORLD_SETTING_DEFS, objectSettingsJson } from "../settingsSchema";
 import { generateAndSave } from "../image";
 import { zipFiles } from "../zip";
 import { applyWorldTemplate, listWorldTemplates } from "../templates";
@@ -31,7 +32,7 @@ if (p === "/api/worlds" && method === "POST") {
         tone: optStr(body.tone, "tone", 200),
         narration_style: optStr(body.narration_style, "narration_style", 200),
         language: optStr(body.language, "language", 20),
-        settings: settingsJson(body.settings),
+        settings: objectSettingsJson(body.settings ?? {}, WORLD_SETTING_DEFS, "settings"),
       });
       return json(w, 201);
     }
@@ -63,7 +64,7 @@ if (parts[1] === "worlds" && parts[2] && !parts[3] && method === "PATCH") {
       if (body.narration_style !== undefined) patch.narration_style = optStr(body.narration_style, "narration_style", 200);
       if (body.cover !== undefined) patch.cover = optStr(body.cover, "cover", 300);
       if (body.map !== undefined) patch.map = optStr(body.map, "map", 300);
-      if (body.settings !== undefined) patch.settings = settingsJson(body.settings);
+      if (body.settings !== undefined) patch.settings = objectSettingsJson(body.settings, WORLD_SETTING_DEFS, "settings");
       const w = updateWorld(Number(parts[2]), patch);
       return w ? json(w) : json({ error: "not found" }, 404);
     }

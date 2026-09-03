@@ -51,7 +51,13 @@ function serveFile(filePath: string, rootDir?: string): Response | null {
   } catch {
     return null;
   }
-  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return null;
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(resolved);
+  } catch {
+    return null;
+  }
+  if (!st.isFile()) return null;
   const ext = path.extname(resolved).toLowerCase();
   const body = new Uint8Array(fs.readFileSync(resolved));
   return new Response(body, {
@@ -137,7 +143,9 @@ console.log(`🟤 ${NAME} running → http://localhost:${port}`);
 
 // Optional: pre-spawn the Python image sidecar so the first illustration is fast.
 if (getSetting("image_preload", false)) {
-  ensureImageServer().then((ok) => console.log(`[image] preload ${ok ? "ready" : "failed — first generation will load it"}`));
+  ensureImageServer()
+    .then((ok) => console.log(`[image] preload ${ok ? "ready" : "failed — first generation will load it"}`))
+    .catch((e) => console.log(`[image] preload failed: ${String((e as Error)?.message || e)}`));
 }
 
 for (const d of [DATA_DIR]) fs.mkdirSync(d, { recursive: true });

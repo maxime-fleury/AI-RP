@@ -11,7 +11,9 @@
   <script>
     // apply saved theme before paint ('auto' = nuit → anime, jour → néon)
     try {
-      const t = JSON.parse(localStorage.getItem("innsekai-theme") || '"glass"');
+      let t = localStorage.getItem("innsekai-theme") || '"glass"';
+      try { t = JSON.parse(t); } catch { /* legacy plain string like glass (no quotes) */ }
+      if (typeof t !== "string") t = "glass";
       const h = new Date().getHours();
       document.documentElement.dataset.theme = t === "auto" ? (h >= 20 || h < 8 ? "anime" : "glass") : t;
     } catch (e) { document.documentElement.dataset.theme = "glass"; }
@@ -28,6 +30,19 @@
   <div id="modal-root"></div>
   <div id="palette-root"></div>
   <div id="live-region" class="sr-only" role="status" aria-live="polite"></div>
+  <noscript><div style="padding:40px;text-align:center">Innsekai a besoin de JavaScript pour fonctionner.</div></noscript>
   <script type="module" src="/js/app.js?v=66"></script>
+  <script>
+    // boot fallback: if the module fails (404/version mismatch), don't leave a blank page
+    setTimeout(() => {
+      if (!document.getElementById("main")?.hasChildNodes()) {
+        const m = document.getElementById("main");
+        if (m && !m.dataset.bootError) {
+          m.dataset.bootError = "1";
+          m.innerHTML = '<div class="empty" style="padding:60px 20px;text-align:center"><div style="font-size:40px">😵</div><h3>Chargement impossible</h3><p>L\'application ne s\'est pas chargée — recharge la page (cache périmé ?).</p><button class="btn btn-primary" onclick="location.reload()">Recharger</button></div>';
+        }
+      }
+    }, 6000);
+  </script>
 </body>
 </html>

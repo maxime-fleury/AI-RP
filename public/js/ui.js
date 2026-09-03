@@ -1,12 +1,15 @@
 // DOM + UI helpers
+const BOOLEAN_ATTRS = new Set(["hidden", "disabled", "checked", "selected", "readonly", "required", "open", "autofocus"]);
 export function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
     if (k === "class") node.className = v;
     else if (k === "style" && typeof v === "object") Object.assign(node.style, v);
-    else if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2), v);
+    else if (k.startsWith("on") && typeof v === "function" && (k.length > 3 && /^on(click|change|input|submit|keydown|keyup|keypress|mousedown|mouseup|mouseenter|mouseleave|mouseover|mouseout|mousemove|focus|focusin|focusout|blur|dblclick|contextmenu|scroll|dragover|dragleave|drop|touchstart|touchend|paste|copy|cut|wheel|resize|pointerdown|pointerup|animationend)$/i.test(k))) node.addEventListener(k.slice(2).toLowerCase(), v);
     else if (k === "dataset") Object.assign(node.dataset, v);
-    else if (v !== null && v !== undefined) node.setAttribute(k, v);
+    else if (BOOLEAN_ATTRS.has(k)) { if (v && v !== "false") node.setAttribute(k, ""); else node.removeAttribute(k); }
+    else if (v === false || v === null || v === undefined) continue;
+    else node.setAttribute(k, v);
   }
   for (const c of children.flat()) {
     if (c == null) continue;
@@ -54,6 +57,7 @@ export function fmtAge(ms) {
 
 export function toast(msg, type = "ok", ms = 3800) {
   const root = document.getElementById("toasts");
+  if (!root) { console.log(`[toast:${type}]`, msg); return; }
   const t = el("div", { class: `toast ${type}`, role: "status", "aria-live": "polite" }, type === "err" || type === "warn" ? "⚠️" : "✅", msg);
   root.append(t);
   setTimeout(() => {
@@ -66,6 +70,7 @@ export function toast(msg, type = "ok", ms = 3800) {
 /** Toast with a clickable action (e.g. "Annuler") — used for undoable deletes. */
 export function actionToast(msg, actionLabel, onAction, ms = 6000) {
   const root = document.getElementById("toasts");
+  if (!root) { console.log("[toast:action]", msg); return; }
   const btn = el("button", { class: "toast-action", onclick: () => { onAction?.(); dismiss(); } }, actionLabel);
   const t = el("div", { class: "toast ok action", role: "status", "aria-live": "polite" }, "✅", msg, btn);
   const dismiss = () => { t.style.opacity = "0"; t.style.transition = "opacity .3s"; setTimeout(() => t.remove(), 320); };
