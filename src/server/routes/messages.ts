@@ -48,15 +48,15 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts
 if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] && !parts[5] && method === "DELETE") {
       const convId = Number(parts[2]);
       const mid = Number(parts[4]);
-      const msgs = listMessages(convId);
-      const idx = msgs.findIndex((m) => m.id === mid);
-      if (idx < 0) return json({ error: "message not found" }, 404);
-      for (const m of msgs.slice(idx)) {
-        deleteMessage(m.id);
-      }
+      const m = getMessage(mid);
+      // single delete: ONLY this message (the old code truncated the target
+      // AND every later message despite the singular verb — use rewind or
+      // bulk-delete for tails)
+      if (!m || m.conversation_id !== convId) return json({ error: "message not found" }, 404);
+      deleteMessage(mid);
       const last = lastMessageOf(convId);
       updateConversation(convId, { last_message: last?.content ?? "" });
-      return json({ ok: true });
+      return json({ ok: true, removed: 1 });
     }
 
 if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts[4] === "bulk-delete" && method === "POST") {

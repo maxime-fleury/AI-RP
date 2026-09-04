@@ -36,7 +36,7 @@ import { storageInfo, runBackup, analyzeOrphans, purgeOrphans } from "../backup"
 import { zipFiles } from "../zip";
 import { providerHealth } from "../health";
 import { IMAGES_DIR, UPLOADS_DIR } from "../paths";
-import { withCharaChunk, placeholderPng } from "../cardExport";
+
 import { registerJobRetry, trackJob } from "../jobs";
 import { HttpError } from "../http";
 import { combineSignals } from "../signal";
@@ -586,29 +586,38 @@ export async function assistCharacters(
   return { characters };
 }
 
-/** Stage 4 — 4 card variants for one validated character. */
+/** Stage 4 — 4 card variants for one validated character. The player's own
+ * persona is passed so cards stay distinct from it (name + concept), and each
+ * card gets an opening line (first_mes) so the new party starts talking
+ * instead of falling back to a generic greeting. */
 export async function assistCards(
   description: string, world: Record<string, unknown> | null,
   character: Record<string, unknown> | undefined, feedback: string,
-): Promise<{ proposals: { name: string; description: string; personality: string; scenario: string; tags: string[] }[] }> {
+  persona?: Record<string, unknown> | null, siblingNames: string[] = [],
+): Promise<{ proposals: { name: string; description: string; personality: string; scenario: string; tags: string[]; first_mes: string }[] }> {
   const charName = ASSIST_STR(character?.name, 80) || "le personnage";
   const charRole = ASSIST_STR(character?.role, 200);
   const charDetail = ASSIST_STR(character?.detail, 400);
+  const personaName = ASSIST_STR(persona?.name, 80);
+  const forbidden = new Set([personaName, ...siblingNames].map(assistKey).filter(Boolean));
   const sys = [
     `Tu crées des cartes de personnage alternatives pour « ${charName} » (${charRole || "rôle à définir"}) dans le monde du joueur.`,
     ...(charDetail ? [`Le joueur a dit de lui : « ${charDetail} » — RESPECTE ces indices visuels et ce mystère dans chaque carte.`] : []),
+    ...(personaName ? [`Le joueur incarne « ${personaName} » : n'utilise JAMAIS ce nom pour une carte, et rends chaque carte distincte de ce persona (pas un clone, pas un parent caché sauf si l'idée le suggère).`] : []),
     "Si le nom provisoire n'est pas un vrai nom propre (ex. « la tavernière mystérieuse », « le garde »), invente un nom propre pour chaque carte.",
     'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format :',
-    '{"proposals":[{"name":"Nom","description":"2 phrases : apparence et signes distinctifs","personality":"traits de caractère en une phrase","scenario":"sa situation initiale dans l\'histoire","tags":["tag1","tag2"]}]}.',
+    '{"proposals":[{"name":"Nom","description":"2 phrases : apparence et signes distinctifs","personality":"traits de caractère en une phrase","scenario":"sa situation initiale dans l\'histoire","tags":["tag1","tag2"],"first_mes":"sa première réplique quand le joueur le rencontre (1-2 phrases, à la première personne)"}]}.',
     "proposals : EXACTEMENT 4 cartes complètes, variées entre elles (ton, rôle, attitude), avec des noms différents.",
+    "first_mes : OBLIGATOIRE pour chaque carte — une réplique d'ouverture marquante, dans la voix du personnage.",
     "Tout en français. JSON complet, non tronqué.",
   ].join(" ");
   const worldBlock = world ? `Monde : « ${ASSIST_STR(world.name, 80)} » — ${ASSIST_STR(world.description, 400)}` : "";
+  const personaBlock = personaName ? `Persona du joueur (à ne pas dupliquer) : « ${personaName} » — ${ASSIST_STR(persona?.description, 300)}` : "";
   const fb = feedback ? `\nRetour du joueur sur la fournée précédente (à intégrer) : ${feedback}` : "";
-  const text = await llmJson(`Idée du joueur : ${description}\n\n${worldBlock}${fb}`, sys, 2600, 0.9, 300_000,
+  const text = await llmJson(`Idée du joueur : ${description}\n\n${[worldBlock, personaBlock].filter(Boolean).join("\n")}${fb}`, sys, 2800, 0.9, 300_000,
     (r) => {
-      const n = completeCount(r, "proposals");
-      if (n < 2) return `Il fallait au moins 2 cartes complètes et uniques (nom + description) ; ta réponse n'en contenait que ${n}.`;
+      const n = completeCount(r, "proposals", forbidden);
+      if (n < 2) return `Il fallait au moins 2 cartes complètes et uniques (nom + description, noms jamais déjà vus) ; ta réponse n'en contenait que ${n}.`;
       return null;
     },
   );
@@ -619,10 +628,45 @@ export async function assistCards(
       personality: ASSIST_STR((p as any)?.personality, 1200),
       scenario: ASSIST_STR((p as any)?.scenario, 800),
       tags: ASSIST_ARR((p as any)?.tags).map((t) => ASSIST_STR(t, 40)).filter(Boolean).slice(0, 8),
+      first_mes: ASSIST_STR((p as any)?.first_mes, 600),
     }))
-    .filter((p) => p.name && (p.description || p.personality)))
+    .filter((p) => p.name && (p.description || p.personality) && !forbidden.has(assistKey(p.name))))
     .slice(0, 4);
   return { proposals };
+}
+
+/** Bonus stage — opening situation: the player's idea always contains a
+ * situation ("téléporté au milieu de nulle part…") that used to die at the
+ * wizard handoff. This turns it into an editable intro the new party starts
+ * with (via settings.draft_intro, like the genre generator's drafts). */
+export async function assistOpening(
+  description: string, world: Record<string, unknown> | null,
+  persona: Record<string, unknown> | null, castNames: string[], feedback: string,
+): Promise<{ title: string; intro: string }> {
+  const sys = [
+    "Tu écris la situation de départ d'un roleplay isekai, à partir de l'idée du joueur.",
+    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format :',
+    '{"title":"titre court de la scène d\'ouverture (3-6 mots)","intro":"3 à 5 phrases qui plantent le décor ET lancent l\'action en medias res, à la deuxième personne du singulier (tu…)"}.',
+    "L'intro doit situer le lieu, ce que le joueur y fait, et finir sur un crochet immédiat (un bruit, une rencontre, un danger) — jamais de fin fermée, jamais de résumé du monde.",
+    "Cohérent avec le monde, le persona et les personnages validés ci-dessous.",
+    "Tout en français. JSON complet, non tronqué.",
+  ].join(" ");
+  const worldBlock = world ? `Monde : « ${ASSIST_STR(world.name, 80)} » — ${ASSIST_STR(world.description, 400)}` : "";
+  const personaBlock = persona ? `Tu incarnes : « ${ASSIST_STR(persona.name, 80)} » — ${ASSIST_STR(persona.description, 300)}` : "";
+  const castBlock = castNames.length ? `Personnages présents : ${castNames.map((n) => `« ${n} »`).join(", ")}` : "";
+  const fb = feedback ? `\nRetour du joueur (à intégrer) : ${feedback}` : "";
+  const text = await llmJson(
+    `Idée du joueur : ${description}\n\n${[worldBlock, personaBlock, castBlock].filter(Boolean).join("\n")}${fb}`,
+    sys, 700, 0.9, 300_000,
+    (r) => {
+      const title = ASSIST_STR((r as any)?.title, 120);
+      const intro = ASSIST_STR((r as any)?.intro, 2000);
+      if (!title || !intro) return "Il fallait un title ET un intro non vides.";
+      if (intro.length < 120) return "L'intro est trop courte (minimum ~120 caractères) — développe la scène.";
+      return null;
+    },
+  );
+  return { title: ASSIST_STR((text as any)?.title, 120), intro: ASSIST_STR((text as any)?.intro, 2000) };
 }
 
 // ─── story chapters & dynamic NPCs ───────────────────────────────────────────

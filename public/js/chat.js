@@ -960,6 +960,26 @@ export async function renderChat(convIdRaw) {
     };
     const provider = field("Fournisseur", store.settings.provider || "lmstudio", { type: "select", options: [["lmstudio", "LM Studio (local)"], ["openrouter", "OpenRouter (cloud)"]] });
     const model = field("Modèle", convSettings.model || "", { placeholder: "Vide = défaut (ex: qwen2.5-7b, claude-3.5…)" });
+    // suggest the models detected in settings (same datalists, refilled live)
+    const syncModelList = async () => {
+      try {
+        const prov = provider.input.value;
+        const res = await apiFetch(`/api/models?provider=${prov}`, { method: "GET" }).catch(() => null);
+        if (!res?.ok) return;
+        const list = (await res.json().catch(() => ({}))).models || [];
+        if (!list.length) return;
+        const id = prov === "lmstudio" ? "lm-model-suggestions" : "or-model-suggestions";
+        let dl = document.getElementById(id);
+        if (!dl) {
+          dl = el("datalist", { id });
+          document.body.append(dl);
+        }
+        dl.replaceChildren(...list.map((m) => el("option", { value: m }, m)));
+        model.input.setAttribute("list", id);
+      } catch { /* suggestions are best-effort */ }
+    };
+    provider.input.addEventListener("change", syncModelList);
+    syncModelList();
     const presetSel = field("Preset de style", convSettings.preset || "", { type: "select", options: [["", "Par défaut (réglages manuels)"], ...Object.entries(GENERATION_PRESETS).map(([k, v]) => [k, v.label])] });
     const temp = field("Température", convSettings.temperature ?? 0.9, { type: "number", min: 0, max: 2, step: 0.1 });
     const maxTok = field("Max tokens", convSettings.max_tokens ?? 2048, { type: "number", min: 64, max: 8192, step: 64 });
@@ -1632,11 +1652,15 @@ async function branchesModal() {
   const treeRows = () => {
     const byId = new Map(branches.map((b) => [b.id, b]));
     const out = [];
+    // visited set: a corrupt parent_id cycle used to overflow the stack
+    const seen = new Set();
     const walk = (b, depth) => {
+      if (!b || seen.has(b.id)) return;
+      seen.add(b.id);
       out.push([b, depth]);
       for (const c of childrenOf(b.id)) walk(c, depth + 1);
     };
-    for (const r of branches.filter((b) => !b.parent_id || !byId.has(b.parent_id))) walk(r, 0);
+    for (const r of branches.filter((b) => !b.parent_id || b.parent_id === b.id || !byId.has(b.parent_id))) walk(r, 0);
     return out;
   };
   const paint = () => { list.replaceChildren(...treeRows().map(([b, depth]) => branchRow(b, depth))); };

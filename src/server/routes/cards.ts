@@ -5,6 +5,7 @@
 import { MAX_IMPORT_FILES, MAX_TOTAL_BYTES, NEGATIVE_PROMPT, charSeed, descriptionToTags, json, mediaFileFor, messageView, readJson } from "./core";
 import { createCard, deleteCard, getCard, getSetting, listCards, updateCard } from "../db";
 import { errorResponse } from "../http";
+import { optStr } from "../validate";
 import { trackJob, jobView } from "../jobs";
 import { runBackup } from "../backup";
 import { generateAndSave } from "../image";
@@ -13,6 +14,38 @@ import { type ImportResult, importFile, scanDirectory, sizeLimitFor } from "../i
 import { IMAGES_DIR, UPLOADS_DIR } from "../paths";
 import fs from "node:fs";
 import path from "node:path";
+
+/**
+ * Whitelist + type-check card fields. The old code passed the raw body into
+ * create/update (a non-string name stored "[object Object]" or 500'd on the
+ * sqlite bind). Unknown keys are dropped, missing keys stay missing so DB
+ * defaults still apply.
+ */
+function pickCardFields(body: any): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const s = (k: string, max: number) => {
+    if (body[k] !== undefined) out[k] = optStr(body[k], k, max);
+  };
+  s("name", 160);
+  s("description", 8000);
+  s("personality", 4000);
+  s("scenario", 4000);
+  s("first_mes", 4000);
+  s("mes_example", 4000);
+  s("system_prompt", 2000);
+  s("post_history_instructions", 2000);
+  s("creator", 200);
+  s("avatar", 300);
+  s("voice", 200);
+  s("language", 20);
+  s("data", 20000);
+  for (const k of ["tags", "alternate_greetings"]) {
+    if (body[k] === undefined) continue;
+    const v = Array.isArray(body[k]) ? JSON.stringify(body[k].map(String).slice(0, 32)) : body[k];
+    out[k] = optStr(v, k, 8000);
+  }
+  return out;
+}
 
 export async function handleCards(req: Request, url: URL, parts: string[], method: string): Promise<Response | null> {
   const p = url.pathname;
@@ -41,8 +74,14 @@ if (p === "/api/import" && method === "POST") {
         }
         for (const f of entries) {
           if (!f || typeof f.base64 !== "string") continue;
-          const raw = atob(f.base64);
-          pending.push({ name: String(f.name ?? "?"), bytes: Uint8Array.from(raw, (c) => c.charCodeAt(0)) });
+          // invalid base64 must fail THIS file, not the whole batch (atob
+          // throws — previously one corrupt file 500'd the entire import)
+          try {
+            const raw = atob(f.base64);
+            pending.push({ name: String(f.name ?? "?"), bytes: Uint8Array.from(raw, (c) => c.charCodeAt(0)) });
+          } catch {
+            report.push({ status: "invalid", name: String(f.name ?? "?"), reason: "Base64 illisible" });
+          }
         }
       }
       // pass 1 — validate everything (format + per-file limit + batch total)
@@ -94,13 +133,13 @@ if (p === "/api/cards" && method === "POST") {
         if (!match) return json({ error: "Avatar invalide" }, 400);
         const bytes = Buffer.from(match[2], "base64");
         if (bytes.length > 5 * 1024 * 1024) return json({ error: "Avatar limité à 5 Mo" }, 413);
-        const card = createCard({ ...body, avatar: "" });
+        const card = createCard({ ...pickCardFields(body), avatar: "" });
         const file = `card-${card.id}.${match[1] === "jpeg" ? "jpg" : match[1]}`;
         fs.mkdirSync(path.join(UPLOADS_DIR, "avatars"), { recursive: true });
         fs.writeFileSync(path.join(UPLOADS_DIR, "avatars", file), bytes);
         return json(updateCard(card.id, { avatar: `/uploads/avatars/${file}` }), 201);
       }
-      return json(createCard(body), 201);
+      return json(createCard(pickCardFields(body)), 201);
     }
 
 if (p === "/api/cards/generate-avatar" && method === "POST") {
@@ -182,7 +221,7 @@ if (parts[1] === "cards" && parts[2] && !parts[3] && method === "PATCH") {
         fs.writeFileSync(path.join(UPLOADS_DIR, "avatars", file), bytes);
         body.avatar = `/uploads/avatars/${file}`;
       }
-      const card = updateCard(Number(parts[2]), body);
+      const card = updateCard(Number(parts[2]), pickCardFields(body));
       return card ? json(card) : json({ error: "not found" }, 404);
     }
 
@@ -217,7 +256,7 @@ if (parts[1] === "cards" && parts[2] && parts[3] === "export-st" && method === "
       const avatarFile = card.avatar ? mediaFileFor(card.avatar) : null;
       if (avatarFile && fs.existsSync(avatarFile)) png = new Uint8Array(fs.readFileSync(avatarFile));
       else png = placeholderPng(256, [43, 24, 66]);
-      const out = withCharaChunk(png, chara);
+      const out = withCharaChunk(png, chara) ?? withCharaChunk(placeholderPng(256, [43, 24, 66]), chara)!;
       return new Response(out as unknown as BodyInit, {
         headers: {
           "Content-Type": "image/png",

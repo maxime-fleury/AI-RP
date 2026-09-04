@@ -17,6 +17,8 @@ function chunk(type: string, data: Buffer): Buffer {
 }
 
 export function placeholderPng(size = 256, rgb: [number, number, number] = [43, 24, 66]): Buffer {
+  // cap: raw RGBA grows quadratically (100k → ~40 GB alloc → OOM)
+  size = Math.max(1, Math.min(2048, Math.floor(size) || 256));
   const stride = 1 + size * 4;
   const rows = Buffer.alloc(size * stride);
   for (let y = 0; y < size; y++) {
@@ -43,11 +45,18 @@ export function placeholderPng(size = 256, rgb: [number, number, number] = [43, 
   ]);
 }
 
-/** Inject a "chara" tEXt chunk right before IEND (standard ST card position). */
-export function withCharaChunk(png: Uint8Array, charaJson: string): Buffer {
+/**
+ * Inject a "chara" tEXt chunk right before IEND (standard ST card position).
+ * Returns null when the bytes are not a PNG (ST cards MUST be PNG) so the
+ * caller can fall back to a placeholder instead of shipping a ".png" that
+ * carries no character data.
+ */
+export function withCharaChunk(png: Uint8Array, charaJson: string): Buffer | null {
   const buf = Buffer.from(png);
+  // PNG magic, not just IEND: a JPEG with trailing bytes could false-match
+  if (buf.length < 8 || buf[0] !== 0x89 || buf[1] !== 0x50 || buf[2] !== 0x4e || buf[3] !== 0x47) return null;
   const iend = buf.lastIndexOf(Buffer.from([0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44])); // ...IEND
-  if (iend < 0) return buf;
+  if (iend < 0) return null;
   const payload = Buffer.from(`chara\0${Buffer.from(charaJson, "utf8").toString("base64")}`, "utf8");
   return Buffer.concat([buf.subarray(0, iend), chunk("tEXt", payload), buf.subarray(iend)]);
 }

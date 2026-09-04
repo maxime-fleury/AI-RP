@@ -4,7 +4,7 @@
  * the activity panel shows queued → running → completed/failed — the response
  * is still delivered synchronously (the UI fills fields from it).
  */
-import { CARD_ASSIST_FIELDS, assistCards, assistCharacters, assistPersonas, assistWorlds, generateCardAssist, json, readJson } from "./core";
+import { CARD_ASSIST_FIELDS, assistCards, assistCharacters, assistOpening, assistPersonas, assistWorlds, generateCardAssist, json, readJson } from "./core";
 import { listCards, listPersonas, listWorlds } from "../db";
 import { HttpError, errorResponse } from "../http";
 import { jobView, registerJobRetry, trackJob } from "../jobs";
@@ -49,8 +49,21 @@ registerJobRetry("assist", async (payload) => {
       return assistCharacters(description, (payload.world as any) ?? null, (payload.persona as any) ?? null, cards, feedback);
     }
     if (stage === "cards") {
-      const r = await assistCards(description, (payload.world as any) ?? null, (payload.character as any) ?? undefined, feedback);
+      const siblings = Array.isArray(payload.siblings)
+        ? payload.siblings.map((s) => String(s ?? "").slice(0, 80)).filter(Boolean).slice(0, 20)
+        : [];
+      const r = await assistCards(description, (payload.world as any) ?? null, (payload.character as any) ?? undefined, feedback, (payload.persona as any) ?? null, siblings);
       if (!r.proposals.length) throw new HttpError(502, "Le modèle n'a rien fourni — réessaie.");
+      return r;
+    }
+    if (stage === "opening") {
+      const castNames = Array.isArray(payload.castNames)
+        ? payload.castNames.map((s) => String(s ?? "").slice(0, 80)).filter(Boolean).slice(0, 12)
+        : [];
+      const r = await assistOpening(
+        description, (payload.world as any) ?? null, (payload.persona as any) ?? null, castNames, feedback,
+      );
+      if (!r.title || !r.intro) throw new HttpError(502, "Le modèle n'a rien fourni — réessaie.");
       return r;
     }
     throw new HttpError(400, "Étape inconnue — relance l'assistant guidé.");
@@ -96,19 +109,25 @@ export async function handleAssist(req: Request, url: URL, parts: string[], meth
       const rawDescription = String(body.description || "").trim();
       const description = rawDescription.slice(0, 3000);
       if (!description) return json({ error: "Décris d'abord ton idée de partie." }, 400);
-      if (!["worlds", "personas", "characters", "cards"].includes(stage)) {
+      if (!["worlds", "personas", "characters", "cards", "opening"].includes(stage)) {
         return json({ error: "Étape inconnue." }, 400);
       }
       const feedback = String(body.feedback || "").trim().slice(0, 500);
       const world = body.world && typeof body.world === "object" ? (body.world as Record<string, unknown>) : null;
       const persona = body.persona && typeof body.persona === "object" ? (body.persona as Record<string, unknown>) : null;
       const character = body.character && typeof body.character === "object" ? (body.character as Record<string, unknown>) : null;
+      const siblings = Array.isArray(body.siblings)
+        ? body.siblings.map((s: unknown) => String(s ?? "").slice(0, 80)).filter(Boolean).slice(0, 20)
+        : [];
+      const castNames = Array.isArray(body.castNames)
+        ? body.castNames.map((s: unknown) => String(s ?? "").slice(0, 80)).filter(Boolean).slice(0, 12)
+        : [];
       const { job, result } = await trackJob(
         {
           type: "assist",
           title: `Assistant — ${stage}`,
           // full context so a failed job can be retried from the activity panel
-          payload: { kind: "build", stage, description, feedback, world, persona, character },
+          payload: { kind: "build", stage, description, feedback, world, persona, character, siblings, castNames },
           cancellable: true,
           retryable: true,
         },
@@ -145,8 +164,18 @@ export async function handleAssist(req: Request, url: URL, parts: string[], meth
               console.log(`[assist/characters] ${r.characters.length} personnage(s) — ${Date.now() - t0} ms`);
               return r;
             }
+            if (stage === "opening") {
+              const r = await assistOpening(description, world, persona, castNames, feedback);
+              console.log(`[assist/opening] « ${r.title} » (${r.intro.length} caractères) — ${Date.now() - t0} ms`);
+              if (!r.title || !r.intro) {
+                throw new HttpError(502, "Le modèle n'a pas fourni d'intro exploitable — réessaie.");
+              }
+              return r;
+            }
             if (stage === "cards") {
-              const r = await assistCards(description, world, body.character as Record<string, unknown> | undefined, feedback);
+              // sibling character names keep variants distinct from each other
+              // and from the player's persona (see assistCards forbidden set)
+              const r = await assistCards(description, world, body.character as Record<string, unknown> | undefined, feedback, persona, siblings);
               console.log(`[assist/cards] ${r.proposals.length} proposition(s) — ${Date.now() - t0} ms`);
               if (!r.proposals.length) {
                 throw new HttpError(502, "Le modèle n'a pas fourni de carte exploitable — réessaie.");

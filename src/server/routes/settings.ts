@@ -15,8 +15,8 @@ export async function handleSettings(req: Request, url: URL, parts: string[], me
   try {
 if (p === "/api/models" && method === "GET") {
       const provider = getProvider(url.searchParams.get("provider") || undefined);
-      const models = await provider.models().catch(() => []);
-      return json({ models });
+      const r = await provider.listModels().catch((e) => ({ models: [], error: String((e as Error)?.message ?? e) }));
+      return json(r);
     }
 
 if (p === "/api/auth" && method === "GET") {

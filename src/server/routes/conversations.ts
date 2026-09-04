@@ -617,15 +617,18 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "fork" && method ==
           conversation_id: fork.id, role: m.role, name: m.name, content: m.content,
           segments: m.segments, meta: "{}",
         }).id;
-        // copy the illustration
+        // copy the illustration (best-effort per file: a failed copy must
+        // not abort the whole branch mid-loop and leave it half-built)
         if (meta.image) {
-          const file = path.basename(meta.image);
-          const srcImg = path.join(imgSrcDir, file);
-          if (fs.existsSync(srcImg)) {
-            fs.mkdirSync(imgDstDir, { recursive: true });
-            fs.copyFileSync(srcImg, path.join(imgDstDir, file));
-            meta.image = `/images/conversations/${fork.id}/${file}`;
-          }
+          try {
+            const file = path.basename(meta.image);
+            const srcImg = path.join(imgSrcDir, file);
+            if (fs.existsSync(srcImg)) {
+              fs.mkdirSync(imgDstDir, { recursive: true });
+              fs.copyFileSync(srcImg, path.join(imgDstDir, file));
+              meta.image = `/images/conversations/${fork.id}/${file}`;
+            }
+          } catch { /* branch keeps the text; image stays on the source URL */ }
         }
         delete meta.suggestions; // the branch point changed the context
         updateMessage(newMid, { meta: JSON.stringify(meta) });
@@ -925,7 +928,10 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "export" && method 
       const msgs = listMessages(conv.id).map(messageView);
       const lines = msgs.map((m: any) => {
         const who = m.role === "user" ? (view.persona?.name || "Moi") : (m.name || "Narrateur");
-        const body = (m.meta?.image ? `![illustration](${m.meta.image})\n` : "") + (m.content || "");
+        // relative link: the ZIP bundles images/ next to the markdown, while
+        // the stored /images/… URL only resolves against a live server
+        const rel = m.meta?.image ? `images/${String(m.meta.image).split("/").pop()}` : null;
+        const body = (rel ? `![illustration](${rel})\n` : "") + (m.content || "");
         return m.role === "user" ? `**${who}** : ${body}` : `> **${who}** : ${body}`;
       }).join("\n\n");
       const md = `# ${conv.title}\n\n${lines}\n`;

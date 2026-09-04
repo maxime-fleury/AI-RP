@@ -433,12 +433,16 @@ export function listTrashedResources(): TrashedResource[] {
   for (const r of db.query("SELECT id, name, created_at AS updated_at FROM personas WHERE trashed = 1").all() as any[]) out.push({ type: "persona", ...r });
   return out.sort((a, b) => b.updated_at - a.updated_at);
 }
+const TRASH_GETTERS: Record<string, (id: number) => unknown> = {
+  world: getWorld, scenario: getScenario, card: getCard, persona: getPersona,
+};
 export function restoreTrashed(type: string, id: number): boolean {
   const fn: Record<string, (x: number) => void> = {
     world: restoreWorld, scenario: restoreScenario, card: restoreCard, persona: restorePersona,
   };
   const f = fn[type];
-  if (!f) return false;
+  // unknown type OR unknown id → false (callers report 404, not a fake ok)
+  if (!f || !TRASH_GETTERS[type]?.(id)) return false;
   f(id);
   return true;
 }
@@ -447,7 +451,7 @@ export function permanentDeleteTrashed(type: string, id: number): boolean {
     world: permanentDeleteWorld, scenario: permanentDeleteScenario, card: permanentDeleteCard, persona: permanentDeletePersona,
   };
   const f = fn[type];
-  if (!f) return false;
+  if (!f || !TRASH_GETTERS[type]?.(id)) return false;
   f(id);
   return true;
 }
@@ -637,10 +641,11 @@ export function deleteLorebookEntry(id: number): void {
 
 /** Entries whose triggers (comma-separated) match the recent text. */
 export function activeLorebook(worldId: number, recentText: string): LorebookRow[] {
-  const lower = recentText.toLowerCase();
+  const lower = (recentText || "").toLowerCase();
   return listLorebook(worldId)
     .filter((e) => e.enabled === 1)
-    .filter((e) => e.triggers.split(",").map((t) => t.trim().toLowerCase()).filter(Boolean).some((t) => lower.includes(t)));
+    // triggers is NOT NULL today, but a legacy/dirty row must never 500 a generation
+    .filter((e) => String(e.triggers || "").split(",").map((t) => t.trim().toLowerCase()).filter(Boolean).some((t) => lower.includes(t)));
 }
 
 // ─── relations (character relationship graph) ─────────────────────────────────

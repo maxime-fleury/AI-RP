@@ -70,4 +70,35 @@ describe("guided builder assistant", () => {
     expect((await res.json()).error).toContain("monde exploitable");
     expect(calls).toBe(2);
   });
+
+  test("opening stage writes a titled intro from the idea, and rejects stubs", async () => {
+    db.setSetting("lmstudio_model", "test-model");
+    globalThis.fetch = (async () =>
+      llmResponse(JSON.stringify({
+        title: "Arrivée au village",
+        intro: "Tu ouvres les yeux sur une place pavée détrempée par la pluie qui tambourine sur les auvents. Une tavernière aux yeux perçants te dévisage depuis son comptoir pendant qu'un garde s'avance, la main sur le pommeau de son épée.",
+      }))) as unknown as typeof fetch;
+
+    const res = await api(routes, "POST", "/api/assist/build", {
+      stage: "opening",
+      description: "Téléporté dans un village perdu.",
+      world: { name: "Valbrume" },
+      persona: { name: "Max" },
+      castNames: ["Aube"],
+    });
+    expect(res.status).toBe(200);
+    const out = await res.json();
+    expect(out.title).toBe("Arrivée au village");
+    expect(out.intro.length).toBeGreaterThan(120);
+  });
+
+  test("opening stage 502s when the model returns a stub", async () => {
+    db.setSetting("lmstudio_model", "test-model");
+    globalThis.fetch = (async () => llmResponse('{"title":"ok","intro":"trop court"}')) as unknown as typeof fetch;
+    const res = await api(routes, "POST", "/api/assist/build", {
+      stage: "opening",
+      description: "Une idée.",
+    });
+    expect(res.status).toBe(502);
+  });
 });

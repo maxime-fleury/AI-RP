@@ -109,6 +109,46 @@ export async function readSseStream(res, onEvent, onClose) {
   onClose?.();
 }
 
+/**
+ * Normalize an uploaded image to a PNG dataURL (browser-side, via canvas).
+ * SillyTavern cards MUST be PNG to carry the chara chunk — a JPEG/WEBP avatar
+ * would otherwise export as a placeholder and lose its cover art. Returns the
+ * PNG dataURL, or the original dataURL when conversion is impossible (old
+ * browsers, corrupt file): the server still accepts jpeg/webp uploads.
+ */
+export async function fileToPngDataUrl(file, maxSide = 1024) {
+  const readOriginal = () => new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result));
+    fr.onerror = () => reject(new Error("read"));
+    fr.readAsDataURL(file);
+  });
+  if (file.type === "image/png") return readOriginal();
+  try {
+    const bitmap = await (typeof createImageBitmap === "function"
+      ? createImageBitmap(file)
+      : (() => { throw new Error("no-bitmap"); })());
+    const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("no-ctx");
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    if (typeof bitmap.close === "function") bitmap.close();
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+    if (!blob) throw new Error("to-blob");
+    return await new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(String(fr.result));
+      fr.onerror = () => reject(new Error("read"));
+      fr.readAsDataURL(blob);
+    });
+  } catch {
+    return readOriginal(); // graceful fallback: server keeps accepting jpeg/webp
+  }
+}
+
 export function uploadFiles(files) {
   // files: FileList → [{name, base64, skipped?}]
   if (!files || typeof files.length !== "number") return Promise.resolve([]);

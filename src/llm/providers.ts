@@ -25,9 +25,28 @@ export interface ChatProvider {
   label: string;
   configured(): boolean;
   models(): Promise<string[]>;
+  /** Same list plus a human reason when it comes back empty (shown in settings). */
+  listModels(): Promise<{ models: string[]; error?: string }>;
   stream(opts: StreamOptions): AsyncGenerator<string>;
   /** Non-streaming completion (used for suggestions, summaries…). */
   complete(opts: StreamOptions): Promise<string>;
+}
+
+/**
+ * Normalize the many shapes a /models endpoint can return:
+ * {data:[{id}]}, {data:["id"]}, {models:[…]}, or a bare array.
+ * LM Studio versions disagree, so accept them all; sort + dedupe.
+ */
+export function normalizeModelList(data: unknown): string[] {
+  const raw: unknown = Array.isArray(data)
+    ? data
+    : (data as any)?.data ?? (data as any)?.models ?? [];
+  if (!Array.isArray(raw)) return [];
+  const ids = raw
+    .map((m) => (typeof m === "string" ? m : (m as any)?.id))
+    .filter((s): s is string => typeof s === "string" && !!s.trim())
+    .map((s) => s.trim());
+  return [...new Set(ids)].sort((a, b) => a.localeCompare(b));
 }
 
 export class LMStudioProvider implements ChatProvider {
@@ -43,14 +62,31 @@ export class LMStudioProvider implements ChatProvider {
   }
 
   async models(): Promise<string[]> {
-    try {
-      const res = await fetch(`${this.baseUrl()}/models`, { signal: AbortSignal.timeout(4000) });
-      if (!res.ok) return [];
-      const data = (await res.json()) as { data?: { id: string }[] };
-      return (data.data ?? []).map((m) => m.id);
-    } catch {
-      return [];
+    return (await this.listModels()).models;
+  }
+
+  async listModels(): Promise<{ models: string[]; error?: string }> {
+    const base = this.baseUrl();
+    const urls = [`${base}/models`];
+    // users often paste the bare host (http://localhost:1234) without /v1 —
+    // try the suffixed endpoint before giving up
+    if (!/\/v1$/.test(base)) urls.push(`${base}/v1/models`);
+    let lastErr = "";
+    for (const u of urls) {
+      try {
+        const res = await fetch(u, { signal: AbortSignal.timeout(4000) });
+        if (!res.ok) {
+          lastErr = `LM Studio a répondu ${res.status} sur ${u}`;
+          continue;
+        }
+        const models = normalizeModelList(await res.json().catch(() => null));
+        if (models.length) return { models };
+        lastErr = "aucun modèle chargé dans LM Studio — onglet Developer → charge un modèle (▶), puis actualise";
+      } catch {
+        lastErr = `LM Studio injoignable (${u}) — lance le serveur local (Developer → Start Server, port 1234)`;
+      }
     }
+    return { models: [], error: lastErr };
   }
 
   private body(opts: StreamOptions, stream: boolean): Record<string, unknown> {
@@ -114,16 +150,20 @@ export class OpenRouterProvider implements ChatProvider {
   }
 
   async models(): Promise<string[]> {
+    return (await this.listModels()).models;
+  }
+
+  async listModels(): Promise<{ models: string[]; error?: string }> {
     try {
       const res = await fetch(`${this.baseUrl()}/models`, {
         headers: { Authorization: `Bearer ${this.key()}` },
         signal: AbortSignal.timeout(6000),
       });
-      if (!res.ok) return [];
-      const data = (await res.json()) as { data?: { id: string }[] };
-      return (data.data ?? []).map((m) => m.id);
+      if (!res.ok) return { models: [], error: `OpenRouter a répondu ${res.status} — vérifie la clé API` };
+      const models = normalizeModelList(await res.json().catch(() => null));
+      return models.length ? { models } : { models, error: "OpenRouter n'a renvoyé aucun modèle — vérifie la clé API" };
     } catch {
-      return [];
+      return { models: [], error: "OpenRouter injoignable — vérifie ta connexion" };
     }
   }
 

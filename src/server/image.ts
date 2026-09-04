@@ -63,17 +63,18 @@ function pythonExecutable(): string {
   return "python";
 }
 
-export function ensureImageServer(timeoutMs = 300_000): Promise<boolean> {
+export function ensureImageServer(timeoutMs = 300_000, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
   if (ensurePromise) return ensurePromise;
   let wrapped: Promise<boolean>;
-  wrapped = ensureImageServerOnce(timeoutMs).finally(() => {
+  wrapped = ensureImageServerOnce(timeoutMs, signal).finally(() => {
     if (ensurePromise === wrapped) ensurePromise = null;
   });
   ensurePromise = wrapped;
   return wrapped;
 }
 
-async function ensureImageServerOnce(timeoutMs: number): Promise<boolean> {
+async function ensureImageServerOnce(timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
   if (ready) return true;
   let waitingForExternal = false;
   // Already running (started externally)?
@@ -137,6 +138,12 @@ async function ensureImageServerOnce(timeoutMs: number): Promise<boolean> {
   }
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    // cancelling a job while the model is still loading must stop the wait
+    // (previously the job hung until the full 5 min timeout)
+    if (signal?.aborted) {
+      loading = false;
+      return false;
+    }
     if (!proc && !waitingForExternal) return false;
     try {
       const r = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(2000) });
@@ -188,29 +195,42 @@ export interface ImageResult {
 }
 
 export async function generateImage(req: ImageRequest, signal?: AbortSignal): Promise<ImageResult> {
-  if (!(await ensureImageServer())) throw new Error(lastError || "Serveur d'images indisponible.");
+  if (!(await ensureImageServer(300_000, signal))) {
+    if (signal?.aborted) throw new Error("Génération annulée");
+    throw new Error(lastError || "Serveur d'images indisponible.");
+  }
   // generous timeout: GPU inference can take minutes, but a wedged sidecar must
   // not hold the caller's connection open forever
+  const post = () => fetch(`${BASE}/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+    signal: combineSignals(signal, 300_000),
+  });
+  // transparent recovery: the sidecar may have died between ensure() and this
+  // call, or be wedged on a tight GPU (previously one user-visible failure
+  // per death). Reset and retry ONCE — a user cancel never retries, and the
+  // reset means the next request spawns a fresh server instead of hanging on
+  // the dead one.
   let res: Response;
   try {
-    res = await fetch(`${BASE}/generate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(req),
-      signal: combineSignals(signal, 300_000),
-    });
+    res = await post();
   } catch (e) {
-    // a user-initiated cancel is NOT a wedged sidecar: abort cleanly, do NOT
-    // kill the Python server (that would force a full model reload for the
-    // next request)
     if (signal?.aborted) throw new Error("Génération annulée");
-    // network failure or watchdog timeout → the sidecar is likely wedged on a
-    // tight GPU. Reset it NOW so the NEXT request spawns a fresh server instead
-    // of every subsequent generation hanging on the dead one.
-    console.error(`[image] génération interrompue (${String((e as Error)?.message ?? e).slice(0, 120)}) — redémarrage du serveur d'images`);
     stopImageServer();
-    throw new Error("La génération d'image n'a pas répondu à temps — le serveur d'images a été relancé. Réessaie.");
+    try {
+      if (await ensureImageServer(300_000, signal)) res = await post();
+      else throw e;
+    } catch (e2) {
+      if (signal?.aborted) throw new Error("Génération annulée");
+      console.error(`[image] génération interrompue (${String((e2 as Error)?.message ?? e2).slice(0, 120)})`);
+      throw new Error("La génération d'image n'a pas répondu — réessaie.");
+    }
   }
+  return finishGenerate(res);
+}
+
+async function finishGenerate(res: Response): Promise<ImageResult> {
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`Image (${res.status}): ${text.slice(0, 300)}`);
@@ -272,7 +292,9 @@ export async function generateAndSave(
     return { url: `/images/${subdir}/${key}.png`, seed: res.seed, ms: res.ms };
   }
   const res = await generateImage(req, signal);
-  const file = path.join(dir, `${Date.now()}.png`);
+  // Date.now() alone collides when two unseeded renders land in the same
+  // millisecond (second render silently overwrote the first)
+  const file = path.join(dir, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.png`);
   fs.writeFileSync(file, Buffer.from(res.image_base64, "base64"));
   return { url: `/images/${subdir}/${path.basename(file)}`, seed: res.seed, ms: res.ms };
 }

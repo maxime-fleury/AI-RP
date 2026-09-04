@@ -6,8 +6,21 @@ import { NEGATIVE_PROMPT, buildIllustrationPrompt, generateScenarioIntro, json, 
 import { createLocation, createLorebookEntry, createRelation, createScenario, createTimelineEvent, createWorld, deleteLocation, deleteLorebookEntry, deleteRelation, deleteScenario, deleteTimelineEvent, deleteWorld, getScenario, getSetting, getWorld, listConversations, listLocations, listLorebook, listMessages, listRelations, listScenarios, listTimeline, listWorlds, updateLocation, updateLorebookEntry, updateRelation, updateScenario, updateTimelineEvent, updateWorld } from "../db";
 import { errorResponse } from "../http";
 import { trackJob } from "../jobs";
-import { Codes, apiError, en, fkId, intArray, optStr, str } from "../validate";
+import { Codes, apiError, en, fkId, int, intArray, num, optStr, str } from "../validate";
 import { WORLD_SETTING_DEFS, objectSettingsJson } from "../settingsSchema";
+
+/** Map pin coordinate 0–100 (NaN / "abc" used to 500 on the sqlite bind). */
+function coord(v: unknown): number {
+  if (v === undefined || v === null || v === "") return 0;
+  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
+  return num(n, "coordonnée", 0, 100);
+}
+
+/** Integer that also accepts numeric strings (form fields serialize as text). */
+function intCoerce(v: unknown, label: string, min: number, max: number): number {
+  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
+  return int(n, label, min, max);
+}
 import { generateAndSave } from "../image";
 import { zipFiles } from "../zip";
 import { applyWorldTemplate, listWorldTemplates } from "../templates";
@@ -142,7 +155,9 @@ if (parts[1] === "worlds" && parts[2] && parts[3] === "map" && method === "GET")
       if (!world) return json({ error: "not found" }, 404);
       const texts: string[] = [];
       for (const c of listConversations().filter((x: any) => x.world_id === world.id)) {
-        for (const m of listMessages(c.id)) if (m.role === "assistant") texts.push(m.content);
+        // cap per message: place names repeat, and unbounded fiction makes the
+        // regex scan quadratic on very long parties
+        for (const m of listMessages(c.id)) if (m.role === "assistant") texts.push((m.content || "").slice(0, 20000));
       }
       const seen = new Set<string>();
       const locations: string[] = [];
@@ -177,14 +192,19 @@ if (parts[1] === "worlds" && parts[2] && parts[3] === "locations" && method === 
         world_id: world.id,
         name: str(body.name, "name", { max: 160 }),
         description: optStr(body.description, "description", 4000),
-        x: body.x !== undefined && body.x !== null ? Number(body.x) : 0,
-        y: body.y !== undefined && body.y !== null ? Number(body.y) : 0,
+        x: coord(body.x),
+        y: coord(body.y),
       }), 201);
     }
 
 if (parts[1] === "locations" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
-      const row = updateLocation(Number(parts[2]), body);
+      const patch: Record<string, unknown> = {};
+      if (body.name !== undefined) patch.name = str(body.name, "name", { max: 160 });
+      if (body.description !== undefined) patch.description = optStr(body.description, "description", 4000);
+      if (body.x !== undefined && body.x !== null) patch.x = coord(body.x);
+      if (body.y !== undefined && body.y !== null) patch.y = coord(body.y);
+      const row = updateLocation(Number(parts[2]), patch);
       if (!row) return json({ error: "not found" }, 404);
       return json(row);
     }
@@ -210,14 +230,20 @@ if (parts[1] === "worlds" && parts[2] && parts[3] === "lorebook" && method === "
         name: str(body.name, "name", { max: 160 }),
         triggers: optStr(body.triggers, "triggers", 500),
         content: str(body.content, "content", { max: 4000 }),
-        priority: body.priority !== undefined && body.priority !== null ? Number(body.priority) : 0,
+        priority: body.priority !== undefined && body.priority !== null ? intCoerce(body.priority, "priority", 0, 1000) : 0,
         enabled: body.enabled === false || body.enabled === 0 ? 0 : 1,
       }), 201);
     }
 
 if (parts[1] === "lorebook" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
-      const row = updateLorebookEntry(Number(parts[2]), body);
+      const patch: Record<string, unknown> = {};
+      if (body.name !== undefined) patch.name = str(body.name, "name", { max: 160 });
+      if (body.triggers !== undefined) patch.triggers = optStr(body.triggers, "triggers", 500);
+      if (body.content !== undefined) patch.content = str(body.content, "content", { max: 4000 });
+      if (body.priority !== undefined && body.priority !== null) patch.priority = intCoerce(body.priority, "priority", 0, 1000);
+      if (body.enabled !== undefined) patch.enabled = body.enabled === false || body.enabled === 0 || body.enabled === "0" ? 0 : 1;
+      const row = updateLorebookEntry(Number(parts[2]), patch);
       if (!row) return json({ error: "not found" }, 404);
       return json(row);
     }
@@ -248,7 +274,11 @@ if (parts[1] === "worlds" && parts[2] && parts[3] === "relations" && method === 
 
 if (parts[1] === "relations" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
-      const row = updateRelation(Number(parts[2]), body);
+      const patch: Record<string, unknown> = {};
+      if (body.from_name !== undefined) patch.from_name = str(body.from_name, "from_name", { max: 120 });
+      if (body.to_name !== undefined) patch.to_name = str(body.to_name, "to_name", { max: 120 });
+      if (body.kind !== undefined) patch.kind = optStr(body.kind, "kind", 80);
+      const row = updateRelation(Number(parts[2]), patch);
       if (!row) return json({ error: "not found" }, 404);
       return json(row);
     }

@@ -25,7 +25,13 @@ if (p === "/api/personas" && method === "POST") {
 
 if (parts[1] === "personas" && parts[2] && !parts[3] && method === "PATCH") {
       const body = await readJson(req);
-      const row = updatePersona(Number(parts[2]), body);
+      // whitelist + validate (raw-body merge stored "[object Object]" for
+      // non-string values and 500'd on sqlite bind)
+      const patch: Record<string, unknown> = {};
+      if (body.name !== undefined) patch.name = str(body.name, "name", { max: 160 });
+      if (body.description !== undefined) patch.description = optStr(body.description, "description", 4000);
+      if (body.avatar !== undefined) patch.avatar = optStr(body.avatar, "avatar", 300);
+      const row = updatePersona(Number(parts[2]), patch);
       return row ? json(row) : json({ error: "not found" }, 404);
     }
 
@@ -43,13 +49,13 @@ if (p === "/api/trash" && method === "GET") {
 if (p === "/api/trash/restore" && method === "POST") {
       const body = await readJson(req);
       const ok = restoreTrashed(String(body.type), Number(body.id));
-      return ok ? json({ ok: true }) : json({ error: "type inconnu" }, 400);
+      return ok ? json({ ok: true }) : json({ error: "élément introuvable dans la corbeille", code: "NOT_FOUND" }, 404);
     }
 
 if (p === "/api/trash/permanent" && method === "POST") {
       const body = await readJson(req);
       const ok = permanentDeleteTrashed(String(body.type), Number(body.id));
-      return ok ? json({ ok: true }) : json({ error: "type inconnu" }, 400);
+      return ok ? json({ ok: true }) : json({ error: "élément introuvable dans la corbeille", code: "NOT_FOUND" }, 404);
     }
     return null;
   } catch (e) {

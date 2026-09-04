@@ -1,4 +1,4 @@
-import { api, apiFetch, apiForm, uploadFiles, setToken, readSseStream } from "./api.js?v=66";
+import { api, apiFetch, apiForm, uploadFiles, setToken, readSseStream, fileToPngDataUrl } from "./api.js?v=66";
 import { el, esc, toast, actionToast, openModal, confirmModal, closeAllModals, field, ICONS, fmtTime, fmtAge } from "./ui.js?v=66";
 import { renderChat } from "./chat.js?v=66";
 
@@ -1542,6 +1542,9 @@ function renderGalleryTab(world) {
     // items arrive asynchronously; compute this from the current collection so
     // character filters are available after the gallery request completes.
     const characters = [...new Set(items.map((i) => i.character).filter(Boolean))];
+    // a deleted character's filter would otherwise show a permanent,
+    // misleading "Aucune illustration"
+    if (charFilter && !characters.includes(charFilter)) charFilter = null;
     const pills = el("div", { class: "gallery-filters" },
       ["all", "landscape", "portrait", "fav"].map((k) =>
         el("button", { class: "chip-btn slim" + (filter === k ? " on" : ""), onclick: () => { filter = k; paint(); } },
@@ -1632,8 +1635,16 @@ async function renderBranchGraph(id) {
   const byId = new Map(branches.map((b) => [b.id, b]));
   const childrenOf = (bid) => branches.filter((b) => b.parent_id === bid);
   const tree = [];
-  const walk = (b, depth) => { tree.push([b, depth]); for (const c of childrenOf(b.id)) walk(c, depth + 1); };
-  for (const r of branches.filter((b) => !b.parent_id || !byId.has(b.parent_id))) walk(r, 0);
+  // visited set: a corrupt parent_id cycle (A→B→A) used to recurse until the
+  // tab crashed with a stack overflow; self-parents render as roots
+  const seenWalk = new Set();
+  const walk = (b, depth) => {
+    if (!b || seenWalk.has(b.id)) return;
+    seenWalk.add(b.id);
+    tree.push([b, depth]);
+    for (const c of childrenOf(b.id)) walk(c, depth + 1);
+  };
+  for (const r of branches.filter((b) => !b.parent_id || b.parent_id === b.id || !byId.has(b.parent_id))) walk(r, 0);
   const kindSel = (b) => {
     const sel = el("select", { class: "mini-select", title: "Statut de cette branche", "aria-label": "Statut" },
       Object.entries(KIND_META).map(([k, m]) => el("option", { value: k, ...(b.branch_kind === k ? { selected: "" } : {}) }, m.label)),
@@ -2002,7 +2013,26 @@ function cardModal(existing) {
   let lastSeed = null;
   let genBusy = false;
   let everGen = false;
-  avatarInput.addEventListener("change", () => { const file = avatarInput.files?.[0]; if (!file || file.size > 5 * 1024 * 1024) return toast("Avatar limité à 5 Mo", "err"); const reader = new FileReader(); reader.onload = () => { avatarData = String(reader.result); avatarServer = null; lastSeed = null; sameSeedBtn.hidden = true; varyBtn.hidden = true; avatarStatus.textContent = ""; const next = el("img", { src: avatarData, class: "avatar avatar-lg" }); avatarPreview.replaceWith(next); avatarPreview = next; updatePreview(); }; reader.readAsDataURL(file); });
+  avatarInput.addEventListener("change", async () => {
+    const file = avatarInput.files?.[0];
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) { avatarInput.value = ""; return toast("Avatar limité à 5 Mo", "err"); }
+    avatarStatus.textContent = "⏳ Préparation…";
+    try {
+      // normalize to PNG so the SillyTavern export keeps the real cover art
+      // (a JPEG/WEBP avatar can't carry the chara chunk and exported as a
+      // placeholder). Falls back to the original bytes when undecodable.
+      avatarData = await fileToPngDataUrl(file);
+      if (avatarData.startsWith("data:image/png") && file.type !== "image/png") toast("Avatar converti en PNG ✓", "ok", 2200);
+    } catch {
+      return toast("Fichier illisible.", "err");
+    } finally {
+      avatarInput.value = ""; // same file re-selectable after an error
+      avatarStatus.textContent = "";
+    }
+    avatarServer = null; lastSeed = null; sameSeedBtn.hidden = true; varyBtn.hidden = true;
+    const next = el("img", { src: avatarData, class: "avatar avatar-lg" }); avatarPreview.replaceWith(next); avatarPreview = next; updatePreview();
+  });
   async function genAvatar(mode) {
     if (genBusy) return;
     if (!name.input.value.trim() && !desc.input.value.trim() && !perso.input.value.trim() && !scenario.input.value.trim() && !tags.input.value.trim()) return toast("Remplis au moins un champ du personnage pour générer un avatar.", "err");
@@ -2304,10 +2334,11 @@ async function renderSettings() {
   });
   const lmUrl = field("URL LM Studio (API)", s.lmstudio_url || "http://localhost:1234/v1", { placeholder: "http://localhost:1234/v1" });
   const orKey = field("Clé API OpenRouter", s.openrouter_key || "", { type: "password", placeholder: "sk-or-v1-…" });
-  const lmModel = field("Modèle LM Studio", s.lmstudio_model || "", {
-    type: "select",
-    options: s.lmstudio_model ? [[s.lmstudio_model, s.lmstudio_model]] : [["", "Chargement…"]],
-  });
+  // combobox (input + datalist), not a strict select: the model id stays
+  // typeable even when LM Studio is down, and every detected model is offered
+  const lmModel = field("Modèle LM Studio", s.lmstudio_model || "", { placeholder: "Ex : qwen2.5-7b-instruct…" });
+  const lmStatus = el("p", { class: "model-status", role: "status" }, "Recherche des modèles…");
+  const lmRefresh = el("button", { class: "btn btn-ghost btn-sm", title: "Recharger la liste des modèles depuis LM Studio" }, "↻ Actualiser");
   const orModel = field("Modèle OpenRouter", s.openrouter_model || "", { placeholder: "Ex: anthropic/claude-3.7-sonnet" });
   // ── narrator style presets (built-ins + user overrides, editable below) ──
   const narrMap = {}; // key → { label, prompt, custom, dirty }
@@ -2326,34 +2357,56 @@ async function renderSettings() {
     stylePreview.textContent = p ? p.prompt : "";
   });
 
+  // one datalist per provider, shared by the settings form and the party modal
+  const datalistFor = (id) => {
+    let dl = document.getElementById(id);
+    if (!dl) {
+      dl = el("datalist", { id });
+      document.body.append(dl);
+    }
+    return dl;
+  };
+  const paintDatalist = (id, list) => {
+    datalistFor(id).replaceChildren(...list.map((m) => el("option", { value: m }, m)));
+  };
+
+  let refreshGen = 0;
   const refreshModels = async () => {
+    const gen = ++refreshGen;
+    const prov = providerSel.input.value;
+    const stale = () => gen !== refreshGen;
     try {
-      const prov = providerSel.input.value;
+      lmStatus.textContent = "⏳ Recherche des modèles…";
       const res = await apiFetch(`/api/models?provider=${prov}`, { method: "GET" }).catch(() => null);
-      let list = [];
-      if (res?.ok) list = (await res.json()).models || [];
-      if (!list.length) return;
+      if (stale()) return;
+      if (!res?.ok) throw new Error(`le serveur a répondu ${res?.status ?? "?"}`);
+      const body = await res.json().catch(() => ({}));
+      const list = Array.isArray(body.models) ? body.models : [];
       if (prov === "lmstudio") {
-        const cur = lmModel.input.value || s.lmstudio_model || "";
-        const opts = list.includes(cur) ? list : (cur ? [cur, ...list] : list);
-        lmModel.input.replaceChildren(...opts.map((m) => el("option", { value: m, ...(m === cur ? { selected: "" } : {}) }, m)));
-        if (cur) lmModel.input.value = cur;
+        // never wipe what the user typed: merge the saved/typed value in
+        const cur = lmModel.input.value.trim() || s.lmstudio_model || "";
+        paintDatalist("lm-model-suggestions", list);
+        lmModel.input.setAttribute("list", "lm-model-suggestions");
+        if (cur && document.activeElement !== lmModel.input) lmModel.input.value = cur;
+        lmStatus.textContent = list.length
+          ? `✓ ${list.length} modèle${list.length > 1 ? "s" : ""} détecté${list.length > 1 ? "s" : ""} dans LM Studio`
+          : `⚠️ ${body.error || "aucun modèle détecté"}`;
       } else {
-        // OpenRouter: catalog is huge, so suggest via a datalist instead of
-        // forcing a select — previously the list was fetched then discarded.
-        let dl = document.getElementById("or-model-suggestions");
-        if (!dl) {
-          dl = el("datalist", { id: "or-model-suggestions" });
-          document.body.append(dl);
-        }
-        dl.replaceChildren(...list.map((m) => el("option", { value: m }, m)));
+        paintDatalist("or-model-suggestions", list);
         orModel.input.setAttribute("list", "or-model-suggestions");
+        lmStatus.textContent = list.length
+          ? `✓ ${list.length} modèles OpenRouter (suggestions)`
+          : `⚠️ ${body.error || "catalogue OpenRouter indisponible"}`;
       }
-    } catch { /* ignore */ }
+    } catch (e) {
+      if (stale()) return;
+      lmStatus.textContent = `⚠️ Modèles introuvables : ${e?.message || "serveur injoignable"} — tu peux quand même saisir l'identifiant à la main`;
+    }
   };
 
   providerSel.input.addEventListener("change", refreshModels);
   lmUrl.input.addEventListener("change", refreshModels);
+  lmRefresh.addEventListener("click", refreshModels);
   orKey.input.addEventListener("input", () => { /* typed; saved on save */ });
 
   const llmTimeout = field("Timeout du modèle (s)", s.llm_timeout || 150, { type: "number", min: 20, max: 900, step: 10 });
@@ -2361,6 +2414,7 @@ async function renderSettings() {
     el("div", { class: "row" }, providerSel.wrap, narrStyle.wrap),
     el("div", { class: "row" }, lmUrl.wrap, orKey.wrap),
     el("div", { class: "row" }, lmModel.wrap, orModel.wrap),
+    el("div", { class: "model-status-row" }, lmStatus, lmRefresh),
     el("div", { class: "row" }, llmTimeout.wrap),
     stylePreview,
     el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "12px" } },
@@ -2697,8 +2751,10 @@ async function renderSettings() {
             ))
           : el("p", { style: { color: "var(--text-dim)", fontSize: "13px" } }, "Aucune tâche enregistrée pour l'instant."),
       );
-      // live refresh while something is still queued or running
-      if (jobs.some((j) => j.status === "queued" || j.status === "running")) {
+      // live refresh while something is still queued or running — but stop
+      // when the settings screen is gone (leaving it polled /api/jobs every
+      // 4s forever on a detached DOM node)
+      if (document.contains(jobsCard) && jobs.some((j) => j.status === "queued" || j.status === "running")) {
         clearTimeout(jobsTimer);
         jobsTimer = setTimeout(paintJobs, 4000);
       }
@@ -3054,9 +3110,44 @@ function guidedWizard() {
       : el("input", { placeholder: placeholder ?? "", class: "assist-in", value: value ?? "" });
     return { wrap: el("label", { class: "assist-field" }, el("span", {}, label), input), input };
   };
-  const spinner = (txt) => el("div", { class: "assist-status" }, "⏳ " + esc(txt));
+  const spinner = (txt) => el("div", { class: "assist-status", role: "status" }, "⏳ " + esc(txt));
+  // honest spinner: local models can take a minute per batch — show elapsed
+  // time instead of "quelques secondes". Call node._stop() when done.
+  const timed = (txt) => {
+    const t0 = Date.now();
+    const node = el("div", { class: "assist-status", role: "status" }, "⏳ " + esc(txt));
+    const iv = setInterval(() => {
+      if (!node.isConnected) { clearInterval(iv); return; } // user moved on — don't tick a dead node forever
+      node.textContent = `⏳ ${txt} (${Math.round((Date.now() - t0) / 1000)}s)`;
+    }, 1000);
+    node._stop = () => clearInterval(iv);
+    return node;
+  };
+  // "Varier" helper: prefill the batch feedback box with an anchor proposal
+  // ("more like this one") — no backend change, just better steering.
+  const varyText = (name, desc) =>
+    `Dans l'esprit de « ${name} » (${String(desc || "").slice(0, 140)}) : une autre proposition du même genre, mais différente`;
+  // Draft persistence: closing the modal no longer loses the wizard — every
+  // step transition and every choice snapshots `st` to localStorage.
+  const DRAFT_KEY = "innsekai-assist-draft";
+  function saveAssistDraft() {
+    try {
+      localStorage.setItem(DRAFT_KEY, JSON.stringify({ v: 1, at: Date.now(), st }));
+    } catch { /* quota / private mode — the wizard just won't resume */ }
+  }
+  function loadAssistDraft() {
+    try {
+      const d = JSON.parse(localStorage.getItem(DRAFT_KEY) || "null");
+      if (!d || d.v !== 1 || !d.st || typeof d.st.desc !== "string") return null;
+      return d;
+    } catch { return null; }
+  }
+  function clearAssistDraft() {
+    try { localStorage.removeItem(DRAFT_KEY); } catch { /* ignore */ }
+  }
   // soft=true renders the previous batch from memory instead of calling the LLM.
   const go = (i, soft) => {
+    saveAssistDraft();
     if (i === 1) stepWorlds("", soft);
     else if (i === 2) stepPersonas("", soft);
     else if (i === 3) stepCharacters(soft);
@@ -3065,6 +3156,21 @@ function guidedWizard() {
   const keyOf = (s) => String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
 
   // ── étape 1 : la description libre ──
+  // instant checklist (no LLM): guides a better idea before spending GPU
+  // time — world cues, a "you", and named/role characters
+  const WORLD_CUES = ["monde", "royaume", "empire", "ville", "village", "futur", "cyber", "magie", "école", "forêt", "planète", "univers", "île", "désert", "espace", "médiéval", "steampunk", "post-apo", "donjon"];
+  const SELF_CUES = ["je suis", "je m'appelle", "moi,", "moi ", "mon ", "ma ", "mes ", "m'appelle"];
+  const ROLE_CUES = ["tavernière", "tavernier", "garde", "marchand", "sorcièr", "mage", "reine", "roi ", "princesse", "prince ", "détective", "fantôme", "dragon", "elfe", "nain", "vampire", "robot", "androïde", "prêtre", "capitaine", "pirate", "assassin", "aubergiste", "forgeron", "oracle", "démon", "ange "];
+  function analyzeIdea(text) {
+    const low = text.toLowerCase();
+    const words = low.trim() ? (low.trim().match(/\S+/g) || []).length : 0;
+    const hasWorld = WORLD_CUES.some((w) => low.includes(w));
+    const hasSelf = SELF_CUES.some((w) => low.includes(w));
+    const names = [...new Set([...text.matchAll(/\b([A-ZÀ-Þ][a-zà-ÿ'’-]{2,24})\b/g)].map((m) => m[1]))]
+      .filter((n) => !["Je", "Tu", "Il", "Elle", "Nous", "Vous", "Ils", "Elles", "Mon", "Ma", "Mes", "Le", "La", "Les", "Un", "Une", "Des", "Ex"].includes(n));
+    const roles = ROLE_CUES.filter((r) => low.includes(r));
+    return { words, hasWorld, hasSelf, names, roles };
+  }
   function stepDescribe() {
     const viewVersion = ++st.viewVersion;
     stepIdx = 0; paintProgress();
@@ -3072,10 +3178,33 @@ function guidedWizard() {
     ta.style.minHeight = "150px";
     const ex1 = "Un monde médiéval fantastique avec de la magie. Moi, Max, 22 ans, je suis téléporté au milieu de nulle part, dans un village perdu. Il y a une tavernière mystérieuse et un garde arrogant.";
     const ex2 = "Un futur cyberpunk moite et pluvieux où la mémoire se vend à crédit. Je suis un détective endetté, et une fantôme de synthèse me hante. Décris mes partenaires de fortune.";
+    const checklist = el("div", { class: "idea-checks", role: "status" });
+    let checkTimer = null;
+    const paintChecks = () => {
+      const a = analyzeIdea(ta.value);
+      const chip = (ok, label) => el("span", { class: "chip" + (ok ? " on" : "") }, (ok ? "✓ " : "○ ") + label);
+      const hints = [];
+      if (a.words > 0 && a.words < 20) hints.push("quelques phrases de plus aideront l'IA");
+      else {
+        if (!a.hasWorld) hints.push("décris le monde (époque, lieu, magie…)");
+        if (!a.hasSelf) hints.push("dis qui tu es (« je suis… »)");
+        if (!a.names.length && !a.roles.length) hints.push("nomme 1-2 personnages à rencontrer (facultatif)");
+      }
+      checklist.replaceChildren(
+        chip(a.hasWorld, "monde"),
+        chip(a.hasSelf, "toi"),
+        chip(a.names.length + a.roles.length > 0, `personnages${a.names.length + a.roles.length ? ` (${[...a.names, ...a.roles].slice(0, 3).join(", ")})` : ""}`),
+        el("span", { class: "idea-count" }, `${a.words} mot${a.words > 1 ? "s" : ""}`),
+        hints.length ? el("span", { class: "idea-hint" }, "💡 " + hints.join(" · ")) : null,
+      );
+    };
+    ta.addEventListener("input", () => { clearTimeout(checkTimer); checkTimer = setTimeout(() => { if (ta.isConnected) paintChecks(); }, 300); });
+    paintChecks();
     run(() => el("div", {},
       el("h3", {}, "Raconte ton idée"),
       el("p", { class: "modal-note" }, "Décris le monde, qui tu es, ce qui t'arrive — et les personnages que tu veux voir (facultatif). Ton modèle local (LM Studio) a besoin de quelques secondes par lot : laisse-le finir."),
       ta,
+      checklist,
       el("div", { class: "assist-refine", style: { justifyContent: "flex-start" } },
         el("button", { class: "chip-btn", onclick: () => { ta.value = ex1; } }, "Ex. isekai médiéval"),
         el("button", { class: "chip-btn", onclick: () => { ta.value = ex2; } }, "Ex. cyberpunk"),
@@ -3084,6 +3213,7 @@ function guidedWizard() {
         el("button", { class: "btn btn-primary", onclick: () => {
           st.desc = ta.value.trim();
           if (!st.desc) return toast("Décris d'abord ton idée.", "err");
+          saveAssistDraft();
           stepWorlds("");
         } }, "✨ Générer mon monde"),
       ),
@@ -3096,7 +3226,7 @@ function guidedWizard() {
     stepIdx = 1; paintProgress();
     const requestId = ++st.requests.worlds;
     const list = el("div", { class: "assist-list" });
-    const status = spinner("L'IA propose des mondes…");
+    const status = timed("L'IA propose des mondes…");
     const root = el("div", {},
       el("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "8px" } },
         el("h3", { style: { margin: 0 } }, "🌍 Choisis (ou affine) ton monde"),
@@ -3107,6 +3237,7 @@ function guidedWizard() {
     );
     run(() => root);
     const paintBatch = (r) => {
+      status._stop?.();
       status.hidden = true;
       const matches = r.matches || [];
       const proposals = r.proposals || [];
@@ -3124,6 +3255,7 @@ function guidedWizard() {
               st.world = { id: w.id, name: w.name, description: w.description, tone: w.tone, lore: w.lore };
               st.created.worldId = w.id; st.created.worldKey = keyOf(w.name); st.created.worldOwned = false;
               st.memo.personas = null; st.chars = []; st.charsCtx = null; // contexte changé → régénère la suite
+              saveAssistDraft();
               go(2, false);
             } }, isChosen ? "✓ Monde choisi" : "Choisir ce monde")),
           ));
@@ -3137,8 +3269,13 @@ function guidedWizard() {
           const fTone = fieldRow("Genre / ambiance", p.tone, "ex. heroic fantasy sombre", 1);
           const fLore = fieldRow("Histoire fondatrice", p.lore, "Passé, enjeux…", 3);
           const isChosen = !st.world?.id && keyOf(p.name) === chosenKey;
+          const varyBtn = el("button", { class: "btn btn-ghost btn-sm", title: "Pré-remplit l'amélioration pour d'autres mondes dans cet esprit", onclick: () => {
+            fb.value = varyText(fName.input.value.trim() || p.name, fDesc.input.value.trim() || p.description);
+            fb.focus();
+            fb.scrollIntoView({ block: "nearest", behavior: "smooth" });
+          } }, "🎲 Varier");
           list.append(el("div", { class: "assist-prop" + (isChosen ? " chosen" : "") }, fName.wrap, fDesc.wrap, fTone.wrap, fLore.wrap,
-            el("div", { class: "card-actions" }, el("button", { class: "btn btn-primary btn-sm", onclick: () => {
+            el("div", { class: "card-actions" }, varyBtn, el("button", { class: "btn btn-primary btn-sm", onclick: () => {
               const world = {
                 id: null, name: fName.input.value.trim(), description: fDesc.input.value.trim(),
                 tone: fTone.input.value.trim(), lore: fLore.input.value.trim(),
@@ -3147,6 +3284,7 @@ function guidedWizard() {
               if (!world.description) return toast("Décris le monde en une phrase au minimum.", "err");
               st.world = world;
               st.memo.personas = null; st.chars = []; st.charsCtx = null;
+              saveAssistDraft();
               go(2, false);
             } }, isChosen ? "✓ Monde choisi" : "Valider ce monde")),
           ));
@@ -3173,6 +3311,7 @@ function guidedWizard() {
       paintBatch(r);
     } catch (e) {
       if (requestId !== st.requests.worlds || viewVersion !== st.viewVersion) return;
+      status._stop?.();
       status.replaceChildren(el("span", { class: "danger" }, "⚠️ " + esc(e.message)));
       list.append(el("div", { class: "assist-refine" },
         el("button", { class: "btn btn-primary btn-sm", onclick: () => stepWorlds(feedback, false) }, "↻ Réessayer"),
@@ -3187,7 +3326,7 @@ function guidedWizard() {
     const requestId = ++st.requests.personas;
     const batchKey = keyOf(`${st.desc}|${st.world?.id || ""}|${st.world?.name || ""}`);
     const list = el("div", { class: "assist-list" });
-    const status = spinner("L'IA propose des personas…");
+    const status = timed("L'IA propose des personas…");
     const root = el("div", {},
       el("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "8px" } },
         el("h3", { style: { margin: 0 } }, "🧑‍🤝‍🧑 Qui incarnes-tu ?"),
@@ -3198,6 +3337,7 @@ function guidedWizard() {
     );
     run(() => root);
     const paintBatch = (r) => {
+      status._stop?.();
       status.hidden = true;
       const matches = r.matches || [];
       const proposals = r.proposals || [];
@@ -3215,6 +3355,7 @@ function guidedWizard() {
               st.persona = { id: p.id, name: p.name, description: p.description };
               st.created.personaId = p.id; st.created.personaKey = keyOf(p.name); st.created.personaOwned = false;
               st.chars = []; st.charsCtx = null;
+              saveAssistDraft();
               go(3, false);
             } }, isChosen ? "✓ Persona choisi" : "Utiliser ce persona")),
           ));
@@ -3226,12 +3367,18 @@ function guidedWizard() {
           const fName = fieldRow("Nom", p.name, "", 1);
           const fDesc = fieldRow("Description", p.description, "Qui tu es, apparence, passé, motivation…", 4);
           const isChosen = !st.persona?.id && keyOf(p.name) === chosenKey;
+          const varyBtn = el("button", { class: "btn btn-ghost btn-sm", title: "Pré-remplit l'amélioration pour d'autres personas dans cet esprit", onclick: () => {
+            fb.value = varyText(fName.input.value.trim() || p.name, fDesc.input.value.trim() || p.description);
+            fb.focus();
+            fb.scrollIntoView({ block: "nearest", behavior: "smooth" });
+          } }, "🎲 Varier");
           list.append(el("div", { class: "assist-prop" + (isChosen ? " chosen" : "") }, fName.wrap, fDesc.wrap,
-            el("div", { class: "card-actions" }, el("button", { class: "btn btn-primary btn-sm", onclick: () => {
+            el("div", { class: "card-actions" }, varyBtn, el("button", { class: "btn btn-primary btn-sm", onclick: () => {
               const persona = { id: null, name: fName.input.value.trim(), description: fDesc.input.value.trim() };
               if (!persona.name) return toast("Donne un nom à ton persona.", "err");
               st.persona = persona;
               st.chars = []; st.charsCtx = null;
+              saveAssistDraft();
               go(3, false);
             } }, isChosen ? "✓ Persona choisi" : "Valider ce persona")),
           ));
@@ -3262,6 +3409,7 @@ function guidedWizard() {
       paintBatch(r);
     } catch (e) {
       if (requestId !== st.requests.personas || viewVersion !== st.viewVersion) return;
+      status._stop?.();
       status.replaceChildren(el("span", { class: "danger" }, "⚠️ " + esc(e.message)));
       list.append(el("div", { class: "assist-refine" },
         el("button", { class: "btn btn-primary btn-sm", onclick: () => stepPersonas(feedback, false) }, "↻ Réessayer"),
@@ -3270,19 +3418,45 @@ function guidedWizard() {
   }
 
   // ── étape 4 : personnages évoqués → 4 cartes chacun ──
-  async function stepCharacters(soft = false) {
+  async function stepCharacters(soft = false, feedback = "") {
     const viewVersion = ++st.viewVersion;
     stepIdx = 3; paintProgress();
     const requestId = ++st.requests.characters;
     const charsKey = keyOf(`${st.desc}|${st.world?.id || ""}|${st.world?.name || ""}|${st.persona?.id || ""}|${st.persona?.name || ""}`);
     const list = el("div", { class: "assist-list" });
-    const status = spinner("Recherche des personnages évoqués…");
+    const status = timed("Recherche des personnages évoqués…");
+    // refine the extraction itself (previously only a full reset existed —
+    // the server always accepted feedback, the UI just never sent any)
+    const extractFb = el("input", { class: "assist-in", placeholder: "💡 Affiner l'extraction (ex. « oublie le garde, ajoute la sœur »)…" });
+    const extractBar = el("div", { class: "assist-refine" }, extractFb,
+      el("button", { class: "btn btn-ghost btn-sm", onclick: () => {
+        const v = extractFb.value.trim();
+        if (!v) return toast("Écris d'abord ton amélioration.", "err");
+        st.chars = []; st.charsCtx = null;
+        stepCharacters(false, v);
+      } }, "↻ Ré-extraire"),
+    );
     const addName = el("input", { class: "assist-in", placeholder: "Nom d'un personnage…" });
     const addRole = el("input", { class: "assist-in", placeholder: "Rôle (optionnel)…" });
+    const cardDurations = []; // ms per card batch, for the remaining-time estimate
+    const fmtEta = (ms) => ms < 60_000 ? `${Math.round(ms / 1000)}s` : `${Math.floor(ms / 60000)}min ${Math.round((ms % 60000) / 1000)}s`;
     const genAllBtn = el("button", { class: "btn btn-primary", onclick: async () => {
-      genAllBtn.disabled = true; genAllBtn.textContent = "⏳ Génération des cartes…";
+      genAllBtn.disabled = true;
+      const total = st.chars.length;
+      let done = 0;
+      genAllBtn.textContent = `⏳ Génération des cartes… (0/${total})`;
       for (const ch of st.chars) { ch.cards = null; ch.chosen = null; }
-      for (const ch of st.chars) await genCards(ch, "");
+      for (const ch of st.chars) {
+        done++;
+        const avg = cardDurations.length ? cardDurations.reduce((a, b) => a + b, 0) / cardDurations.length : 0;
+        const eta = avg && done < total ? ` — reste ≈ ${fmtEta(avg * (total - done + 1))}` : "";
+        genAllBtn.textContent = `⏳ Génération des cartes… (${done}/${total}) — ${ch.name}${eta}`;
+        const t0 = Date.now();
+        await genCards(ch, "");
+        cardDurations.push(Date.now() - t0);
+        if (cardDurations.length > 8) cardDurations.shift();
+      }
+      saveAssistDraft();
       genAllBtn.disabled = false; genAllBtn.textContent = "↻ Régénérer toutes les cartes";
     } }, "✨ Générer les cartes");
     const root = el("div", {},
@@ -3291,7 +3465,7 @@ function guidedWizard() {
         el("button", { class: "btn btn-ghost btn-sm", onclick: () => go(2, true) }, "← Persona"),
       ),
       el("p", { class: "modal-note" }, "Ceux que tu as décrits, repérés dans ton idée. Chacun recevra 4 cartes à choisir — ou sa carte existante si elle correspond déjà."),
-      status, list,
+      status, list, extractBar,
       el("div", { class: "assist-footer" },
         el("div", { class: "assist-refine", style: { flex: "1" } }, addName, addRole,
           el("button", { class: "btn btn-ghost btn-sm", onclick: () => {
@@ -3299,6 +3473,7 @@ function guidedWizard() {
             if (!nm) return toast("Écris un nom.", "err");
             st.chars.push({ name: nm, role: addRole.value.trim(), detail: "", reuseName: null, reuseCard: null, cards: null, chosen: null, status: "", skipped: false });
             addName.value = ""; addRole.value = "";
+            saveAssistDraft();
             paint();
           } }, "＋ Ajouter"),
         ),
@@ -3315,8 +3490,17 @@ function guidedWizard() {
     const genCards = async (ch, feedback) => {
       ch.status = "⏳ L'IA crée 4 cartes pour « " + ch.name + " »…";
       paint();
+      const t0 = Date.now();
       try {
-        const r = await api("/api/assist/build", { body: { stage: "cards", description: st.desc, world: st.world, character: { name: ch.name, role: ch.role, detail: ch.detail || "" }, feedback: feedback || "" } });
+        // persona + sibling names keep variants distinct from the player and
+        // from each other (server forbidden-name set); first_mes comes back
+        // with every proposal so the party starts talking right away
+        const r = await api("/api/assist/build", { body: {
+          stage: "cards", description: st.desc, world: st.world, persona: st.persona,
+          character: { name: ch.name, role: ch.role, detail: ch.detail || "" },
+          siblings: st.chars.map((x) => x.name).filter((n) => n && n !== ch.name),
+          feedback: feedback || "",
+        } });
         if (r.truncated) toast(r.note || "Description tronquée.", "warn");
         ch.cards = (r.proposals || []).filter((p2) => p2 && p2.name).slice(0, 4);
         ch.status = "";
@@ -3324,19 +3508,25 @@ function guidedWizard() {
       } catch (e) {
         ch.status = "⚠️ " + e.message;
       }
+      cardDurations.push(Date.now() - t0);
+      if (cardDurations.length > 8) cardDurations.shift();
       paint();
     };
 
-    const cardProp = (c, ch) => {
+    const cardProp = (c, ch, onVary) => {
       const f = {
         name: fieldRow("Nom", c.name, "", 1),
         desc: fieldRow("Description", c.description, "Apparence, signes distinctifs…", 3),
         pers: fieldRow("Personnalité", c.personality, "", 2),
         sce: fieldRow("Situation initiale", c.scenario, "", 2),
         tags: fieldRow("Tags", Array.isArray(c.tags) ? c.tags.join(", ") : "", "", 1),
+        first: fieldRow("Premier message", c.first_mes || "", "Sa première réplique quand le joueur le rencontre…", 2),
       };
-      return el("div", { class: "assist-prop sub" }, f.name.wrap, f.desc.wrap, f.pers.wrap, f.sce.wrap, f.tags.wrap,
-        el("div", { class: "card-actions" }, el("button", { class: "btn btn-primary btn-sm", onclick: () => {
+      const varyBtn = onVary
+        ? el("button", { class: "btn btn-ghost btn-sm", title: "Pré-remplit l'amélioration pour d'autres cartes dans cet esprit", onclick: onVary }, "🎲 Varier")
+        : null;
+      return el("div", { class: "assist-prop sub" }, f.name.wrap, f.desc.wrap, f.pers.wrap, f.sce.wrap, f.tags.wrap, f.first.wrap,
+        el("div", { class: "card-actions" }, varyBtn, el("button", { class: "btn btn-primary btn-sm", onclick: () => {
           ch.chosen = {
             card: {
               name: f.name.input.value.trim() || "Personnage",
@@ -3344,8 +3534,10 @@ function guidedWizard() {
               personality: f.pers.input.value.trim(),
               scenario: f.sce.input.value.trim(),
               tags: f.tags.input.value.split(",").map((t) => t.trim()).filter(Boolean),
+              first_mes: f.first.input.value.trim(),
             },
           };
+          saveAssistDraft();
           paint();
         } }, "✓ Valider cette carte")),
       );
@@ -3356,7 +3548,7 @@ function guidedWizard() {
       parts.push(el("div", { class: "char-head" },
         el("input", { class: "assist-in", value: ch.name, oninput: (e) => (ch.name = e.target.value.trim()) }),
         el("input", { class: "assist-in", value: ch.role, placeholder: "Rôle…", oninput: (e) => (ch.role = e.target.value.trim()) }),
-        el("button", { class: "mini-btn", title: "Retirer ce personnage", onclick: () => { st.chars = st.chars.filter((x) => x !== ch); paint(); } }, "🗑"),
+        el("button", { class: "mini-btn", title: "Retirer ce personnage", onclick: () => { st.chars = st.chars.filter((x) => x !== ch); saveAssistDraft(); paint(); } }, "🗑"),
       ));
       if (ch.detail) parts.push(el("div", { class: "assist-hint", style: { fontSize: "12px" } }, "📜 " + esc(ch.detail)));
       if (ch.reuseCard) parts.push(el("div", { class: "assist-hint reuse" }, "💡 Correspond à ta carte « " + esc(ch.reuseCard.name) + " »."));
@@ -3364,7 +3556,7 @@ function guidedWizard() {
       if (ch.chosen) {
         parts.push(el("div", { class: "assist-hint ok" },
           "✓ " + (ch.chosen.reuseCardId ? "Carte existante utilisée : « " + esc(ch.reuseCard.name) + " »" : "Carte choisie : « " + esc(ch.chosen.card.name) + " »"),
-          el("button", { class: "mini-btn", onclick: () => { ch.chosen = null; paint(); } }, "↺ Changer"),
+          el("button", { class: "mini-btn", onclick: () => { ch.chosen = null; saveAssistDraft(); paint(); } }, "↺ Changer"),
         ));
       } else {
         // The matching existing card is offered immediately, BEFORE any LLM
@@ -3372,12 +3564,18 @@ function guidedWizard() {
         if (ch.reuseCard) parts.push(el("div", { class: "assist-prop reuse" },
           el("strong", {}, "Déjà dans ta collection"),
           el("p", {}, esc(ch.reuseCard.description || "")),
-          el("div", { class: "card-actions" }, el("button", { class: "btn btn-primary btn-sm", onclick: () => { ch.chosen = { reuseCardId: ch.reuseCard.id, reuseName: ch.reuseCard.name }; paint(); } }, "Utiliser « " + esc(ch.reuseCard.name) + " »")),
+          el("div", { class: "card-actions" }, el("button", { class: "btn btn-primary btn-sm", onclick: () => { ch.chosen = { reuseCardId: ch.reuseCard.id, reuseName: ch.reuseCard.name }; saveAssistDraft(); paint(); } }, "Utiliser « " + esc(ch.reuseCard.name) + " »")),
         ));
         if (ch.cards) {
           if (ch.cards.length) parts.push(el("div", { class: "assist-sec" }, "Variantes générées"));
-          for (const c of ch.cards) parts.push(cardProp(c, ch));
           const fb = el("input", { class: "assist-in", placeholder: "💡 Pas convaincu ? Améliore et régénère…" });
+          // anchor steering per variant: "more like this one" without retyping
+          const varyFor = (c) => () => {
+            fb.value = varyText(c.name, c.description);
+            fb.focus();
+            fb.scrollIntoView({ block: "nearest", behavior: "smooth" });
+          };
+          for (const c of ch.cards) parts.push(cardProp(c, ch, varyFor(c)));
           parts.push(el("div", { class: "assist-refine" }, fb,
             el("button", { class: "btn btn-ghost btn-sm", onclick: () => genCards(ch, fb.value.trim()) }, "↻ Régénérer"),
           ));
@@ -3412,19 +3610,24 @@ function guidedWizard() {
       }
     };
     if (soft && st.memo.characters && st.charsCtx === charsKey) {
+      status._stop?.();
       status.hidden = true;
       applyCharacters(st.memo.characters, true);
       return;
     }
     try {
-      const r = await api("/api/assist/build", { body: { stage: "characters", description: st.desc, world: st.world, persona: st.persona, feedback: "" } });
+      const r = await api("/api/assist/build", { body: { stage: "characters", description: st.desc, world: st.world, persona: st.persona, feedback: feedback || "" } });
       if (requestId !== st.requests.characters || viewVersion !== st.viewVersion) return;
       if (r.truncated) toast(r.note || "Description tronquée.", "warn");
+      status._stop?.();
       status.hidden = true;
       // Keep a manual character added while the extraction request was in
       // flight; the user should never lose edits because the model answered.
-      applyCharacters(r, st.chars.length > 0);    } catch (e) {
+      applyCharacters(r, st.chars.length > 0);
+      saveAssistDraft();
+    } catch (e) {
       if (requestId !== st.requests.characters || viewVersion !== st.viewVersion) return;
+      status._stop?.();
       status.replaceChildren(el("span", { class: "danger" }, "⚠️ " + esc(e.message)));
       list.append(el("div", { class: "assist-refine" },
         el("button", { class: "btn btn-primary btn-sm", onclick: () => stepCharacters(false) }, "↻ Réessayer"),
@@ -3438,6 +3641,57 @@ function guidedWizard() {
     ++st.viewVersion;
     stepIdx = 4; paintProgress();
     const chosen = st.chars.map((ch) => ch.chosen).filter(Boolean);
+    // opening situation, generated from the idea (the situation used to die
+    // at the handoff — now it becomes the party's draft intro, editable)
+    if (!st.opening) st.opening = { title: "", intro: "" };
+    const opTitleF = fieldRow("Titre", st.opening.title, "Ex : Arrivée au village", 1);
+    const opIntroF = fieldRow("Situation de départ", st.opening.intro, "L'IA peut l'écrire depuis ton idée — ou écris-la toi-même…", 4);
+    const opTitle = opTitleF.input;
+    const opIntro = opIntroF.input;
+    opIntro.style.minHeight = "90px";
+    const opStatus = el("div", { class: "assist-status", role: "status", hidden: true });
+    let opBusy = false;
+    const opFb = el("input", { class: "assist-in", placeholder: "💡 Affiner (ex. « de nuit, sous la pluie »)…" });
+    const genOpening = async () => {
+      if (opBusy) return;
+      opBusy = true;
+      opStatus.hidden = false;
+      opStatus.textContent = "✨ L'IA écrit la scène d'ouverture…";
+      try {
+        const castNames = chosen.map((c) => (c.reuseCardId ? c.reuseName : c.card?.name)).filter(Boolean);
+        const r = await api("/api/assist/build", {
+          body: {
+            stage: "opening", description: st.desc, world: st.world, persona: st.persona,
+            castNames, feedback: opFb.value.trim(),
+          },
+        });
+        if (r.truncated) toast(r.note || "Description tronquée.", "warn");
+        opTitle.value = r.title || "";
+        opIntro.value = r.intro || "";
+        st.opening = { title: opTitle.value, intro: opIntro.value };
+        saveAssistDraft();
+        opStatus.textContent = "Scène prête — modifie-la à ton goût ✓";
+        toast("Situation de départ générée ✓", "ok");
+      } catch (e) {
+        opStatus.textContent = "⚠️ " + (e?.message || "génération impossible");
+      } finally {
+        opBusy = false;
+      }
+    };
+    const syncOpening = () => {
+      st.opening = { title: opTitle.value.trim(), intro: opIntro.value.trim() };
+      saveAssistDraft();
+    };
+    opTitle.addEventListener("change", syncOpening);
+    opIntro.addEventListener("change", syncOpening);
+    const openingBox = el("details", { class: "assist-opening", ...(st.opening.intro ? { open: "" } : {}) },
+      el("summary", {}, "📜 Situation de départ (optionnel — sinon l'accueil par défaut)"),
+      el("p", { class: "modal-note" }, "La scène d'ouverture de ta partie, écrite depuis ton idée. Elle sera proposée comme scénario au lancement."),
+      el("div", { class: "assist-refine" }, opFb,
+        el("button", { class: "btn btn-primary btn-sm", onclick: genOpening }, "✨ Générer"),
+      ),
+      opTitleF.wrap, opIntroF.wrap, opStatus,
+    );
     run(() => el("div", {},
       el("h3", {}, "✨ Vérifie et crée"),
       el("p", { class: "modal-note" }, "Tout sera créé pour de vrai (avatars en arrière-plan), puis la nouvelle partie s'ouvrira pré-remplie."),
@@ -3448,6 +3702,7 @@ function guidedWizard() {
           el("p", {}, esc(chosen.map((c) => (c.reuseCardId ? c.reuseName || "carte existante" : c.card.name)).join(", ") || "aucun") + (st.chars.length > chosen.length ? " — d'autres personnages sans carte validée seront ignorés." : "")),
         ),
       ),
+      openingBox,
       el("div", { class: "assist-refine", style: { justifyContent: "flex-end", marginTop: "16px" } },
         el("button", { class: "btn btn-ghost", onclick: () => stepCharacters(true) }, "← Retour"),
         el("button", { class: "btn btn-primary", onclick: async (e) => {
@@ -3533,7 +3788,7 @@ function guidedWizard() {
               const card = ch.chosen?.card;
               if (!card?.name?.trim()) continue;
               const cardKey = keyOf(card.name);
-              const cardPayload = { name: card.name, description: card.description, personality: card.personality, scenario: card.scenario, tags: JSON.stringify(card.tags || []) };
+              const cardPayload = { name: card.name, description: card.description, personality: card.personality, scenario: card.scenario, first_mes: card.first_mes || "", tags: JSON.stringify(card.tags || []) };
               const cardSignature = JSON.stringify(cardPayload);
               // A wizard-owned card keeps its identity even if the user edits
               // its name between retries; update it instead of creating a
@@ -3565,9 +3820,16 @@ function guidedWizard() {
               });
             }
             await refreshAll();
+            clearAssistDraft();
             closeAllModals();
             toast("✨ Monde, persona et personnages créés ✓");
-            newGameWizard({ world_id: worldId, persona_id: personaId, cast });
+            syncOpening();
+            newGameWizard({
+              world_id: worldId, persona_id: personaId, cast,
+              ...(st.opening?.intro?.trim()
+                ? { draft_title: st.opening.title.trim() || "Situation de départ", draft_intro: st.opening.intro.trim() }
+                : {}),
+            });
           } catch (err) {
             toast(err.message, "err");
             btn.disabled = false; btn.textContent = "✨ Créer & lancer la partie";
@@ -3577,7 +3839,35 @@ function guidedWizard() {
     ));
   }
 
-  stepDescribe();
+  // Resume: a draft from a closed wizard offers to pick up where it stopped
+  // (memoized batches render instantly, created ids keep creation idempotent).
+  const draft = loadAssistDraft();
+  if (draft && (draft.st.world || draft.st.persona || (draft.st.chars || []).length || draft.st.desc)) {
+    const when = new Date(draft.at).toLocaleString("fr-FR", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+    const bits = [
+      draft.st.world?.name ? "🌍 " + draft.st.world.name : null,
+      draft.st.persona?.name ? "🧑‍🤝‍🧑 " + draft.st.persona.name : null,
+      (draft.st.chars || []).length ? `🎭 ${(draft.st.chars || []).length} personnage(s)` : null,
+    ].filter(Boolean).join(" · ");
+    stepIdx = 0; paintProgress();
+    run(() => el("div", {},
+      el("h3", {}, "📝 Brouillon retrouvé"),
+      el("p", { class: "modal-note" }, `Une création interrompue (${when})${bits ? " : " + bits : ""}. Tes choix et tes lots déjà générés sont conservés.`),
+      el("div", { class: "assist-refine", style: { justifyContent: "flex-end" } },
+        el("button", { class: "btn btn-ghost", onclick: () => { clearAssistDraft(); stepDescribe(); } }, "🗑 Recommencer"),
+        el("button", { class: "btn btn-primary", onclick: () => {
+          Object.assign(st, draft.st, { requests: { worlds: 0, personas: 0, characters: 0 }, viewVersion: 0 });
+          if ((st.chars || []).length || st.memo.characters) go(3, true);
+          else if (st.persona) go(2, true);
+          else if (st.world) go(2, true);
+          else if (st.memo.worlds) { stepIdx = 0; stepWorlds("", true); }
+          else stepDescribe();
+        } }, "▶ Reprendre"),
+      ),
+    ));
+  } else {
+    stepDescribe();
+  }
 }
 
 export function newGameWizard(pre) {
@@ -3666,8 +3956,11 @@ export function newGameWizard(pre) {
     // the world, wait for its scenarios, then preselect the requested one
     worldSel.input.value = pre.world_id;
     loadScenarios(pre.world_id).then((sc) => {
-      if (!pre?.scenario_id || !sc?.some((s) => String(s.id) === String(pre.scenario_id))) return;
-      scenSel.input.value = pre.scenario_id;
+      if (pre?.scenario_id && sc?.some((s) => String(s.id) === String(pre.scenario_id))) {
+        scenSel.input.value = pre.scenario_id;
+        return;
+      }
+      applyGuidedDraft();
     });
   }
 
@@ -3702,6 +3995,23 @@ export function newGameWizard(pre) {
     ),
   );
   renderCast();
+  // coming from the guided builder with a generated opening → preselect it as
+  // a draft scenario, exactly like the in-modal genre generator does. Applied
+  // AFTER the async scenario load (which rebuilds the options and would wipe
+  // an earlier append).
+  const applyGuidedDraft = () => {
+    if (!pre?.draft_intro || scenSel.input.querySelector('option[value="draft"]')) return;
+    scenSel.input.append(el("option", { value: "draft", selected: "" }, pre.draft_title || "Situation de départ"));
+    scenSel.input.dataset.draftName = pre.draft_title || "Situation de départ";
+    scenSel.input.dataset.draftIntro = pre.draft_intro;
+    scenSel.input.value = "draft";
+    scenPreview.hidden = false;
+    scenPreview.replaceChildren(
+      el("div", { class: "gen-preview-head" }, "📜 " + esc(pre.draft_title || "Situation de départ")),
+      el("p", {}, esc(pre.draft_intro)),
+    );
+  };
+  if (!pre?.world_id) applyGuidedDraft();
   // coming from the guided builder → preselect the validated persona & cast
   if (pre?.persona_id) persoSel.input.value = String(pre.persona_id);
   if (Array.isArray(pre?.cast)) {
