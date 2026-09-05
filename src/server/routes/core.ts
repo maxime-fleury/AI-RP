@@ -28,8 +28,10 @@ import {
   type CanonRow,
 } from "../db";
 import { importFile, scanDirectory, sizeLimitFor, type ImportResult } from "../importCards";
+import { classifyIntent, directionChanged, intentToFocus } from "../../llm/intent";
+import { checkResponseDrift } from "../../llm/guardrail";
 import { getProvider, defaultModelFor, type ChatMessage } from "../../llm/providers";
-import { buildMessages, buildSystemPrompt, estimateTokens, parseSegments, fallbackSpeaker, summarizeSystem, presetFromKey, parseMemory, memoryToText, type Segment, type CastContext, type MemoryState } from "../../llm/prompt";
+import { buildMessages, buildSystemPrompt, estimateTokens, parseSegments, fallbackSpeaker, summarizeSystem, presetFromKey, parseMemory, memoryToText, profileFromSettings, modelClass, modelContextBudget, recencyBlock, stripThinking, type Segment, type CastContext, type MemoryState, type BuildPromptOptions, type SceneFocus } from "../../llm/prompt";
 import type { ConversationRow, MessageRow } from "../db";
 import { generateAndSave, probeImageStatus, ensureImageServer } from "../image";
 import { storageInfo, runBackup, analyzeOrphans, purgeOrphans } from "../backup";
@@ -40,7 +42,7 @@ import { IMAGES_DIR, UPLOADS_DIR } from "../paths";
 import { registerJobRetry, trackJob } from "../jobs";
 import { HttpError } from "../http";
 import { combineSignals } from "../signal";
-import { log } from "../log";
+import { log, recordMetric } from "../log";
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 // HTTP plumbing, embedded-media helpers and SSE are shared modules — see the
@@ -1247,6 +1249,128 @@ export async function generateQuests(title: string, messages: MessageRow[]): Pro
   }
 }
 
+export interface RpgQuestion {
+  q: string;
+  answers: string[];
+}
+
+/**
+ * Questionnaire du meneur : the narrator prepares a short batch of questions
+ * for the PLAYER, grounded in the world / cast / scenario / current scene, to
+ * guide the RP (motivations, intentions, relations, upcoming choices). Each
+ * question carries 2-4 suggested answers the player can pick or override.
+ * Returns null when the model can't answer.
+ */
+export async function generateQuestions(conv: ConversationRow, messages: MessageRow[], count = 5): Promise<RpgQuestion[] | null> {
+  const view = conversationView(conv.id)!;
+  const msgs = messages.slice(-40);
+  const { kept, summary, memory } = applyContextWindow(conv.id, conv, msgs);
+  const personaName = view.persona?.name ?? "le joueur";
+  const castLine = view.cards.length
+    ? `Personnages en scène : ${view.cards.map((c: any) => c.name).join(", ")}.`
+    : "Aucun personnage en scène.";
+  const worldLine = view.world
+    ? `Monde : ${view.world.name}.${view.world.description ? ` ${view.world.description.slice(0, 300)}` : ""}`
+    : "Monde générique.";
+  const sceneLine = (view.scenario?.intro || "").trim().slice(0, 400);
+  const recent = [...kept].slice(-8)
+    .map((m) => `${m.role === "user" ? personaName : (m.name || "Narrateur")} : ${(m.content || "").replace(/\s+/g, " ").slice(0, 260)}`)
+    .join("\n");
+  const memLine = (memory ? memoryToText(memory) : summary || "").trim().slice(0, 600);
+  const provider = getProvider();
+  let model = defaultModelFor(provider.id);
+  if (!model) {
+    const models = await provider.models().catch(() => []);
+    model = models[0] ?? "";
+  }
+  const n = Math.max(1, Math.min(8, Math.round(count)));
+  const sys = [
+    `Tu es le meneur de jeu d'une partie de roleplay. Tu prépares ${n} questions à poser au joueur (${personaName}) pour GUIDER la partie.`,
+    "Chaque question doit aider la suite de l'histoire : intentions du personnage, choix à venir, relations, ton de jeu, envies du joueur.",
+    "Questions courtes et variées, dans la langue du joueur (français par défaut). 2 à 4 réponses suggérées par question, sous forme de propositions que le joueur pourra choisir ou modifier.",
+    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : [{"q":"question","answers":["proposition 1","proposition 2","proposition 3"]}].',
+    "JSON complet, non tronqué. Ne pose pas de questions hors de la partie.",
+  ].join(" ");
+  const prompt = [
+    worldLine,
+    castLine,
+    sceneLine ? `Situation de départ : ${sceneLine}` : "",
+    recent ? `Derniers échanges :\n${recent}` : "",
+    memLine ? `Mémoire : ${memLine}` : "",
+    `Pose ${n} questions qui guident la suite de la partie.`,
+  ].filter(Boolean).join("\n\n");
+  let text = "";
+  try {
+    text = await provider.complete({
+      messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
+      model,
+      temperature: 0.8,
+      maxTokens: 1600,
+      noThinking: true,
+      signal: AbortSignal.timeout(120_000),
+    });
+  } catch (e) {
+    console.warn("[questions] complete failed:", String((e as any)?.message ?? e).slice(0, 160));
+    return null;
+  }
+  const arr = parseJsonArray(text || "");
+  if (!arr || !arr.length) {
+    // tolerant fallback: some models wrap the list in an object
+    const obj = parseCardAssistJson(text || "");
+    const wrapped = obj && Array.isArray((obj as any).questions) ? (obj as any).questions : null;
+    if (!wrapped?.length) return null;
+    return normalizeQuestions(wrapped, n);
+  }
+  return normalizeQuestions(arr, n);
+}
+
+/** Extract + parse the first balanced JSON array — robust to prose around it. */
+export function parseJsonArray(text: string): unknown[] | null {
+  const raw = String(text)
+    .replace(/```[a-zA-Z]*\n?/g, "")
+    .replace(/[“”]/g, '"')
+    .replace(/^\ufeff+/u, "");
+  const tryParse = (s: string): unknown[] | null => {
+    try {
+      const v = JSON.parse(s);
+      return Array.isArray(v) ? v : null;
+    } catch { return null; }
+  };
+  const fast = tryParse(raw);
+  if (fast) return fast;
+  let start = -1;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "[") { if (depth === 0) start = i; depth++; }
+    else if (c === "]") { depth--; if (depth === 0 && start >= 0) return tryParse(raw.slice(start, i + 1)); }
+  }
+  return null;
+}
+
+function normalizeQuestions(raw: unknown[], n: number): RpgQuestion[] {
+  return raw
+    .map((x: any) => {
+      const q = String(x?.q ?? x?.question ?? "").trim().replace(/\s+/g, " ").slice(0, 300);
+      const answers = (Array.isArray(x?.answers) ? x.answers : [])
+        .map((a: unknown) => String(a ?? "").trim().replace(/\s+/g, " ").slice(0, 180))
+        .filter(Boolean)
+        .slice(0, 4);
+      return q ? { q, answers } : null;
+    })
+    .filter((x: RpgQuestion | null): x is RpgQuestion => x !== null)
+    .slice(0, n);
+}
+
 /** Extract + parse the first balanced JSON object — robust to prose around it,
  * braces inside strings and raw newlines in string values (models cheat). */
 export function parseCardAssistJson(text: string): Record<string, unknown> | null {
@@ -1646,12 +1770,16 @@ export async function handleStream(req: Request, convId: number): Promise<Respon
   const userText = (body.content ?? "").trim();
   const modelText = (body.prompt ?? body.content ?? "").trim(); // slash commands rewrite the model input
   const directive = (body.directive ?? "").trim();
+  const steering = (body.steering ?? "").trim(); // per-turn steering channel (§8.3)
+  const isOoc = body.mode === "ooc" || /^(\/ooc\b|<ooc:?\s)/i.test(userText) || /^\[hors-jeu/i.test(modelText);
   if (!userText && !directive) { activeStreams.delete(convId); return json({ error: "message vide" }, 400); }
   // keep the model-facing input on the user message so "Régénérer" can replay
   // it exactly (slash commands and directives rewrite the raw content)
   const userMeta: Record<string, string> = {};
   if (modelText && modelText !== userText) userMeta.prompt = modelText;
   if (directive) userMeta.directive = directive;
+  if (steering) userMeta.steering = steering;
+  if (isOoc) userMeta.ooc = "1";
   if (attemptUid) userMeta.uid = attemptUid;
   const userMsg = createMessage({
     conversation_id: convId, role: "user",
@@ -1663,13 +1791,8 @@ export async function handleStream(req: Request, convId: number): Promise<Respon
   const historyBefore = listMessages(convId).filter((m) => m.id !== userMsg.id);
   // history + new user message
   const history = listMessages(convId);
-  // context window: keep recent messages, compress the rest into a rolling summary
-  const { kept, summary, memory } = applyContextWindow(convId, conv, history.filter((m) => m.id !== userMsg.id));
-  const { system, messages } = buildMessages({ world, persona, cards, scenario, conversation: conv, summary, memory }, kept);
-  messages.push({ role: "user", content: modelText || directive });
-  // interpellation directive (e.g. "ask the narrator / a character to speak")
-  if (directive) messages[messages.length - 1].content += `\n\n[Directive : ${directive}]`;
 
+  // per-party settings must be valid before we touch the model
   let settings: any = {};
   try {
     settings = JSON.parse(conv.settings || "{}");
@@ -1678,13 +1801,49 @@ export async function handleStream(req: Request, convId: number): Promise<Respon
     activeStreams.delete(convId);
     return json({ error: "Réglages de la partie corrompus — réinitialise-les depuis les réglages.", code: "INVALID_JSON" }, 422);
   }
+
+  // RP profile + intention classification (§8.2): the detected intent feeds
+  // the scene focus by default, and a direction change puts the persistent
+  // scene plan on hold for THIS turn only (manual focus always overrides).
+  const profile = profileFromSettings(settings);
+  const intent = classifyIntent(modelText || directive || userText);
+  const intentHistory: string[] = Array.isArray(settings.intent_history)
+    ? settings.intent_history.filter((x: unknown) => typeof x === "string")
+    : [];
+  const changed = directionChanged(intentHistory as any, intent);
+  const sceneControlHeld = changed && settings.scene_control && settings.scene_control.enabled !== false;
+  const effectiveFocus: SceneFocus | undefined = isOoc ? undefined : (profile.sceneFocus ?? intentToFocus(intent));
+
   const preset = presetFromKey(settings.preset);
   const provider = getProvider((settings.provider as string) || undefined);
   const model = (settings.model as string) || defaultModelFor(provider.id);
-  const rawTemp = Number(settings.temperature ?? preset?.temperature ?? getSetting("temperature", 0.9));
-  const temperature = Number.isFinite(rawTemp) ? Math.min(2, Math.max(0, rawTemp)) : 0.9;
+  const mclass = modelClass(model);
+  const budgetTokens = modelContextBudget(mclass);
+  // calmer defaults for the reactive profiles (report Phase 5)
+  const behaviorDefaultTemp = profile.behavior === "cinematique" ? 0.9 : 0.75;
+  const rawTemp = Number(settings.temperature ?? preset?.temperature ?? getSetting("temperature", behaviorDefaultTemp));
+  const temperature = Number.isFinite(rawTemp) ? Math.min(2, Math.max(0, rawTemp)) : 0.75;
   const rawMax = Number(settings.max_tokens ?? preset?.maxTokens ?? getSetting("max_tokens", 2048));
   const maxTokens = Number.isFinite(rawMax) ? Math.min(8192, Math.max(64, Math.round(rawMax))) : 2048;
+
+  // context window: keep recent messages, compress the rest into a rolling summary
+  const { kept, summary, memory } = applyContextWindow(convId, conv, history.filter((m) => m.id !== userMsg.id));
+  const buildOpts: BuildPromptOptions = {
+    profile,
+    ooc: isOoc,
+    sceneControlHeld,
+    steering: isOoc ? "" : steering,
+    budgetTokens,
+    currentTurn: modelText || directive,
+  };
+  const { system, messages } = buildMessages({ world, persona, cards, scenario, conversation: conv, summary, memory }, kept, buildOpts);
+  messages.push({ role: "user", content: modelText || directive });
+  // interpellation directive (e.g. "ask the narrator / a character to speak")
+  // — only when the turn also carries text, else the directive IS the message
+  if (directive && modelText) messages[messages.length - 1].content += `\n\n[Directive : ${directive}]`;
+  // recency block (§8.3): agency + active focus repeated right before generation
+  if (isOoc) messages[messages.length - 1].content += "\n\n[OOC — question hors-jeu : réponds hors de la fiction]";
+  else messages[messages.length - 1].content += `\n\n${recencyBlock(persona?.name ?? "le joueur", effectiveFocus)}`;
 
   // server-side trace of every generation (structured — see log.ts)
   const genLabel = (userText || directive || "").replace(/\s+/g, " ").trim().slice(0, 90);
@@ -1692,53 +1851,65 @@ export async function handleStream(req: Request, convId: number): Promise<Respon
   log("chat", "generation started", {
     convId, title: (conv.title || "sans titre").slice(0, 60), message: genLabel || "(directive)",
     provider: provider.id, model: model || "défaut", temperature, maxTokens,
+    behavior: profile.behavior, contextMode: profile.contextMode, length: profile.responseLength,
+    focus: effectiveFocus ?? "", focusSource: profile.manualFocus ? "manual" : isOoc ? "ooc" : "detected",
+    intent, modelClass: mclass, budgetTokens, sceneControlHeld, ooc: isOoc ? 1 : 0,
   });
 
   // hard timeout: a stuck model must not leave the UI on "…" forever
   const rawTimeout = Number(getSetting("llm_timeout", 150));
   const timeoutSec = Number.isFinite(rawTimeout) ? Math.min(900, Math.max(20, rawTimeout)) : 150;
   const llmAbort = new AbortController();
-  const llmTimer = setTimeout(() => llmAbort.abort(), timeoutSec * 1000);
+  let llmTimer = setTimeout(() => llmAbort.abort(), timeoutSec * 1000);
   let clientStopped = false;
   let assistantCreated = false;
+  let streamAttempts = 0;
 
   return sseStream(
     async (send, close) => {
     let full = "";
     let assistantId = 0;
     let doneSent = false; // the client was told the turn committed
-    try {
-      // transient failures (LM Studio loading a model, network blips) are
-      // retried with backoff before surfacing an error
-      const MAX_ATTEMPTS = 3;
+    const MAX_ATTEMPTS = 3;
+    // stream one attempt set with transient-failure backoff; sends deltas live
+    const streamOnce = async (msgs: ChatMessage[], temp: number): Promise<string> => {
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        streamAttempts++;
+        let acc = "";
         try {
           for await (const delta of provider.stream({
-            messages: [{ role: "system", content: system }, ...messages],
+            messages: msgs,
             model,
-            temperature,
+            temperature: temp,
             maxTokens,
             noThinking: true,
             signal: llmAbort.signal,
           })) {
-            full += delta;
+            acc += delta;
             send("delta", { text: delta });
           }
-          break; // stream finished
+          return acc;
         } catch (e: any) {
           const aborted = e?.name === "AbortError" || e?.name === "TimeoutError" || /abort/i.test(String(e));
           // Once any output has reached the client, retrying would append a
           // second response to the partial one and commit duplicated fiction.
-          if (aborted || full || attempt >= MAX_ATTEMPTS) throw e;
-          const wait = 500 * attempt * attempt;
+          if (aborted || acc || attempt >= MAX_ATTEMPTS) throw e;
           send("retry", { attempt, message: `Connexion au modèle instable — nouvelle tentative (${attempt}/${MAX_ATTEMPTS})…` });
-          await new Promise((r) => setTimeout(r, wait));
+          await new Promise((r) => setTimeout(r, 500 * attempt * attempt));
           if (clientStopped) throw e;
         }
       }
+      return "";
+    };
+    try {
+      full = await streamOnce([{ role: "system", content: system }, ...messages], temperature);
       clearTimeout(llmTimer);
+      // the guardrail correction below is a SECOND model call: re-arm a fresh,
+      // shorter timeout so a hung model can't leave the SSE open and the
+      // conversation locked after the main stream already succeeded
+      llmTimer = setTimeout(() => llmAbort.abort(), 60_000);
       const genSecs = ((Date.now() - genStart) / 1000).toFixed(1);
-      log("chat", "generation completed", { convId, secs: genSecs, chars: full.trim().length });
+      log("chat", "generation completed", { convId, secs: genSecs, chars: full.trim().length, attempts: streamAttempts });
       if (!full.trim()) {
         // try to get the model list for a nicer error
         const models = await provider.models().catch(() => []);
@@ -1750,9 +1921,33 @@ export async function handleStream(req: Request, convId: number): Promise<Respon
         close();
         return;
       }
+      // post-generation guardrail (§8.9): rule-based drift checks, then ONE
+      // transparent corrective regeneration when a check trips (extra latency
+      // only on real triggers; never for OOC turns or after Stop).
+      let driftRetry = false;
+      let driftIssues: string[] = [];
+      if (!isOoc && !clientStopped) {
+        const issues = checkResponseDrift(full, { personaName: persona?.name, focus: effectiveFocus, behavior: profile.behavior });
+        if (issues.length) {
+          driftIssues = issues.map((i) => i.detail);
+          log("chat", "drift detected", { convId, issues: driftIssues.join(" | ") });
+          const correction = `[CORRECTION : la réponse précédente ${driftIssues.join(" ; ")}. Réponds uniquement à la dernière action du joueur, sans contrôler le joueur ni introduire d'événement majeur non demandé, et termine à un point naturel où le joueur peut répondre.]`;
+          try {
+            const corrected = await streamOnce([...messages, chatMsg("user", correction)], 0.6);
+            if (corrected.trim()) { full = corrected; driftRetry = true; }
+          } catch (e2) {
+            console.warn(`[chat] correction du garde-fou échouée (partie #${convId}):`, String((e2 as any)?.message ?? e2).slice(0, 160));
+          }
+        }
+      }
+      clearTimeout(llmTimer);
+      // strip any visible chain-of-thought from the SAVED content
+      full = stripThinking(full);
+      if (!full.trim()) { deleteMessage(userMsg.id); send("error", { message: `Le modèle "${model}" n'a rien renvoyé.` }); close(); return; }
       const assistant = createMessage({
         conversation_id: convId, role: "assistant",
         name: cards[0]?.name ?? "Narrateur", content: full.trim(),
+        meta: JSON.stringify({ ooc: isOoc ? 1 : 0 }),
       });
       assistantCreated = true;
       assistantId = assistant.id;
@@ -1760,8 +1955,20 @@ export async function handleStream(req: Request, convId: number): Promise<Respon
       // into an "error" event (the client would think the turn failed and
       // retry, duplicating it). Log them and move on.
       try {
-        const segments = parseSegmentsFor(conv, full);
-        updateMessage(assistant.id, { segments: JSON.stringify(segments) });
+        // OOC replies stay plain text — never split into narration/dialogue
+        if (!isOoc) {
+          const segments = parseSegmentsFor(conv, full);
+          updateMessage(assistant.id, { segments: JSON.stringify(segments) });
+        }
+        // diagnostic trace on the message (Phase 5 — context inspector + metrics)
+        const diag = {
+          behavior: profile.behavior, contextMode: profile.contextMode, length: profile.responseLength,
+          focus: effectiveFocus ?? "", focusSource: profile.manualFocus ? "manual" : isOoc ? "ooc" : "detected",
+          intent, modelClass: mclass, budgetTokens, promptTokens: estimateTokens(system),
+          temperature, maxTokens, driftRetry, driftIssues, sceneControlHeld, attempts: streamAttempts,
+        };
+        const m2 = getMessage(assistant.id)!;
+        updateMessage(assistant.id, { meta: JSON.stringify({ ...JSON.parse(m2.meta || "{}"), diagnostics: diag }) });
         touchConversation(convId);
         const firstLine = full.trim().split("\n")[0]?.slice(0, 60) ?? "";
         // fresh conversation (only the opening message so far) → name it from the
@@ -1771,37 +1978,28 @@ export async function handleStream(req: Request, convId: number): Promise<Respon
         }
         // dashboard preview = the latest exchange
         updateConversation(convId, { last_message: full.trim().slice(0, 200) });
-        // game-master directives apply to THIS turn only — clear the pending flag
-        if (settings.dm) {
-          updateConversation(convId, { settings: JSON.stringify({ ...settings, dm_pending: false }) });
-        }
+        // end-of-turn state: clear the one-shot DM flag, record the intent
+        // history (scene_control.hold is per-turn only, never persisted)
+        updateConversation(convId, { settings: JSON.stringify({ ...settings, dm_pending: false, intent_history: [...intentHistory, intent].slice(-5) }) });
       } catch (e) {
-        console.error(`[chat] post-commit bookkeeping failed (partie #${convId}):`, String(e?.message ?? e).slice(0, 160));
+        console.error(`[chat] post-commit bookkeeping failed (partie #${convId}):`, String((e as any)?.message ?? e).slice(0, 160));
       }
+      // Phase 8: raw per-turn metric (regeneration rate, guardrail, profiles)
+      recordMetric("turn", {
+        convId, behavior: profile.behavior, contextMode: profile.contextMode, length: profile.responseLength,
+        focus: effectiveFocus ?? "", focusSource: profile.manualFocus ? "manual" : isOoc ? "ooc" : "detected",
+        intent, modelClass: mclass, budgetTokens, promptTokens: estimateTokens(system),
+        temperature, maxTokens, driftRetry, ooc: isOoc ? 1 : 0, attempts: streamAttempts, secs: Number(genSecs),
+      });
       doneSent = true;
       send("done", { message: messageView(getMessage(assistant.id) ?? assistant) });
-      console.log(`[chat] 📨  Réponse #${assistant.id} envoyée au client — suggestions en arrière-plan…`);
-      // suggestions are best-effort: a failure here is already-committed and
-      // must not surface as an error to the client
-      try {
-        const sugg = await generateSuggestions(
-          { world, persona, cards, scenario, conversation: conv },
-          listMessages(convId),
-        );
-        if (sugg.length) {
-          const m2 = getMessage(assistant.id)!;
-          updateMessage(assistant.id, { meta: JSON.stringify({ ...JSON.parse(m2.meta || "{}"), suggestions: sugg }) });
-          send("suggestions", { messageId: assistant.id, suggestions: sugg });
-        }
-      } catch (e) {
-        console.warn(`[chat] suggestions échouées (partie #${convId}):`, String(e?.message ?? e).slice(0, 160));
-      }
+      console.log(`[chat] 📨  Réponse #${assistant.id} envoyée au client${driftRetry ? " (corrigée par le garde-fou)" : ""}`);
       // player-owned canon: optional AI proposals after each turn (opt-in via
-      // settings.canon_auto) — proposals land in "proposed" and need approval
+      // settings.canon_auto, avancé mode only) — non-blocking tracked job
       try {
         let cs2: Record<string, unknown> = {};
         try { cs2 = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
-        if (cs2.canon_auto) {
+        if (cs2.canon_auto && profile.contextMode === "avance") {
           void trackJob(
             {
               type: "canon",
@@ -1813,7 +2011,7 @@ export async function handleStream(req: Request, convId: number): Promise<Respon
             async (job, api) => {
               await proposeCanonFacts(convId, listMessages(convId), api.signal);
             },
-          ).catch((e) => console.warn(`[canon] auto-propose failed (#${convId}):`, String(e?.message ?? e).slice(0, 160)));
+          ).catch((e) => console.warn(`[canon] auto-propose failed (#${convId}):`, String((e as any)?.message ?? e).slice(0, 160)));
         }
       } catch { /* ignore */ }
       close();
@@ -1836,15 +2034,16 @@ export async function handleStream(req: Request, convId: number): Promise<Respon
       } else if (aborted && clientStopped) {
         // user pressed Stop: commit whatever the model already wrote, then
         // drop the orphan user turn only if nothing was produced
-        if (full.trim()) {
+        const stoppedText = stripThinking(full);
+        if (stoppedText.trim()) {
           const partial = createMessage({
             conversation_id: convId, role: "assistant",
-            name: cards[0]?.name ?? "Narrateur", content: full.trim(),
+            name: cards[0]?.name ?? "Narrateur", content: stoppedText.trim(),
           });
-          const segs = parseSegmentsFor(conv, full);
+          const segs = parseSegmentsFor(conv, stoppedText);
           updateMessage(partial.id, { segments: JSON.stringify(segs) });
           touchConversation(convId);
-          updateConversation(convId, { last_message: full.trim().slice(0, 200) });
+          updateConversation(convId, { last_message: stoppedText.trim().slice(0, 200) });
         } else {
           deleteMessage(userMsg.id);
         }

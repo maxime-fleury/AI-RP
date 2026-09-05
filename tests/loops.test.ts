@@ -91,7 +91,7 @@ describe("time loops: checkpoints & rewind (RE:ZERO)", async () => {
 
   test("buildMessages drops rewind markers; buildSystemPrompt injects loops when narrator >= 1", () => {
     const conv = db.createConversation({ title: "P", settings: JSON.stringify({
-      loop_mem_narrator: 3, loop_mem_player: 1,
+      context_mode: "avance", loop_mem_narrator: 3, loop_mem_player: 1,
       loops: [{ n: 1, title: "Faux pas", summary: "Une gaffe et Mila est partie." }],
     }) });
     const history = [

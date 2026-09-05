@@ -70,7 +70,7 @@ describe("session recap (Previously on…)", async () => {
       text: "La cité est tombée sous les ombres.",
       shots: [{ caption: "Les remparts", prompt: "burning city walls at dusk", status: "done", image: "/images/x.png", seed: 1 }],
     };
-    db.updateConversation(conv.id, { settings: JSON.stringify({ recap }) });
+    db.updateConversation(conv.id, { settings: JSON.stringify({ recap, context_mode: "avance" }) });
 
     const res = await api(routes, "GET", `/api/conversations/${conv.id}/recap`);
     expect(res.status).toBe(200);
@@ -80,7 +80,8 @@ describe("session recap (Previously on…)", async () => {
 
     const ctx = { world: null, persona: null, cards: [], scenario: null, conversation: db.getConversation(conv.id)! };
     const sys = prompt.buildSystemPrompt(ctx);
-    expect(sys).toContain("Récap de la session précédente");
+    // avancé mode → the recap lands in the unified memory block
+    expect(sys).toContain("Mémoire pertinente");
     expect(sys).toContain("La chute de Valdore");
     expect(sys).toContain("La cité est tombée sous les ombres.");
   });
@@ -90,7 +91,7 @@ describe("session recap (Previously on…)", async () => {
     const sys = prompt.buildSystemPrompt({
       world: null, persona: null, cards: [], scenario: null, conversation: db.getConversation(conv.id)!,
     });
-    expect(sys).not.toContain("Récap de la session précédente");
+    expect(sys).not.toContain("Récapitulatif");
   });
 
   test("shots retry on a finished recap re-queues nothing and reports ok", async () => {

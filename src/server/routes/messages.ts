@@ -3,6 +3,7 @@
  * Returns null when no route matches; throws are mapped by index.ts.
  */
 import { json, messageView, parseSegmentsFor, readJson } from "./core";
+import { recordMetric } from "../log";
 import { type MessageRow, deleteMessage, getConversation, getMessage, lastMessageOf, listMessages, updateConversation, updateMessage } from "../db";
 import { errorResponse } from "../http";
 
@@ -42,6 +43,8 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "messages" && parts
       }
       updates.meta = JSON.stringify(meta);
       updateMessage(mid, updates);
+      // Phase 8: user edited a response — regeneration-rate signal per party
+      recordMetric("edit", { convId, mid, role: m.role });
       return json(messageView(getMessage(mid)!));
     }
 

@@ -195,14 +195,14 @@ describe("world workspace: locations / lorebook / relations / timeline / jobs", 
       { world, persona: null, cards: [], conversation: conv },
       history as any,
     );
-    expect(withTrigger.system).toContain("Connaissances du monde");
+    expect(withTrigger.system).toContain("Mémoire pertinente");
     expect(withTrigger.system).toContain("La guilde dirige la ville.");
 
     const noTrigger = prompt.buildMessages(
       { world, persona: null, cards: [], conversation: conv },
       [{ ...history[0], content: "*Je dors.*" }] as any,
     );
-    expect(noTrigger.system).not.toContain("Connaissances du monde");
+    expect(noTrigger.system).not.toContain("La guilde dirige la ville.");
   });
 
   test("relations: create + list", async () => {
@@ -269,7 +269,7 @@ describe("structured memory & provider health", async () => {
       { world: null, persona: null, cards: [], conversation: conv, memory: { location: "Eldoria", characters: ["Alba"], goals: ["Trouver la source"] } },
       [] as any,
     );
-    expect(out.system).toContain("Mémoire structurée");
+    expect(out.system).toContain("Mémoire pertinente");
     expect(out.system).toContain("📍 Lieu : Eldoria");
     expect(out.system).toContain("👥 Personnages : Alba");
   });

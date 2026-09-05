@@ -2410,12 +2410,17 @@ async function renderSettings() {
   orKey.input.addEventListener("input", () => { /* typed; saved on save */ });
 
   const llmTimeout = field("Timeout du modèle (s)", s.llm_timeout || 150, { type: "number", min: 20, max: 900, step: 10 });
+  // model-size-aware system-prompt budgets (Phase 3): 0 = built-in default
+  const budgetSmall = field("Budget prompt — petit modèle (tokens, 0 = auto ≈4k)", s.context_budget_small || 0, { type: "number", min: 0, max: 32000, step: 500 });
+  const budgetMedium = field("Budget prompt — modèle moyen (0 = auto ≈8k)", s.context_budget_medium || 0, { type: "number", min: 0, max: 32000, step: 500 });
+  const budgetLarge = field("Budget prompt — grand modèle (0 = auto ≈12k)", s.context_budget_large || 0, { type: "number", min: 0, max: 32000, step: 500 });
   container.append(el("div", { class: "card", style: { padding: "18px 22px" } },
     el("div", { class: "row" }, providerSel.wrap, narrStyle.wrap),
     el("div", { class: "row" }, lmUrl.wrap, orKey.wrap),
     el("div", { class: "row" }, lmModel.wrap, orModel.wrap),
     el("div", { class: "model-status-row" }, lmStatus, lmRefresh),
     el("div", { class: "row" }, llmTimeout.wrap),
+    el("div", { class: "row3" }, budgetSmall.wrap, budgetMedium.wrap, budgetLarge.wrap),
     stylePreview,
     el("p", { style: { fontSize: "12.5px", color: "var(--text-dim)", marginTop: "12px" } },
       "LM Studio : lance le serveur local (onglet Developer → Start Server, port 1234). OpenRouter : colle ta clé API — les deux peuvent être utilisés et le choix se fait au lancement de partie. Le style du narrateur s'applique aux nouvelles réponses.",
@@ -2766,6 +2771,9 @@ async function renderSettings() {
   // hardcoded — the enum rarely changes and the select needs labels anyway)
   const schemaNumFields = [
     [llmTimeout, "llm_timeout"],
+    [budgetSmall, "context_budget_small"],
+    [budgetMedium, "context_budget_medium"],
+    [budgetLarge, "context_budget_large"],
     [imgSteps, "image_steps"],
     [imgCfg, "image_cfg"],
   ];
@@ -2821,6 +2829,9 @@ async function renderSettings() {
             image_ref_strength: Number(imgRef.input.value),
             image_preload: imgPreload.input.checked,
             llm_timeout: Number(llmTimeout.input.value),
+            context_budget_small: Number(budgetSmall.input.value),
+            context_budget_medium: Number(budgetMedium.input.value),
+            context_budget_large: Number(budgetLarge.input.value),
             auth_token: authField.input.value.trim(),
             notifications: notifCb.input.checked,
             sound_effects: soundCb.input.checked,

@@ -46,16 +46,19 @@ describe("buildSystemPrompt", async () => {
     const conv = db.createConversation({ title: "P" });
     const ctx = { world: null, persona: null, cards: [], scenario: null, conversation: conv, summary: "Le groupe a atteint la cité." };
     const sys = prompt.buildSystemPrompt(ctx);
-    expect(sys).toContain("Résumé des événements précédents");
+    expect(sys).toContain("Mémoire pertinente");
     expect(sys).toContain("Le groupe a atteint la cité.");
-    expect(sys).toContain("maître de jeu");
+    expect(sys).toContain("partenaire de roleplay");
   });
 
   test("narrator never speaks: format section present", () => {
     const conv = db.createConversation({ title: "P" });
     const sys = prompt.buildSystemPrompt({ world: null, persona: null, cards: [], scenario: null, conversation: conv });
-    expect(sys).toContain("raconte UNIQUEMENT l'histoire");
-    expect(sys).toContain("Ne fais JAMAIS parler le joueur");
+    expect(sys).toContain("raconte en narration entre astérisques");
+    expect(sys).toContain("Ne fais JAMAIS agir, parler, penser ou décider à la place du joueur");
+    // the default profile must not push forced plot movement
+    expect(sys).not.toContain("rebondissements");
+    expect(sys).toContain("partenaire de roleplay");
   });
 
   test("buildMessages maps roles 1:1", () => {

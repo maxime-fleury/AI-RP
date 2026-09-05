@@ -88,6 +88,36 @@ describe("chat streaming (handleStream)", () => {
     expect((await readSseAll(res2)).some((e) => e.event === "done")).toBe(true);
   });
 
+  test("background suggestions do NOT hold the conversation lock (Phase 4)", async () => {
+    const conv = t.conv({ title: uid("Decouple") });
+    // non-stream calls (suggestions…) answer SLOWLY — under the old code the
+    // awaited suggestions kept activeStreams locked and the next turn 409'd
+    globalThis.fetch = (async (_url: any, opts: any) => {
+      let stream = false;
+      try {
+        stream = JSON.parse(String(opts?.body || "{}")).stream === true;
+      } catch { /* ignore */ }
+      if (stream) {
+        const chunks = `data: ${JSON.stringify({ choices: [{ delta: { content: "réponse" } }] })}\n\ndata: [DONE]\n\n`;
+        return new Response(chunks, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+      }
+      await new Promise((r) => setTimeout(r, 500)); // slow background work
+      return new Response(JSON.stringify({ choices: [{ message: { content: "" } }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    const res = await api(routes, "POST", `/api/conversations/${conv.id}/stream`, { content: "Premier tour" });
+    expect((await readSseAll(res)).some((e) => e.event === "done")).toBe(true);
+    // the SSE stream already closed → a new turn is NOT 409-blocked, even
+    // though the background suggestion call is still in flight
+    const res2 = await api(routes, "POST", `/api/conversations/${conv.id}/stream`, { content: "Deuxième tour" });
+    const events2 = await readSseAll(res2);
+    expect(events2.some((e) => e.event === "done")).toBe(true);
+    expect(events2.some((e) => e.event === "error")).toBe(false);
+  });
+
   test("provider failure → error event, user turn rolled back, lock released", async () => {
     const conv = t.conv({ title: uid("Echec") });
     globalThis.fetch = (() => Promise.reject(new Error("boom"))) as unknown as typeof fetch;

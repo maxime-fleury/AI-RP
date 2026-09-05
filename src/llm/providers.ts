@@ -32,6 +32,11 @@ export interface ChatProvider {
   complete(opts: StreamOptions): Promise<string>;
 }
 
+/** Models that accept a `reasoning` control field on OpenRouter. */
+function isThinkingModel(model: string): boolean {
+  return /qwen|deepseek|r1|o1|o3|thinking|reasoning/i.test(String(model || ""));
+}
+
 /**
  * Normalize the many shapes a /models endpoint can return:
  * {data:[{id}]}, {data:["id"]}, {models:[…]}, or a bare array.
@@ -168,13 +173,19 @@ export class OpenRouterProvider implements ChatProvider {
   }
 
   async *stream(opts: StreamOptions): AsyncGenerator<string> {
-    const body = {
+    const body: Record<string, unknown> = {
       model: opts.model,
       messages: opts.messages,
       temperature: opts.temperature ?? 0.9,
       max_tokens: opts.maxTokens ?? 2048,
       stream: true,
     };
+    if (opts.noThinking && isThinkingModel(opts.model)) {
+      // OpenRouter parity with LM Studio's chat_template_kwargs: disable
+      // chain-of-thought for reasoning models. Only sent for models known to
+      // accept the field — unknown fields 400 on some OpenRouter models.
+      body.reasoning = { enabled: false };
+    }
     const res = await fetch(`${this.baseUrl()}/chat/completions`, {
       method: "POST",
       headers: {
@@ -194,13 +205,16 @@ export class OpenRouterProvider implements ChatProvider {
   }
 
   async complete(opts: StreamOptions): Promise<string> {
-    const body = {
+    const body: Record<string, unknown> = {
       model: opts.model,
       messages: opts.messages,
       temperature: opts.temperature ?? 0.9,
       max_tokens: opts.maxTokens ?? 2048,
       stream: false,
     };
+    if (opts.noThinking && isThinkingModel(opts.model)) {
+      body.reasoning = { enabled: false };
+    }
     const res = await fetch(`${this.baseUrl()}/chat/completions`, {
       method: "POST",
       headers: {

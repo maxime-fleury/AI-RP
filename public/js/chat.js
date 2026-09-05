@@ -440,7 +440,8 @@ export async function renderChat(convIdRaw) {
   // the header keeps only the essentials; everything else lives in a two-pane
   // popup: a rail of category buttons on the left, the selected category's
   // actions on the right (each category acts as its own dropdown button).
-  const questBtn = el("button", { title: "Journal de quêtes", onclick: () => questModal(conv) }, "🗡"); // invisible triggers, surfaced via the menu
+  const askBtn = el("button", { title: "Poser des questions au joueur (guider le RP)", onclick: () => questionnaireModal() }, "❓"); // invisible triggers, surfaced via the menu
+  const questBtn = el("button", { title: "Journal de quêtes", onclick: () => questModal(conv) }, "🗡");
   const statsBtn = el("button", { title: "Statistiques", onclick: () => statsModal(convId) }, "📊");
   const npcBtn = el("button", { title: "Proposer un PNJ", onclick: () => npcSuggestModal() }, "✨");
   const checkpointBtn = el("button", { title: "Marquer un checkpoint", onclick: () => checkpointModal() }, "📌");
@@ -451,7 +452,7 @@ export async function renderChat(convIdRaw) {
   const menu = el("div", { class: "header-menu", hidden: true });
   const closeHeaderMenu = () => { menu.hidden = true; };
   const sections = [
-    { title: "🎬 Scène & mémoire", items: [[sceneBtn, "État de la scène"], [memoryBtn, "Mémoire de la partie"], [dmBtn, "Directives du maître de jeu"], [contextBtn, "Contexte envoyé au modèle"], [branchesBtn, "Variantes"], [validateBtn, "Vérifier la cohérence"]] },
+    { title: "🎬 Scène & mémoire", items: [[sceneBtn, "État de la scène"], [memoryBtn, "Mémoire de la partie"], [dmBtn, "Directives du maître de jeu"], [askBtn, "Poser des questions"], [contextBtn, "Contexte envoyé au modèle"], [branchesBtn, "Variantes"], [validateBtn, "Vérifier la cohérence"]] },
     { title: "🔎 Fil & sélection", items: [[searchBtn, "Rechercher"], [bookmarkFilterBtn, "Favoris seulement"], [selectBtn, "Sélectionner plusieurs messages"]] },
     { title: "📤 Export", items: [[mdBtn, "Exporter en Markdown"], [copyThreadBtn, "Copier le fil"], [galleryBtn, "Galerie d'illustrations"], [exportBtn, "Exporter en ZIP"]] },
     { title: "🕘 Boucles de temps", items: [[checkpointBtn, "Marquer un checkpoint"], [returnBtn, "Revenir au checkpoint"], [loopsBtn, "Journal des boucles"]] },
@@ -846,6 +847,23 @@ export async function renderChat(convIdRaw) {
   const stopBtn = el("button", { class: "send-btn stop-btn", hidden: true, onclick: stopStreaming, title: "Arrêter la génération" }, "⏹");
   const suggestBtn = el("button", { class: "send-btn ghost", onclick: onSuggest, title: "Suggestions de réponses" }, "💡");
   const composer = el("div", { class: "composer" }, textarea, suggestBtn, stopBtn, sendBtn);
+
+  // ── RP / OOC mode toggle + per-turn steering channel (§8.3) ───────────────
+  let composerMode = "rp";
+  const modeRp = el("button", { type: "button", class: "on", onclick: () => setComposerMode("rp"), title: "Dans la fiction" }, "💬 RP");
+  const modeOoc = el("button", { type: "button", onclick: () => setComposerMode("ooc"), title: "Hors-jeu : question au modèle, sans fiction" }, "💬 OOC");
+  const modeSeg = el("div", { class: "seg mini" }, modeRp, modeOoc);
+  const steerInput = el("input", { type: "text", class: "steer-input", placeholder: "Consigne du tour (optionnelle) : ex. « pas d'action, juste du dialogue »", "aria-label": "Consigne du tour" });
+  const steerWrap = el("div", { class: "composer-extra" }, modeSeg, steerInput);
+  function setComposerMode(m) {
+    composerMode = m;
+    modeRp.classList.toggle("on", m === "rp");
+    modeOoc.classList.toggle("on", m === "ooc");
+    steerWrap.hidden = m === "ooc";
+    textarea.placeholder = m === "ooc"
+      ? "Question hors-jeu au modèle…"
+      : (conv.cards?.[0] ? `Écris ta réplique à ${conv.cards[0].name}…` : "Écris ton action ou ta réplique…");
+  }
   async function stopStreaming() {
     if (!abortController) return;
     const ac = abortController;
@@ -882,7 +900,7 @@ export async function renderChat(convIdRaw) {
   selectionBarRef = selectionBar;
 
   selectionExitRef = selectBtn;
-  const composerWrap = el("div", { class: "composer-wrap" }, selectionBar, coherenceBanner, slashMenu, speakRow, chipsRow, composer);
+  const composerWrap = el("div", { class: "composer-wrap" }, selectionBar, coherenceBanner, slashMenu, steerWrap, speakRow, chipsRow, composer);
 
   chipsRowRef = chipsRow;
 
@@ -921,15 +939,18 @@ export async function renderChat(convIdRaw) {
     const raw = textarea.value.trim();
     if (busy && raw) return toast("Une génération est déjà en cours…", "warn", 2000);
     if (!raw || busy) return;
+    const steer = steerInput.value.trim();
+    const mode = composerMode;
     const slash = parseSlash(raw);
     textarea.value = "";
+    steerInput.value = "";
     textarea.style.height = "auto";
     if (slash) {
       if (slash.action) { await slash.action(); return; }
       if (!slash.prompt) return toast(slash.display); // invalid dice syntax → hint only
-      await doStream(slash.display, { prompt: slash.prompt });
+      await doStream(slash.display, { prompt: slash.prompt, mode, steering: steer });
     } else {
-      await doStream(raw);
+      await doStream(raw, { mode, steering: steer });
     }
   }
 
@@ -981,6 +1002,19 @@ export async function renderChat(convIdRaw) {
     provider.input.addEventListener("change", syncModelList);
     syncModelList();
     const presetSel = field("Preset de style", convSettings.preset || "", { type: "select", options: [["", "Par défaut (réglages manuels)"], ...Object.entries(GENERATION_PRESETS).map(([k, v]) => [k, v.label])] });
+    // ── RP profile (comportement / contexte / longueur / focus) ──
+    const behaviorSel = field("Comportement", convSettings.behavior || "equilibre", { type: "select", options: [["reactif", "Réactif (suit le joueur)"], ["equilibre", "Équilibré"], ["cinematique", "Cinématique (initiative)"]] });
+    const lenSel = field("Longueur de réponse", convSettings.response_length || "courte", { type: "select", options: [["courte", "Courte"], ["moyenne", "Moyenne"], ["longue", "Longue"]] });
+    const modeSel = field("Contexte", convSettings.context_mode || "simple", { type: "select", options: [["simple", "Simple (essentiel)"], ["avance", "Avancé (toutes les mémoires)"]] });
+    const focusSel = field("Focus de scène", convSettings.scene_focus || "", { type: "select", options: [["", "Auto (détection)"], ["explorer", "Explorer / aventure"], ["conversation", "Conversation"], ["romance", "Romance / intimité"], ["adulte", "Scène adulte"], ["combat", "Combat"], ["enquete", "Enquête"], ["tranche_de_vie", "Tranche de vie"], ["personnage", "Focus personnage"]] });
+    const autoNpcsCb = el("label", { class: "setting-row" },
+      el("span", { class: "lbl" }, "Suggérer des PNJ après chaque tour"),
+      el("input", { type: "checkbox", "aria-label": "Suggérer des PNJ automatiquement", ...(convSettings.auto_npcs === true || (convSettings.auto_npcs === undefined && convSettings.context_mode === "avance") ? { checked: "" } : {}) }),
+    );
+    const autoRelsCb = el("label", { class: "setting-row" },
+      el("span", { class: "lbl" }, "Relations automatiques"),
+      el("input", { type: "checkbox", "aria-label": "Relations automatiques", ...(convSettings.auto_relations === true || (convSettings.auto_relations === undefined && convSettings.context_mode === "avance") ? { checked: "" } : {}) }),
+    );
     const temp = field("Température", convSettings.temperature ?? 0.9, { type: "number", min: 0, max: 2, step: 0.1 });
     const maxTok = field("Max tokens", convSettings.max_tokens ?? 2048, { type: "number", min: 64, max: 8192, step: 64 });
     const ctxMax = field("Tours gardés en mémoire", convSettings.context_max_messages ?? store.settings.context_max_messages ?? 20, { type: "number", min: 4, max: 100, step: 1 });
@@ -1100,6 +1134,11 @@ export async function renderChat(convIdRaw) {
       autoValCb,
       diceCb,
       ctxLine,
+      el("div", { class: "modal-section" }, "Profil RP"),
+      el("div", { class: "row" }, behaviorSel.wrap, lenSel.wrap),
+      el("div", { class: "row" }, modeSel.wrap, focusSel.wrap),
+      autoNpcsCb,
+      autoRelsCb,
       el("div", { class: "modal-section" }, "Mode de jeu"),
       el("div", { class: "row" }, el("div", { class: "modal-line" },
         el("div", { class: "ml-txt" }, el("strong", {}, "Faire jouer tous les personnages"), el("small", {}, "Groupe : chacun réagit à la scène · Solo : un personnage principal")),
@@ -1129,6 +1168,12 @@ export async function renderChat(convIdRaw) {
           provider: provider.input.value,
           model: model.input.value.trim(),
           preset: presetSel.input.value,
+          behavior: behaviorSel.input.value,
+          response_length: lenSel.input.value,
+          context_mode: modeSel.input.value,
+          scene_focus: focusSel.input.value,
+          auto_npcs: autoNpcsCb.querySelector("input").checked,
+          auto_relations: autoRelsCb.querySelector("input").checked,
           temperature: Number(temp.input.value),
           max_tokens: Number(maxTok.input.value),
           context_max_messages: Number(ctxMax.input.value),
@@ -1260,7 +1305,7 @@ async function doStream(content, opts = {}) {
         const res = await apiFetch(`/api/conversations/${currentConversation.id}/stream`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content, directive: opts.directive || "", prompt: opts.prompt || "", uid: attemptUid }),
+          body: JSON.stringify({ content, directive: opts.directive || "", prompt: opts.prompt || "", mode: opts.mode || "rp", steering: opts.steering || "", uid: attemptUid }),
           signal: abortController.signal,
         });
     let streamDone = false; // an "error" after "done" is never a failure (turn committed)
@@ -1931,36 +1976,49 @@ async function canonModal() {
 async function contextModal() {
   if (!currentConversation) return;
   const convId = currentConversation.id;
-  let r;
-  try { r = await api(`/api/conversations/${convId}/context`); }
-  catch (e) { return toast(e.message, "err"); }
-
-  const bar = el("div", { class: "ctx-bar" }, el("div", { class: "ctx-fill", style: { width: `${Math.min(100, r.budget)}%` } }));
-  const stat = (label, value) => el("div", { class: "ctx-stat" }, el("strong", {}, value), el("small", {}, label));
-  const chips = el("div", { class: "ctx-chips" },
-    el("span", { class: "chip" }, `📖 ${r.canon.count} faits canoniques`),
-    r.directives.one_shot_dm ? el("span", { class: "chip" }, "🎮 directives DM actives") : null,
-    r.directives.persistent_scene_control ? el("span", { class: "chip" }, "🧭 plan de scène actif") : null,
-    r.summaryUsed ? el("span", { class: "chip" }, "📚 résumé utilisé") : null,
-    r.memoryUsed ? el("span", { class: "chip" }, "🧠 mémoire utilisée") : null,
-  );
-  const sysBlock = el("details", { class: "ctx-block" },
-    el("summary", {}, `📜 Prompt système (${r.systemTokens.toLocaleString("fr-FR")} tokens)`),
-    el("pre", { class: "ctx-pre" }, esc(r.system)),
-  );
-  const msgs = el("div", { class: "ctx-msgs" });
-  const shown = r.messages.slice(-20);
-  msgs.replaceChildren(...shown.map((m) =>
-    el("details", { class: "ctx-msg" },
-      el("summary", {}, `${m.role === "user" ? "🧑 vous" : "🎭 narrateur"} · ${String(m.content).length} caractères`),
-      el("pre", { class: "ctx-pre" }, esc(m.content)),
-    ),
-  ));
-
-  openModal({
-    title: "📡 Contexte envoyé au modèle",
-    sub: "Ce que le modèle recevra au prochain tour : canon, directives, mémoire, résumé, puis messages récents.",
-    body: el("div", { class: "ctx-body" },
+  let preview = "";
+  const body = el("div", { class: "ctx-body" });
+  // preview the REAL next turn — the inspector re-builds the exact prompt the
+  // model would receive (incl. recency block, unified memory, lore matching)
+  const previewInput = el("input", { type: "text", class: "steer-input", placeholder: "Aperçu du prochain tour : tape ton message puis Entrée…" });
+  previewInput.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    preview = previewInput.value.trim();
+    void paint();
+  });
+  const paint = async () => {
+    let r;
+    try { r = await api(`/api/conversations/${convId}/context${preview ? `?input=${encodeURIComponent(preview)}` : ""}`); }
+    catch (e) { return toast(e.message, "err"); }
+    const bar = el("div", { class: "ctx-bar" }, el("div", { class: "ctx-fill", style: { width: `${Math.min(100, r.budget)}%` } }));
+    const stat = (label, value) => el("div", { class: "ctx-stat" }, el("strong", {}, value), el("small", {}, label));
+    const chips = el("div", { class: "ctx-chips" },
+      el("span", { class: "chip" }, `🎭 ${r.profile.behavior}`),
+      el("span", { class: "chip" }, `🧩 ${r.profile.contextMode}`),
+      el("span", { class: "chip" }, `📏 ${r.profile.responseLength}`),
+      r.profile.sceneFocus ? el("span", { class: "chip" }, `🎯 ${r.profile.sceneFocus}`) : el("span", { class: "chip" }, "🎯 auto"),
+      el("span", { class: "chip" }, `⚙️ ${r.modelClass}`),
+      el("span", { class: "chip" }, `📖 ${r.canon.count} faits canoniques`),
+      r.directives.one_shot_dm ? el("span", { class: "chip" }, "🎮 directives DM actives") : null,
+      r.directives.persistent_scene_control ? el("span", { class: "chip" }, "🧭 plan de scène actif") : null,
+      r.summaryUsed ? el("span", { class: "chip" }, "📚 résumé utilisé") : null,
+      r.memoryUsed ? el("span", { class: "chip" }, "🧠 mémoire utilisée") : null,
+    );
+    const sysBlock = el("details", { class: "ctx-block" },
+      el("summary", {}, `📜 Prompt système (${r.systemTokens.toLocaleString("fr-FR")} tokens)`),
+      el("pre", { class: "ctx-pre" }, esc(r.system)),
+    );
+    const msgs = el("div", { class: "ctx-msgs" });
+    const shown = r.messages.slice(-20);
+    msgs.replaceChildren(...shown.map((m) =>
+      el("details", { class: "ctx-msg" },
+        el("summary", {}, `${m.role === "user" ? "🧑 vous" : "🎭 narrateur"} · ${String(m.content).length} caractères${m.current ? " · prochain tour" : ""}`),
+        el("pre", { class: "ctx-pre" }, esc(m.content)),
+      ),
+    ));
+    body.replaceChildren(
+      previewInput,
       el("div", { class: "ctx-stats" },
         stat("tokens envoyés", r.tokens.toLocaleString("fr-FR")),
         stat("messages gardés", `${r.keptMessages} / ${r.messageCount}`),
@@ -1968,16 +2026,22 @@ async function contextModal() {
         stat("plafond", r.capSource === "tokens" ? "tokens" : "tours"),
       ),
       bar,
-      el("div", { class: "ctx-budget-note" }, `Budget utilisé : ${r.budget}%`),
+      el("div", { class: "ctx-budget-note" }, `Budget utilisé : ${r.budget}% · prompt système plafonné à ${r.systemBudget.toLocaleString("fr-FR")} tokens`),
       chips,
       sysBlock,
       el("div", { class: "ctx-block" },
         el("summary", {}, `💬 Messages envoyés (${r.messages.length} — aperçu des ${shown.length} derniers)`),
         msgs,
       ),
-    ),
+    );
+  };
+  openModal({
+    title: "📡 Contexte envoyé au modèle",
+    sub: "Ce que le modèle recevra au prochain tour : profil RP, canon, directives, mémoire unifiée, puis messages récents.",
+    body,
     wide: true,
   });
+  void paint();
 }
 
 // ─── narrative consistency check (IA, button-triggered) ─────────────────────
@@ -2028,9 +2092,10 @@ function renderMessage(m) {
   const marker = isChapter || isRewind;
   const isSystem = !isMe && (m.meta?.system || (m.name || "").toLowerCase() === "système" || (m.content || "").startsWith("[Système]"));
   const isDice = (m.content || "").startsWith("🎲 ") || m.meta?.dice;
+  const isOoc = !isMe && m.meta?.ooc;
   // distinct accessible kind per message — screen readers announce the role,
   // CSS can target each kind without relying on color/italics/emoji alone
-  const kind = marker ? (isChapter ? "chapter" : "rewind") : isSystem ? "system" : isDice ? "dice" : isMe ? "user" : "narrator";
+  const kind = marker ? (isChapter ? "chapter" : "rewind") : isSystem ? "system" : isDice ? "dice" : isOoc ? "ooc" : isMe ? "user" : "narrator";
   const segs = m.segments || [];
   const body = el("div", { class: "body" });
   if (isChapter) {
@@ -2049,7 +2114,10 @@ function renderMessage(m) {
     for (const b of splitBlocks(m.content)) body.append(el("div", { "data-kind": b.type || "text" }, formatBody(b)));
   }
   const bubble = el("div", { class: "bubble" + (m.bubbleClass ? " " + m.bubbleClass : "") + (marker ? " chapter-bubble rewind-bubble" : ""), ...(!marker ? { title: "Double-clic pour modifier" } : {}) },
-    isMe || marker ? null : el("div", { class: "who" }, esc(m.name || "Narrateur")),
+    isMe || marker ? null : el("div", { class: "who" },
+      esc(m.name || "Narrateur"),
+      isOoc ? el("span", { class: "chip tiny ooc-badge" }, "hors-jeu") : null,
+    ),
     body,
   );
   // double-click → inline edit (Enter valide, Échap annule)
@@ -2358,6 +2426,8 @@ async function regenerate(messageId) {
     const opts = {};
     if (meta.prompt) opts.prompt = meta.prompt;
     if (meta.directive) opts.directive = meta.directive;
+    if (meta.steering) opts.steering = meta.steering;
+    if (meta.ooc) opts.mode = "ooc";
     toast("↻ Régénération en cours…", "ok", 3000);
     await doStream(lastUser.content, opts);
   } catch (e) { toast(e.message, "err"); }
@@ -2487,6 +2557,112 @@ document.addEventListener("click", (e) => { if (sheetEl && !sheetEl.contains(e.t
 // ─── quest journal ───────────────────────────────────────────────────────────
 // Objectives auto-extracted by the LLM on demand, editable by the player.
 // Stored user-side only: never injected into the model prompt.
+// ─── questionnaire du meneur (❓) ────────────────────────────────────────────
+// The narrator prepares a few questions to GUIDE the RP. The player answers one
+// at a time — picking a suggested answer or typing their own — and the answers
+// are fed back into the story through a normal turn.
+async function questionnaireModal() {
+  if (!currentConversation) return;
+  const convId = currentConversation.id;
+  let questions = []; // [{ q, answers: [] }]
+  let answers = []; // string[] aligned with questions ("" = unanswered)
+  let idx = 0;
+
+  const note = el("p", { class: "modal-note" },
+    "Le narrateur te pose quelques questions pour guider la partie. Choisis une proposition ou écris ta propre réponse, puis passe à la suivante. Tes réponses seront intégrées à la partie.",
+  );
+  const status = el("div", { class: "assist-status", hidden: true });
+  const retryBtn = el("button", { class: "mini-btn", hidden: true, onclick: () => { retryBtn.hidden = true; load(true); } }, "↻ Réessayer");
+  const progress = el("div", { class: "ask-progress" });
+  const questionEl = el("div", { class: "ask-question" });
+  const chips = el("div", { class: "ask-chips" });
+  const custom = el("textarea", { class: "ask-answer", rows: 3, placeholder: "Ta réponse… (ou clique une proposition ci-dessus)" });
+  const prevBtn = el("button", { class: "btn btn-ghost btn-sm" }, "← Précédente");
+  const nextBtn = el("button", { class: "btn btn-ghost btn-sm" }, "Question suivante →");
+  const finishBtn = el("button", { class: "btn btn-primary btn-sm" }, "✓ Terminer et lancer");
+  const cancelBtn = el("button", { class: "btn btn-ghost" }, "Fermer");
+
+  const answeredCount = () => answers.filter((a) => a && a.trim()).length;
+  const paint = () => {
+    const total = questions.length;
+    progress.textContent = total ? `Question ${idx + 1} / ${total}` : "";
+    prevBtn.disabled = idx === 0;
+    nextBtn.disabled = idx >= total - 1;
+    finishBtn.disabled = answeredCount() === 0;
+    if (!total) {
+      questionEl.textContent = "";
+      chips.replaceChildren();
+      custom.value = "";
+      custom.disabled = true;
+      return;
+    }
+    custom.disabled = false;
+    const q = questions[idx];
+    questionEl.textContent = q.q || "";
+    const cur = answers[idx] || "";
+    custom.value = cur;
+    chips.replaceChildren(...(q.answers || []).map((a) =>
+      el("button", { class: "chip-btn" + (cur === a ? " on" : ""), onclick: () => { answers[idx] = a; paint(); } }, esc(a)),
+    ));
+  };
+
+  const load = async (retry = false) => {
+    status.hidden = false;
+    status.textContent = retry ? "Le narrateur reformule ses questions…" : "Le narrateur prépare ses questions…";
+    try {
+      const r = await api(`/api/conversations/${convId}/questions`, { body: { count: 5 } });
+      questions = r.questions || [];
+      answers = questions.map(() => "");
+      idx = 0;
+      status.hidden = true;
+      paint();
+      if (!questions.length) {
+        status.hidden = false;
+        status.textContent = "Aucune question générée — réessaie.";
+        retryBtn.hidden = false;
+      }
+    } catch (e) {
+      status.hidden = false;
+      status.textContent = "⚠️ " + e.message;
+      retryBtn.hidden = false;
+    }
+  };
+
+  custom.addEventListener("input", () => { answers[idx] = custom.value; finishBtn.disabled = answeredCount() === 0; });
+  prevBtn.addEventListener("click", () => { if (idx > 0) { answers[idx] = custom.value; idx--; paint(); } });
+  nextBtn.addEventListener("click", () => { if (idx < questions.length - 1) { answers[idx] = custom.value; idx++; paint(); } });
+
+  const { close } = openModal({
+    title: "❓ Poser des questions (guider le RP)",
+    sub: currentConversation.title || "",
+    body: el("div", { class: "ask-body" },
+      note,
+      el("div", { class: "quest-actions" }, status, retryBtn),
+      progress,
+      questionEl,
+      chips,
+      custom,
+      el("div", { class: "ask-nav" }, prevBtn, el("div", { style: { flex: "1" } }), nextBtn, finishBtn),
+    ),
+    footer: [cancelBtn],
+    wide: true,
+  });
+  cancelBtn.addEventListener("click", close);
+  finishBtn.addEventListener("click", async () => {
+    answers[idx] = custom.value;
+    const done = questions
+      .map((q, i) => ({ q: q.q, a: (answers[i] || "").trim() }))
+      .filter((x) => x.a);
+    if (!done.length) return toast("Réponds à au moins une question.", "warn");
+    close();
+    if (busy) return toast("Une génération est déjà en cours…", "warn", 2000);
+    const lines = done.map((x, i) => `Q${i + 1} : ${x.q}\n→ ${x.a}`).join("\n\n");
+    const prompt = `[Questionnaire du meneur — réponses du joueur]\n${lines}\n\nIntègre ces réponses à la partie : elles guident la suite (intentions, relations, faits à retenir). Prends-les en compte dans la scène en cours et réponds brièvement, puis laisse le joueur reprendre la main.`;
+    await doStream("📋 Questionnaire complété", { prompt, display: `📋 Questionnaire complété (${done.length} réponse${done.length > 1 ? "s" : ""})` });
+  });
+  void load();
+}
+
 async function questModal(conv) {
   const convId = currentConversation.id;
   let quests = [];
@@ -2687,6 +2863,10 @@ function syncCurrentMemory(convId, mem) {
 async function maybeChapter() {
   const conv = currentConversation;
   if (!conv) return;
+  let cs = {};
+  try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  // chapters are an avancé-mode feature — never auto-created in Simple
+  if (cs.context_mode !== "avance") return;
   const r = await api(`/api/conversations/${conv.id}/chapter`, { body: {} });
   if (r.created) {
     toast(`📖 Chapitre ${r.chapter.n} — ${r.chapter.title} ✓`);
@@ -2704,6 +2884,8 @@ async function maybeNpcSuggest() {
   if (!conv || !conv.cards?.length) return;
   let cs = {};
   try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  // NPC suggestion is opt-in: on by default in avancé, off in simple
+  if (!(cs.auto_npcs === true || (cs.auto_npcs === undefined && cs.context_mode === "avance"))) return;
   if (Date.now() - Number(cs.npc_last_suggest || 0) < 8 * 60_000) return;
   cs.npc_last_suggest = Date.now();
   await api(`/api/conversations/${conv.id}`, { method: "PATCH", body: { settings: cs } }).catch(() => {});
@@ -2748,6 +2930,10 @@ async function acceptNpc(npc) {
 async function maybeRelations() {
   const conv = currentConversation;
   if (!conv || !conv.cards?.length) return;
+  let cs = {};
+  try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  // relations scan is opt-in: on by default in avancé, off in simple
+  if (!(cs.auto_relations === true || (cs.auto_relations === undefined && cs.context_mode === "avance"))) return;
   const r = await api(`/api/conversations/${conv.id}/relations`, { body: {} }).catch(() => null);
   // the graph modal is open → refresh it live; otherwise keep the scan silent
   if (r?.scanned) relationsRef.current?.refresh?.();

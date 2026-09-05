@@ -7,7 +7,33 @@
  * that matter for debugging; everything else keeps console.* as-is.
  */
 
+import fs from "node:fs";
+import path from "node:path";
+import { DATA_DIR } from "./paths";
+
 export type LogData = Record<string, string | number | boolean | null | undefined>;
+
+let metricsFile: string | null = null;
+function metricsPath(): string {
+  if (!metricsFile) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    metricsFile = path.join(DATA_DIR, "metrics.jsonl");
+  }
+  return metricsFile;
+}
+
+/**
+ * Phase 8 instrumentation: one JSON line per meaningful event, appended to
+ * data/metrics.jsonl. Raw signal for the improvement loop (regeneration rate
+ * per profile / context mode, guardrail triggers…) — no dashboard yet.
+ */
+export function recordMetric(type: string, data: LogData): void {
+  try {
+    fs.appendFileSync(metricsPath(), JSON.stringify({ t: Date.now(), type, ...data }) + "\n");
+  } catch {
+    /* best effort — a full disk must never break a turn */
+  }
+}
 
 function fmt(data?: LogData): string {
   if (!data) return "";

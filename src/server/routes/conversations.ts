@@ -2,7 +2,7 @@
  * conversations resource router (extracted from the monolithic routes.ts).
  * Returns null when no route matches; throws are mapped by index.ts.
  */
-import { CHAPTER_MIN_MESSAGES, type Quest, RECAP_MIN_MESSAGES, type RecapData, assistKey, computeKept, contextConfig, conversationView, forkTail, generateCaptions, generateQuests, generateSceneState, generateSuggestions, handleStream, json, messageView, proposeCanonFacts, readJson, recapOf, relsOf, renderRecapShots, scanRelations, storyMessages, suggestChapter, suggestLore, suggestNpcs, suggestRecap, summarizeLoop, validateNarrative } from "./core";
+import { CHAPTER_MIN_MESSAGES, type Quest, RECAP_MIN_MESSAGES, type RecapData, assistKey, computeKept, contextConfig, conversationView, forkTail, generateCaptions, generateQuestions, generateQuests, generateSceneState, generateSuggestions, handleStream, json, messageView, proposeCanonFacts, readJson, recapOf, relsOf, renderRecapShots, scanRelations, storyMessages, suggestChapter, suggestLore, suggestNpcs, suggestRecap, summarizeLoop, validateNarrative } from "./core";
 import { type CanonRow, type ConversationRow, type MessageRow, createCanon, createCard, createConversation, createMessage, deleteCanon, deleteConversation, deleteMessagesAfter, getCanon, getCard, getConversation, getMessage, getPersona, getScenario, getSetting, getWorld, lastMessageOf, listBranches, listCanon, listConversations, listMessages, updateCanon, updateConversation, updateMessage } from "../db";
 import { errorResponse } from "../http";
 import { trackJob } from "../jobs";
@@ -11,7 +11,9 @@ import { CONVERSATION_SETTING_DEFS, objectSettingsJson } from "../settingsSchema
 import { runBackup } from "../backup";
 import { zipFiles } from "../zip";
 import { IMAGES_DIR } from "../paths";
-import { buildMessages, estimateTokens, memoryToText, parseMemory } from "../../llm/prompt";
+import { buildMessages, estimateTokens, memoryToText, parseMemory, profileFromSettings, modelClass, modelContextBudget, recencyBlock } from "../../llm/prompt";
+import { getProvider, defaultModelFor } from "../../llm/providers";
+import { recordMetric } from "../log";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -608,6 +610,8 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "fork" && method ==
         parent_id: src.id,
         branch_kind: "alternative",
       });
+      // Phase 8: a regeneration happened (the fork is the regenerated variant)
+      recordMetric("regenerate", { convId: src.id, forkId: fork.id });
       const imgSrcDir = path.join(IMAGES_DIR, "conversations", String(src.id));
       const imgDstDir = path.join(IMAGES_DIR, "conversations", String(fork.id));
       for (const m of srcMsgs) {
@@ -886,9 +890,20 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "context" && method
       // the inspector shows EXACTLY what the model receives: the same packing
       // (computeKept) and the same system prompt (buildMessages auto-loads canon)
       const kept = computeKept(conv, msgs);
+      // preview the REAL next turn via ?input= — the inspector then shows the
+      // exact system prompt + message list the model would receive (incl. the
+      // recency block, unified memory and lore matched on the current message)
+      const input = url.searchParams.get("input") || undefined;
+      let cs0: Record<string, any> = {};
+      try { cs0 = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+      const profile = profileFromSettings(cs0);
+      const provider = getProvider((cs0.provider as string) || undefined);
+      const model = (cs0.model as string) || defaultModelFor(provider.id);
+      const systemBudget = modelContextBudget(modelClass(model));
       const { system, messages } = buildMessages(
         { world: view.world, persona: view.persona, cards: view.cards, scenario: view.scenario, conversation: conv, summary: conv.summary || undefined, memory: parseMemory(conv.memory_json) || undefined },
         kept,
+        { profile, currentTurn: input, budgetTokens: systemBudget },
       );
       const tokens = estimateTokens(system) + messages.reduce((acc, m) => acc + estimateTokens(m.content), 0);
       const cfg = contextConfig(conv);
@@ -911,13 +926,23 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "context" && method
         budgetTokens,
         budget: Math.min(100, Math.round((tokens / Math.max(1, budgetTokens)) * 100)),
         capSource: cfg.capSource,
-        // inspector payload: the real system prompt + the real message list
+        // inspector payload: the real system prompt + the real message list,
+        // with the previewed next turn appended (marked `current`) — the recency
+        // block is appended exactly like the stream path does at generation
         system,
-        messages: messages.map((m) => ({ role: m.role, content: m.content.slice(0, 2000) })),
+        messages: [
+          ...messages.map((m) => ({ role: m.role, content: m.content.slice(0, 2000) })),
+          ...(input
+            ? [{ role: "user" as const, content: (input + `\n\n${recencyBlock(view.persona?.name ?? "le joueur", profile.sceneFocus)}`).slice(0, 2000), current: true }]
+            : []),
+        ],
         canon: { count: canon.length, entries: canon.slice(0, 20) },
         directives,
         summaryUsed: Boolean(conv.summary),
         memoryUsed: Boolean(conv.memory_json),
+        profile: { behavior: profile.behavior, contextMode: profile.contextMode, responseLength: profile.responseLength, sceneFocus: profile.sceneFocus ?? null },
+        modelClass: modelClass(model),
+        systemBudget,
       });
     }
 
@@ -1095,6 +1120,21 @@ if (parts[1] === "conversations" && parts[2] && parts[3] === "gallery" && parts[
 
 if (parts[1] === "conversations" && parts[2] && parts[3] === "stream" && method === "POST") {
       return handleStream(req, Number(parts[2]));
+    }
+
+// ─── questionnaire du meneur : des questions pour GUIDER la partie ───────────
+if (parts[1] === "conversations" && parts[2] && parts[3] === "questions" && !parts[4] && method === "POST") {
+      const conv = getConversation(Number(parts[2]));
+      if (!conv) return json({ error: "not found" }, 404);
+      const body = await readJson(req);
+      const count = Number.isFinite(Number(body?.count)) ? Math.round(Number(body.count)) : 5;
+      if (count < 1 || count > 8) return json({ error: "count doit être entre 1 et 8" }, 400);
+      const questions = await generateQuestions(conv, listMessages(conv.id), count);
+      if (!questions?.length) {
+        return json({ error: "Le modèle n'a pas pu préparer les questions — vérifie la connexion au modèle." }, 502);
+      }
+      console.log(`[questions] ❓ partie #${conv.id} — ${questions.length} question(s) pour guider la partie`);
+      return json({ questions });
     }
 
 if (parts[1] === "conversations" && parts[2] && parts[3] === "suggestions" && method === "POST") {
