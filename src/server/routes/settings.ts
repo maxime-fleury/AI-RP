@@ -7,6 +7,7 @@ import { getSetting, listCards, listConversations, listPersonas, listWorlds, set
 import { errorResponse } from "../http";
 import { getProvider } from "../../llm/providers";
 import { validateSettingsPatch } from "../settingsSchema";
+import { readMetricsSummary } from "../log";
 import { providerHealth } from "../health";
 import { jobView } from "../jobs";
 
@@ -72,6 +73,7 @@ if (p === "/api/diagnostics" && method === "GET") {
           personas: listPersonas().length,
           conversations: listConversations().length,
         },
+        metrics: readMetricsSummary(),
       });
     }
     return null;

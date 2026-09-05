@@ -12,7 +12,10 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noFallthroughCasesInSwitch": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "allowJs": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts"]
+  // api.js is type-checked against the shared contract (see its @ts-check
+  // header); more public/js files can join the program as they get typed.
+  "include": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts", "public/js/api.js"]
 }

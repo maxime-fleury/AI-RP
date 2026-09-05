@@ -33,6 +33,23 @@ export function esc(s) {
   return String(s);
 }
 
+/**
+ * Conversation-settings blob accessor (mirror of the server-side
+ * `conversationSettingsOf`). ONE place owns the parse so call sites stop
+ * hand-rolling `JSON.parse(conv.settings || "{}")` — corrupt JSON -> {}.
+ */
+export function convSettingsOf(conv) {
+  let raw = typeof conv === "string" ? conv : conv && conv.settings;
+  if (typeof raw === "string") {
+    try {
+      raw = JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+}
+
 export function fmtTime(ts) {
   if (!ts) return "";
   const d = new Date(ts);

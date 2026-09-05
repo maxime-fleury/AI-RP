@@ -2,8 +2,8 @@
 // facts, relation graph, lorebook) as tabbed panes. Extracted from chat.js —
 // chat.js keeps the header buttons, the standalone-modal wrappers and the
 // auto-refresh hook; this module owns the panes plus the shared relations ref.
-import { api } from "./api.js?v=66";
-import { el, esc, toast, confirmModal, openModal } from "./ui.js?v=66";
+import { api } from "./api.js";
+import { el, esc, toast, confirmModal, openModal } from "./ui.js";
 
 // Shared live ref so the post-turn auto hook can refresh an open relations
 // pane (standalone modal or Memory Center tab) without chat.js coupling.

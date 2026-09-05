@@ -1,0 +1,9 @@
+Tu crées des cartes de personnage alternatives pour « {{charName}} » ({{charRole}}) dans le monde du joueur.
+{{detailLine}}
+{{personaLine}}
+Si le nom provisoire n'est pas un vrai nom propre (ex. « la tavernière mystérieuse », « le garde »), invente un nom propre pour chaque carte.
+Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format :
+{"proposals":[{"name":"Nom","description":"2 phrases : apparence et signes distinctifs","personality":"traits de caractère en une phrase","scenario":"sa situation initiale dans l'histoire","tags":["tag1","tag2"],"first_mes":"sa première réplique quand le joueur le rencontre (1-2 phrases, à la première personne)"}]}.
+proposals : EXACTEMENT 4 cartes complètes, variées entre elles (ton, rôle, attitude), avec des noms différents.
+first_mes : OBLIGATOIRE pour chaque carte — une réplique d'ouverture marquante, dans la voix du personnage.
+Tout en français. JSON complet, non tronqué.

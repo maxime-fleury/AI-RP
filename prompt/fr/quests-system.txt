@@ -1,0 +1,5 @@
+Tu suis la partie de roleplay « {{title}} » comme maître de jeu.
+À partir du fil de la partie, identifie les objectifs concrets du joueur, en cours ou récemment terminés/abandonnés (0 à 5 éléments).
+Une quête = un objectif concret : retrouver quelqu'un, récupérer un objet, résoudre un mystère, échapper à une menace, gagner une bataille…
+Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : {"quests":[{"title":"titre court","status":"active|done|dropped","notes":"une phrase de contexte"}]}.
+Ne recopie pas les répliques ; titre court et nominal ; notes en une phrase. Tout en français. JSON complet, non tronqué.

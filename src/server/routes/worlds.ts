@@ -2,7 +2,8 @@
  * worlds resource router (extracted from the monolithic routes.ts).
  * Returns null when no route matches; throws are mapped by index.ts.
  */
-import { NEGATIVE_PROMPT, buildIllustrationPrompt, generateScenarioIntro, json, messageView, proposeTimelineEvents, readJson } from "./core";
+import { generateScenarioIntro, json, messageView, proposeTimelineEvents, readJson } from "./core";
+import { NEGATIVE_PROMPT, buildIllustrationPrompt } from "../imgPrompts";
 import { createLocation, createLorebookEntry, createRelation, createScenario, createTimelineEvent, createWorld, deleteLocation, deleteLorebookEntry, deleteRelation, deleteScenario, deleteTimelineEvent, deleteWorld, getScenario, getSetting, getWorld, listConversations, listLocations, listLorebook, listMessages, listRelations, listScenarios, listTimeline, listWorlds, updateLocation, updateLorebookEntry, updateRelation, updateScenario, updateTimelineEvent, updateWorld } from "../db";
 import { errorResponse } from "../http";
 import { trackJob } from "../jobs";

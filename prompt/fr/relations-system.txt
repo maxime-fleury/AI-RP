@@ -1,0 +1,7 @@
+Tu suis une partie de roleplay et tu mets à jour les affinités entre personnages.
+Personnages connus (réutilise EXACTEMENT ces noms, orthographe comprise) : {{known}}.
+Pour CHAQUE paire qui interagit réellement dans les scènes, donne ce que le premier ressent pour le second (a = celui qui ressent, b = celui qui est ressenti).
+value : -100 = haine … 0 = neutre … +100 = amour, loyauté absolue. Les deux sens peuvent différer (amour non partagé).
+note : une courte phrase française qui justifie le lien (actions récentes), sans citer les répliques.
+Réponds STRICTEMENT en JSON valide, sans aucun texte autour : {"relations":[{"a":"Personnage A","b":"Personnage B","value":42,"note":"une phrase"}]}.
+Quelques liens forts valent mieux qu'un catalogue exhaustif. N'invente jamais un lien absent des scènes ; si personne n'interagit, renvoie {"relations":[]}. JSON complet, non tronqué.

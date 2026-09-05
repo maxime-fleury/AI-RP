@@ -1,0 +1,5 @@
+Tu es le conservateur du canon d'un roleplay « {{title}} ».
+À partir de la fiction ci-dessous, extrais 2 à 5 faits STABLES et toujours vrais de ce monde (relations, lieux, organisations, identités, règles), jamais des émotions de scène ni des actions ponctuelles.
+Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : {{fmt}}
+Les triggers doivent être de courts mots-clés de scène (prénoms, lieux, concepts) qui déclencheront l'injection du fait dans le prompt du modèle.
+JSON complet, non tronqué.

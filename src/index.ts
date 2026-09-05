@@ -40,7 +40,13 @@ function decodeRel(rel: string): string {
   }
 }
 
-function serveFile(filePath: string, rootDir?: string): Response | null {
+/**
+ * Static file serving with real validators (ETag + Last-Modified) so the
+ * hand-rolled ?v= cache busting can die: mutable assets (.html/.js/.css) are
+ * served `no-cache` (always revalidated → 304 when unchanged, fresh bytes the
+ * moment a file changes), immutable media keeps a 1 h max-age and revalidates.
+ */
+function serveFile(filePath: string, rootDir?: string, req?: Request): Response | null {
   let resolved: string;
   try {
     resolved = path.resolve(filePath);
@@ -59,11 +65,22 @@ function serveFile(filePath: string, rootDir?: string): Response | null {
   }
   if (!st.isFile()) return null;
   const ext = path.extname(resolved).toLowerCase();
+  const etag = `"${st.size}-${Math.floor(st.mtimeMs)}"`;
+  const lastModified = st.mtime.toUTCString();
+  const cacheControl = [".html", ".js", ".css"].includes(ext) ? "no-cache" : "public, max-age=3600";
+  const validators = { ETag: etag, "Last-Modified": lastModified, "Cache-Control": cacheControl };
+  if (req) {
+    if (req.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers: validators });
+    const ims = req.headers.get("if-modified-since");
+    if (ims && new Date(ims).getTime() >= Math.floor(st.mtimeMs / 1000) * 1000) {
+      return new Response(null, { status: 304, headers: validators });
+    }
+  }
   const body = new Uint8Array(fs.readFileSync(resolved));
   return new Response(body, {
     headers: {
       "Content-Type": MIME[ext] ?? "application/octet-stream",
-      "Cache-Control": [".html", ".js", ".css"].includes(ext) ? "no-cache" : "public, max-age=3600",
+      ...validators,
     },
   });
 }
@@ -92,12 +109,12 @@ function handler(req: Request): Response | Promise<Response> {
 
   // static data dirs
   if (p.startsWith("/images/")) {
-    const file = serveFile(path.join(IMAGES_DIR, decodeRel(p.slice("/images/".length))), IMAGES_DIR);
+    const file = serveFile(path.join(IMAGES_DIR, decodeRel(p.slice("/images/".length))), IMAGES_DIR, req);
     if (file) return file;
     return new Response("not found", { status: 404 });
   }
   if (p.startsWith("/uploads/")) {
-    const file = serveFile(path.join(UPLOADS_DIR, decodeRel(p.slice("/uploads/".length))), UPLOADS_DIR);
+    const file = serveFile(path.join(UPLOADS_DIR, decodeRel(p.slice("/uploads/".length))), UPLOADS_DIR, req);
     if (file) return file;
     return new Response("not found", { status: 404 });
   }
@@ -105,11 +122,11 @@ function handler(req: Request): Response | Promise<Response> {
   // static app files
   if (p !== "/") {
     const rel = decodeRel(p.replace(/^\/+/, ""));
-    const file = serveFile(path.join(PUBLIC_DIR, rel), PUBLIC_DIR);
+    const file = serveFile(path.join(PUBLIC_DIR, rel), PUBLIC_DIR, req);
     if (file) return file;
   }
   // SPA fallback
-  const index = serveFile(path.join(PUBLIC_DIR, "index.html"));
+  const index = serveFile(path.join(PUBLIC_DIR, "index.html"), undefined, req);
   if (index) return index;
   return new Response(`Hello from ${NAME}! (front-end missing at ${PUBLIC_DIR})`, {
     headers: { "Content-Type": "text/plain; charset=utf-8" },

@@ -164,36 +164,82 @@ CREATE INDEX IF NOT EXISTS idx_canon_conv ON canon_entries(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_canon_status ON canon_entries(status);
 `);
 
-// migrations for pre-existing databases (columns added later)
-{
-  const convCols = new Set((db.query("PRAGMA table_info(conversations)").all() as any[]).map((c) => c.name));
-  if (!convCols.has("summary")) db.exec("ALTER TABLE conversations ADD COLUMN summary TEXT NOT NULL DEFAULT ''");
-  if (!convCols.has("summary_msg_id")) db.exec("ALTER TABLE conversations ADD COLUMN summary_msg_id INTEGER NOT NULL DEFAULT 0");
-  if (!convCols.has("memory_json")) db.exec("ALTER TABLE conversations ADD COLUMN memory_json TEXT NOT NULL DEFAULT ''");
-  if (!convCols.has("pinned")) db.exec("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0");
-  if (!convCols.has("archived")) db.exec("ALTER TABLE conversations ADD COLUMN archived INTEGER NOT NULL DEFAULT 0");
-  const worldCols = new Set((db.query("PRAGMA table_info(worlds)").all() as any[]).map((c: any) => c.name));
-  if (!worldCols.has("map")) db.exec("ALTER TABLE worlds ADD COLUMN map TEXT NOT NULL DEFAULT ''");
-  const convCols2 = new Set((db.query("PRAGMA table_info(conversations)").all() as any[]).map((c: any) => c.name));
-  if (!convCols2.has("parent_id")) db.exec("ALTER TABLE conversations ADD COLUMN parent_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL");
-  if (!convCols2.has("branch_kind")) db.exec("ALTER TABLE conversations ADD COLUMN branch_kind TEXT NOT NULL DEFAULT 'main'");
-  const cardCols = new Set((db.query("PRAGMA table_info(cards)").all() as any[]).map((c: any) => c.name));
-  if (!cardCols.has("fingerprint")) db.exec("ALTER TABLE cards ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''");
-  const jobCols = new Set((db.query("PRAGMA table_info(jobs)").all() as any[]).map((c: any) => c.name));
-  if (!jobCols.has("title")) db.exec("ALTER TABLE jobs ADD COLUMN title TEXT NOT NULL DEFAULT ''");
-  if (!jobCols.has("cancellable")) db.exec("ALTER TABLE jobs ADD COLUMN cancellable INTEGER NOT NULL DEFAULT 0");
-  if (!jobCols.has("retryable")) db.exec("ALTER TABLE jobs ADD COLUMN retryable INTEGER NOT NULL DEFAULT 0");
-  if (!jobCols.has("result")) db.exec("ALTER TABLE jobs ADD COLUMN result TEXT NOT NULL DEFAULT ''");
-  // soft-delete (trash) support: deletes move rows here, restore brings them back
-  for (const [table, cols] of [["worlds", worldCols], ["scenarios", null], ["cards", cardCols], ["personas", null]] as [string, Set<string> | null][]) {
-    if (cols && cols.has("trashed")) continue;
-    const tcols = new Set((db.query(`PRAGMA table_info(${table})`).all() as any[]).map((c: any) => c.name));
-    if (!tcols.has("trashed")) db.exec(`ALTER TABLE ${table} ADD COLUMN trashed INTEGER NOT NULL DEFAULT 0`);
+// ─── schema migrations ───────────────────────────────────────────────────────
+// Versioned evolution on top of the base CREATE TABLE block. Fresh databases
+// and older files converge: each step is idempotent (introspect before ALTER),
+// runs inside a transaction, and bumps PRAGMA user_version on success. New
+// schema needs = bump SCHEMA_VERSION and append a step — never inline ALTERs.
+export const SCHEMA_VERSION = 1;
+
+const MIGRATIONS: { version: number; up: (database: Database) => void }[] = [
+  {
+    // v0 → v1: columns added after the initial schema (summaries, memory,
+    // trash, branches, fingerprints, job bookkeeping…)
+    version: 1,
+    up(database) {
+      const cols = (t: string) =>
+        new Set((database.query(`PRAGMA table_info(${t})`).all() as any[]).map((c: any) => c.name));
+      const add = (table: string, column: string, ddl: string) => {
+        if (!cols(table).has(column)) database.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+      };
+      add("conversations", "summary", "summary TEXT NOT NULL DEFAULT ''");
+      add("conversations", "summary_msg_id", "summary_msg_id INTEGER NOT NULL DEFAULT 0");
+      add("conversations", "memory_json", "memory_json TEXT NOT NULL DEFAULT ''");
+      add("conversations", "pinned", "pinned INTEGER NOT NULL DEFAULT 0");
+      add("conversations", "archived", "archived INTEGER NOT NULL DEFAULT 0");
+      add("worlds", "map", "map TEXT NOT NULL DEFAULT ''");
+      add("conversations", "parent_id", "parent_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL");
+      add("conversations", "branch_kind", "branch_kind TEXT NOT NULL DEFAULT 'main'");
+      add("cards", "fingerprint", "fingerprint TEXT NOT NULL DEFAULT ''");
+      add("jobs", "title", "title TEXT NOT NULL DEFAULT ''");
+      add("jobs", "cancellable", "cancellable INTEGER NOT NULL DEFAULT 0");
+      add("jobs", "retryable", "retryable INTEGER NOT NULL DEFAULT 0");
+      add("jobs", "result", "result TEXT NOT NULL DEFAULT ''");
+      // soft-delete (trash) support: deletes move rows here, restore brings them back
+      for (const table of ["worlds", "scenarios", "cards", "personas"]) add(table, "trashed", "trashed INTEGER NOT NULL DEFAULT 0");
+    },
+  },
+];
+
+/** Run every pending migration against the given database (transactional). */
+export function runMigrations(database: Database): void {
+  const current =
+    ((database.query("PRAGMA user_version").get() as { user_version?: number } | null)?.user_version ?? 0) as number;
+  for (const m of MIGRATIONS) {
+    if (m.version <= current) continue;
+    database.exec("BEGIN");
+    try {
+      m.up(database);
+      database.exec(`PRAGMA user_version = ${m.version}`);
+      database.exec("COMMIT");
+    } catch (e) {
+      database.exec("ROLLBACK");
+      throw e;
+    }
   }
 }
+
+runMigrations(db);
 db.exec("CREATE INDEX IF NOT EXISTS idx_cards_fingerprint ON cards(fingerprint)");
 
 const now = () => Date.now();
+
+// ─── conversation settings accessor ──────────────────────────────────────────
+// Per-conversation state lives in a JSON blob on the row (conversations.settings).
+// ONE accessor owns the parse/validate contract so call sites never hand-roll
+// `JSON.parse(conv.settings || "{}")` (which silently diverges on typos and
+// corrupt blobs). Corrupt JSON resolves to {} like the historic try/catch sites.
+export function conversationSettingsOf(row: { settings?: string | null } | string | null | undefined): Record<string, any> {
+  let raw: unknown = typeof row === "string" ? row : row?.settings;
+  if (typeof raw === "string") {
+    try {
+      raw = JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, any>) : {};
+}
 
 // ─── settings ─────────────────────────────────────────────────────────────────
 export function getSetting<T = string>(key: string, fallback?: T): T {

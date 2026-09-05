@@ -1,7 +1,7 @@
-import { api, apiFetch, readSseStream } from "./api.js?v=66";
-import { el, esc, toast, confirmModal, ICONS, fmtTime } from "./ui.js?v=66";
-import { store, refreshAll, refreshConversations, refreshConversation, navigate, applyTheme, autoCardAvatar } from "./app.js?v=66";
-import { buildRelationsPane, buildMemoryPane, buildCanonPane, buildLorePane, openMemoryCenter, relationsRef } from "./memory-center.js?v=66";
+import { api, apiFetch, readSseStream } from "./api.js";
+import { el, esc, toast, confirmModal, ICONS, fmtTime, convSettingsOf } from "./ui.js";
+import { store, refreshAll, refreshConversations, refreshConversation, navigate, applyTheme, autoCardAvatar } from "./app.js";
+import { buildRelationsPane, buildMemoryPane, buildCanonPane, buildLorePane, openMemoryCenter, relationsRef } from "./memory-center.js";
 
 let currentConversation = null;
 let currentCtx = null;
@@ -40,8 +40,7 @@ function showCoherenceBanner(findings) {
 /** Non-blocking post-turn coherence check (opt-in party setting, throttled). */
 async function maybeAutoValidate() {
   if (!currentConversation || autoValidateBusy) return;
-  let cs = {};
-  try { cs = JSON.parse(currentConversation.settings || "{}"); } catch { /* ignore */ }
+  const cs = convSettingsOf(currentConversation);
   if (!cs.validate_auto) return;
   const now = Date.now();
   if (now - (lastAutoValidateAt || 0) < 10 * 60 * 1000) return;
@@ -128,17 +127,15 @@ const DM_RYTHME = ["normal", "rapide", "lent"];
 const DM_STYLES = ["", "Horreur", "Drame", "Action", "Léger & humoristique", "Héroïque", "Émotionnel"];
 const DM_LENGTHS = ["normale", "courte", "longue"];
 function dmState(conv) {
-  try { return JSON.parse(conv.settings || "{}").dm || {}; } catch { return {}; }
+  return convSettingsOf(conv).dm || {};
 }
 function dmPending(conv) {
-  try { return Boolean(JSON.parse(conv.settings || "{}").dm_pending); } catch { return false; }
+  return Boolean(convSettingsOf(conv).dm_pending);
 }
 async function dmSave(convId, dm, pending) {
   const conv = currentConversation;
   if (!conv) return;
-  let cs = {};
-  try { cs = JSON.parse(conv.settings || "{}"); } catch { cs = {}; }
-  if (cs && typeof cs !== "object") cs = {};
+  const cs = convSettingsOf(conv);
   cs.dm = dm;
   cs.dm_pending = Boolean(pending);
   await api(`/api/conversations/${convId}`, { method: "PATCH", body: { settings: cs } });
@@ -154,7 +151,7 @@ export async function renderChat(convIdRaw) {
   if (bareId === "new") {
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
     const pre = { world_id: params.get("world"), scenario_id: params.get("scenario") };
-    const { newGameWizard } = await import("./app.js?v=66");
+    const { newGameWizard } = await import("./app.js");
     newGameWizard(pre);
     return;
   }
@@ -630,8 +627,7 @@ export async function renderChat(convIdRaw) {
   // if enough new story accumulated since the last recap, offer to generate
   // one. Falls back to the chapter stop-marker banner when there is nothing to
   // recap.
-  let cs0 = {};
-  try { cs0 = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  const cs0 = convSettingsOf(conv);
   const chapters0 = Array.isArray(cs0.chapters) ? cs0.chapters : [];
   const recap0 = cs0.recap && typeof cs0.recap === "object" && !Array.isArray(cs0.recap) ? cs0.recap : null;
   const story0 = (conv.messages || []).filter((m) => !m.meta?.chapter && !m.meta?.rewind);
@@ -963,8 +959,7 @@ export async function renderChat(convIdRaw) {
   }
 
   function convSettingsModal() {
-    let convSettings = {};
-    try { convSettings = JSON.parse(currentConversation.settings || "{}"); } catch { /* ignore */ }
+    const convSettings = convSettingsOf(currentConversation);
     const personaName = currentConversation.persona?.name;
     const castNames = (currentConversation.cards || []).map((c) => c.name).join(", ");
 
@@ -2665,8 +2660,7 @@ async function questionnaireModal() {
 
 async function questModal(conv) {
   const convId = currentConversation.id;
-  let quests = [];
-  try { quests = JSON.parse(conv.settings || "{}").quests || []; } catch { /* ignore */ }
+  const quests = convSettingsOf(conv).quests || [];
   const list = el("div", { class: "quest-list" });
   const STATUS = [
     ["active", "▶ En cours"], ["done", "✓ Accomplie"], ["dropped", "✗ Abandonnée"],
@@ -2863,8 +2857,7 @@ function syncCurrentMemory(convId, mem) {
 async function maybeChapter() {
   const conv = currentConversation;
   if (!conv) return;
-  let cs = {};
-  try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  const cs = convSettingsOf(conv);
   // chapters are an avancé-mode feature — never auto-created in Simple
   if (cs.context_mode !== "avance") return;
   const r = await api(`/api/conversations/${conv.id}/chapter`, { body: {} });
@@ -2882,8 +2875,7 @@ async function maybeChapter() {
 async function maybeNpcSuggest() {
   const conv = currentConversation;
   if (!conv || !conv.cards?.length) return;
-  let cs = {};
-  try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  const cs = convSettingsOf(conv);
   // NPC suggestion is opt-in: on by default in avancé, off in simple
   if (!(cs.auto_npcs === true || (cs.auto_npcs === undefined && cs.context_mode === "avance"))) return;
   if (Date.now() - Number(cs.npc_last_suggest || 0) < 8 * 60_000) return;
@@ -2930,8 +2922,7 @@ async function acceptNpc(npc) {
 async function maybeRelations() {
   const conv = currentConversation;
   if (!conv || !conv.cards?.length) return;
-  let cs = {};
-  try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  const cs = convSettingsOf(conv);
   // relations scan is opt-in: on by default in avancé, off in simple
   if (!(cs.auto_relations === true || (cs.auto_relations === undefined && cs.context_mode === "avance"))) return;
   const r = await api(`/api/conversations/${conv.id}/relations`, { body: {} }).catch(() => null);
@@ -3013,7 +3004,7 @@ function scrollToBottom(scroll, force = false) {
 }
 
 // expose openModal for settings modal
-import { openModal, field } from "./ui.js?v=66";
+import { openModal, field } from "./ui.js";
 void applyTheme;
 void fmtTime;
 void currentConversation;

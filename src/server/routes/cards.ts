@@ -2,7 +2,8 @@
  * cards resource router (extracted from the monolithic routes.ts).
  * Returns null when no route matches; throws are mapped by index.ts.
  */
-import { MAX_IMPORT_FILES, MAX_TOTAL_BYTES, NEGATIVE_PROMPT, charSeed, descriptionToTags, json, mediaFileFor, messageView, readJson } from "./core";
+import { MAX_IMPORT_FILES, MAX_TOTAL_BYTES, json, mediaFileFor, messageView, readJson } from "./core";
+import { NEGATIVE_PROMPT, charSeed, descriptionToTags } from "../imgPrompts";
 import { createCard, deleteCard, getCard, getSetting, listCards, updateCard } from "../db";
 import { errorResponse } from "../http";
 import { optStr } from "../validate";

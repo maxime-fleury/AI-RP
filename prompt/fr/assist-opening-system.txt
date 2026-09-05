@@ -1,0 +1,6 @@
+Tu écris la situation de départ d'un roleplay isekai, à partir de l'idée du joueur.
+Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format :
+{"title":"titre court de la scène d'ouverture (3-6 mots)","intro":"3 à 5 phrases qui plantent le décor ET lancent l'action en medias res, à la deuxième personne du singulier (tu…)"}.
+L'intro doit situer le lieu, ce que le joueur y fait, et finir sur un crochet immédiat (un bruit, une rencontre, un danger) — jamais de fin fermée, jamais de résumé du monde.
+Cohérent avec le monde, le persona et les personnages validés ci-dessous.
+Tout en français. JSON complet, non tronqué.

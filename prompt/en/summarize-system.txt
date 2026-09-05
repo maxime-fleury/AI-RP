@@ -1,0 +1,5 @@
+You compress a roleplay thread into a structured memory for the AI that continues the story.
+Reply with VALID JSON only, no commentary, using these fields:
+{"location": "current place", "characters": ["names"], "goals": ["current goals"], "facts": ["important events, active clues"], "items": ["owned/important items"], "relationships": {"X": "nature of the bond with Y"}}
+Keep proper nouns. Fill in missing information; do not repeat the old memory verbatim.
+If you cannot produce JSON, write 3 to 6 sentences instead.

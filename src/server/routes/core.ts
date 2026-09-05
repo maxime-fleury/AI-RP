@@ -26,11 +26,13 @@ import {
   listBranches,
   listCanon, getCanon, createCanon, updateCanon, deleteCanon, activeCanon,
   type CanonRow,
+  conversationSettingsOf,
 } from "../db";
 import { importFile, scanDirectory, sizeLimitFor, type ImportResult } from "../importCards";
 import { classifyIntent, directionChanged, intentToFocus } from "../../llm/intent";
 import { checkResponseDrift } from "../../llm/guardrail";
 import { getProvider, defaultModelFor, type ChatMessage } from "../../llm/providers";
+import type { ConversationView, MessageView } from "../../shared/contracts";
 import { buildMessages, buildSystemPrompt, estimateTokens, parseSegments, fallbackSpeaker, summarizeSystem, presetFromKey, parseMemory, memoryToText, profileFromSettings, modelClass, modelContextBudget, recencyBlock, stripThinking, type Segment, type CastContext, type MemoryState, type BuildPromptOptions, type SceneFocus } from "../../llm/prompt";
 import type { ConversationRow, MessageRow } from "../db";
 import { generateAndSave, probeImageStatus, ensureImageServer } from "../image";
@@ -40,9 +42,11 @@ import { providerHealth } from "../health";
 import { IMAGES_DIR, UPLOADS_DIR } from "../paths";
 
 import { registerJobRetry, trackJob } from "../jobs";
+import { NEGATIVE_PROMPT, buildIllustrationPrompt, charSeed, characterForMessage, descriptionToTags, detectSceneKind } from "../imgPrompts";
 import { HttpError } from "../http";
 import { combineSignals } from "../signal";
 import { log, recordMetric } from "../log";
+import { promptFilled, promptText } from "../../llm/promptText";
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 // HTTP plumbing, embedded-media helpers and SSE are shared modules — see the
@@ -127,13 +131,8 @@ export async function generateScenarioIntro(
     const models = await provider.models();
     model = models[0] ?? "";
   }
-  const sys = [
-    "Tu écris l'ouverture d'un scénario de roleplay immersif.",
-    "Réponds en 120-220 mots, en français, à la deuxième personne (\"tu\"), vivant et sensoriel.",
-    "Commence par le titre du scénario sur sa propre ligne (sans # ni *), saute une ligne, puis écris l'introduction.",
-    "Aucune métadonnée, aucun commentaire, aucun texte autour du titre et de l'introduction.",
-  ].join(" ");
-  const promptText = [
+  const sys = promptText("scenario-intro-system");
+  const userText = [
     `Monde : ${world?.name ?? "?"}`,
     `Univers : ${world?.lore || world?.description || "?"}`,
     `Thème / point de départ : ${theme || "un départ inattendu"}`,
@@ -142,7 +141,7 @@ export async function generateScenarioIntro(
   ].join("\n");
   let text = "";
   for await (const delta of provider.stream({
-    messages: [{ role: "system", content: sys }, { role: "user", content: promptText }],
+    messages: [{ role: "system", content: sys }, { role: "user", content: userText }],
     model,
     temperature: 0.95,
     maxTokens: 600,
@@ -164,7 +163,7 @@ export async function generateScenarioIntro(
   return { name: title || `Scénario ${g.label}`, intro: rest || trimmed };
 }
 
-export function conversationView(id: number): any {
+export function conversationView(id: number): ConversationView | null {
   const conv = getConversation(id);
   if (!conv) return null;
   const world = conv.world_id ? getWorld(conv.world_id) : null;
@@ -176,10 +175,10 @@ export function conversationView(id: number): any {
   } catch { /* ignore */ }
   const memory = parseMemory(conv.memory_json);
   const { memory_json, ...rest } = conv;
-  return { ...rest, memory, world, persona, scenario, cards, canon: listCanon(conv.id) };
+  return { ...rest, memory, world, persona, scenario, cards, canon: listCanon(conv.id) } as ConversationView;
 }
 
-export function messageView(m: any) {
+export function messageView(m: any): MessageView {
   try { m.segments = JSON.parse(m.segments || "[]"); } catch { m.segments = []; }
   // TTS has been removed — audio data is no longer served
   delete m.audio;
@@ -187,168 +186,15 @@ export function messageView(m: any) {
   return m;
 }
 
-// ─── router ───────────────────────────────────────────────────────────────────
-
-// standard danbooru-style negative prompt for anime SDXL checkpoints
-export const NEGATIVE_PROMPT =
-  "worst quality, low quality, lowres, bad anatomy, bad hands, missing fingers, extra digits, " +
-  "fewer digits, extra limbs, mutated hands and fingers, deformed, disfigured, blurry, out of focus, " +
-  "ugly, duplicate, monochrome, text, watermark, signature, logo, jpeg artifacts, frame, border";
-
-// common FR-EN keyword map: tag-trained anime models understand English tags
-export const IMG_TAGS_FR2EN: Record<string, string> = {
-  temple: "grand temple", "château": "castle", "chateau": "castle", "forêt": "dense forest", "foret": "dense forest",
-  "montagne": "mountain range", "grottes": "cavern", "grotte": "cavern", "rivière": "river", "riviere": "river",
-  "lac": "lake", "océan": "ocean", "ocean": "ocean", "neige": "snow", "pluie": "rain, wet", "orage": "storm clouds",
-  "rune": "glowing runes, arcane symbols", "runes": "glowing runes, arcane symbols", "magie": "magic circles, glowing magic",
-  "lame": "glass sword, radiant blade", "épée": "ornate sword", "epee": "ornate sword", "bouclier": "shield",
-  "flamme": "open flame, fire", "feu": "bonfire, embers", "ombre": "dark shadows, silhouettes", "ténèbres": "darkness, gloom", "tenebres": "darkness, gloom",
-  "cendres": "floating ashes, apocalyptic", "mort": "skulls, dark fantasy", "dieux": "ancient statues", "autel": "stone altar",
-  "statue": "stone statue", "colonnes": "ancient pillars", "portail": "portal, glowing gate", "escalier": "stone staircase",
-  "toits": "medieval roofs", "salle": "stone hall", "trône": "throne", "trone": "throne", "crystal": "crystaline details", "cristal": "crystaline details", "gemme": "glowing gem",
-  "sang": "dripping blood, dark", "squelette": "skeleton", "serpent": "serpent", "dragon": "dragon", "loup": "wolf", "corbeau": "raven", "chene": "ancient oak", "arbre": "ancient tree",
-  "bougie": "candlelight", "fumée": "smoke, mist", "fumee": "smoke, mist", "brume": "mist, fog", "lune": "full moon", "étoiles": "starry night sky", "etoiles": "starry night sky", "ciel": "dramatic sky",
-  "flèches": "arrows", "fleches": "arrows", "arc": "longbow", "armure": "armor, knight", "cape": "cape, cloak", "masque": "mask, masked", "ailes": "large wings", "alle": "large wings",
-  "combat": "battle scene", "bataille": "epic battle", "guerre": "war-torn landscape", "village": "small village", "ville": "fantasy city", "tour": "tower, spire", "pont": "ancient bridge",
-  "fleur": "flowers, nature", "fleurs": "flowers, nature", "herbe": "grass, nature", "falaise": "cliffside", "désert": "desert dunes", "desert": "desert dunes", "volcan": "volcano",
-};
-
-export const LANDSCAPE_WORDS = new Set([
-  "temple", "château", "chateau", "forêt", "foret", "montagne", "grottes", "grotte", "rivière", "riviere",
-  "lac", "océan", "ocean", "mer", "neige", "pluie", "orage", "ciel", "étoiles", "etoiles", "lune", "désert", "desert",
-  "volcan", "village", "ville", "pont", "tour", "falaise", "plaine", "vallée", "vallee", "palais", "ruines", "prairie",
-  "chene", "arbre", "fleur", "fleurs", "herbe", "lande", "port", "fjord", "donjon", "cols", "salle", "autel", "statue",
-  "trône", "trone", "escalier", "toits", "bougie", "brume", "fumée", "fumee", "cendres", "portail", "colonnes", "monument",
-]);
-
-/** Guess the kind of image a message calls for: pure scenery → landscape. */
-export function detectSceneKind(content: string): "landscape" | "portrait" {
-  // drop dialogue lines, keep narration words (asterisks become spaces so a
-  // fully italic message is not stripped bare)
-  const withoutDialogue = content.replace(/"[^"]*"/g, " ").replace(/\*/g, " ");
-  const words = withoutDialogue
-    .toLowerCase()
-    .split(/[^\p{L}'-]+/u)
-    .map((w) => w.replace(/^'+|'+$/g, ""))
-    .filter((w) => w.length > 2); // keep 3-letter words like mer/lac
-  const hits = words.filter((w) => LANDSCAPE_WORDS.has(w)).length;
-  const wc = words.length;
-  return hits >= 2 && wc >= 5 ? "landscape" : "portrait";
-}
-
-/** Deterministic seed per card — the same character always gets the same seed. */
-export function charSeed(cardId: number): number {
-  return ((cardId * 2654435761) >>> 0) % 2_147_483_647;
-}
-
-/**
- * If the message is (mostly) a character's line, return that card so the
- * illustration keeps their look (prompt identity + fixed seed).
- */
-export function characterForMessage(cast: { id: number; name: string; description?: string }[], content: string): { id: number; name: string; description: string } | null {
-  if (!cast.length) return null;
-  // first dialogue speaker of the message wins (the scene is about them)
-  for (const seg of parseSegments(content)) {
-    if (seg.type === "dialogue" && seg.speaker) {
-      const card = cast.find((c) => c.name.toLowerCase() === seg.speaker.toLowerCase());
-      if (card) return { id: card.id, name: card.name, description: card.description ?? "" };
-    }
-  }
-  // narration mentioning a cast member by name → that character
-  const lower = content.toLowerCase();
-  const card = cast.find((c) => c.name.length > 2 && lower.includes(c.name.toLowerCase()));
-  return card ? { id: card.id, name: card.name, description: card.description ?? "" } : null;
-}
-
-/** Card description → danbooru-style tags (shared pipeline with the scene prompt). */
-export function descriptionToTags(desc: string): string[] {
-  const raw = desc.replace(/[*"«»]/g, " ").replace(/\s+/g, " ").trim();
-  const words = raw
-    .toLowerCase()
-    .split(/[^\p{L}'-]+/u)
-    .map((w) => w.replace(/^'+|'+$/g, ""))
-    .filter((w) => w.length > 3 && !STOP_WORDS.has(w) && !/^\d+$/.test(w));
-  const tags: string[] = [];
-  const seen = new Set<string>();
-  for (const w of words) {
-    const t = IMG_TAGS_FR2EN[w] ?? w;
-    if (seen.has(t)) continue;
-    seen.add(t);
-    tags.push(t);
-  }
-  return tags;
-}
-
-export const STOP_WORDS = new Set([
-  "le", "la", "les", "un", "une", "des", "de", "du", "et", "ou", "dans", "sur", "sous", "avec", "pour", "plus", "pas",
-  "très", "tres", "mais", "comme", "lui", "elle", "il", "ils", "tu", "vous", "je", "me", "moi", "mon", "ma", "mes",
-  "ton", "ta", "tes", "sa", "son", "ses", "ce", "cet", "cette", "ces", "au", "aux", "en", "par", "se", "si", "ne",
-  "y", "vers", "contre", "entre", "tout", "tous", "alors", "quand", "où", "ou", "comment", "pourquoi", "à", "a", "était",
-  "etait", "être", "fait", "faire", "voit", "vois", "dit", "dis", "demande", "répond", "repond", "veux", "veut", "peux",
-  "peut", "semble", "déjà", "deja", "encore", "aussi", "bien", "même", "meme", "autre", "rien", "quelque", "petite", "petit",
-  "grand", "grande", "toujours", "jamais", "seul", "seule", "place", "peu", "long", "voix", "regarde", "sait", "savez", "sais",
-  "face", "côté", "cote", "doit", "faites", "êtes", "etes",
-]);
-
-export function buildIllustrationPrompt(world: string, desc: string, tone: string, scene: string, kind: "auto" | "landscape" | "portrait" = "auto", character?: { id: number; name: string; description?: string } | null): string {
-  // strip roleplay markup, keep a clean lowercase word list
-  const raw = scene.replace(/[*"«»]/g, " ").replace(/\s+/g, " ").trim();
-  const words = raw
-    .toLowerCase()
-    .split(/[^\p{L}'-]+/u)
-    .map((w) => w.replace(/^'+|'+$/g, ""))
-    .filter((w) => w.length > 3 && !STOP_WORDS.has(w) && !/^\d+$/.test(w));
-  // translate known words, keep unique order
-  const tags: string[] = [];
-  const seen = new Set<string>();
-  for (const w of words) {
-    const t = IMG_TAGS_FR2EN[w] ?? w;
-    if (seen.has(t)) continue;
-    seen.add(t);
-    tags.push(t);
-  }
-  // keep the prompt in tags: translate the tone, drop French prose (tag-trained
-  // anime models respond poorly to natural-language sentences)
-  const TONE_EN: Record<string, string> = {
-    "épique": "epic", "epique": "epic", "sombre": "dark, grim", "léger": "lighthearted",
-    "leger": "lighthearted", "mystérieux": "mysterious", "mysterieux": "mysterious",
-    "comique": "comedic", "heroïque": "heroic", "heroique": "heroic", "neutre": "",
-  };
-  const worldPart = [world || "fantasy", TONE_EN[String(tone || "").toLowerCase().trim()] || ""].filter(Boolean).join(", ");
-  // character identity: description-derived tags + name + stable face framing
-  let charPart: string[] = [];
-  if (character) {
-    charPart = [
-      "character focus, one character",
-      ...descriptionToTags(character.description),
-      character.name.replace(/\s+/g, "_"),
-      "solo, upper body, detailed face, face focus, looking at viewer",
-    ].filter(Boolean);
-  }
-  // environment-only scenes: push the scenery, keep the frame empty of people
-  const sceneOverride =
-    kind === "landscape"
-      ? ["scenery, breathtaking landscape, wide angle shot, vast vista, clear composition", "no people, no characters, empty scene, background focus"]
-      : ["cinematic lighting, dramatic composition, detailed background, depth of field, sharp focus"];
-  // danbooru-style: quality tags first, then environment, scene keywords, style
-  return [
-    "masterpiece, best quality, anime illustration, highly detailed, vibrant colors",
-    worldPart,
-    ...charPart,
-    tags.slice(0, 12).join(", "),
-    ...sceneOverride,
-  ].filter(Boolean).join(", ");
-}
-
 // ─── response suggestions (the "chips") ───────────────────────────────────────
 export function suggestSystem(ctx: CastContext): string {
-  const persona = ctx.persona;
+  const persona = ctx.persona?.name ?? "Moi";
   const cast = ctx.cards.map((c) => c.name).join(", ");
-  return [
-    `Tu es l'assistant de jeu d'un roleplay immersif. Le joueur s'appelle ${persona?.name ?? "Moi"}${cast ? `, les personnages présents sont : ${cast}` : ""}.`,
-    "À partir de la dernière scène, propose entre 3 et 5 réponses possibles pour le joueur : des actions ou des répliques à la première personne, courtes (moins de 12 mots chacune) et variées dans le ton (une prudente, une audacieuse, une curieuse, une émotionnelle…).",
-    "Réponds UNIQUEMENT avec la liste, une suggestion par ligne commençant par « - ». Aucune autre explication, aucun texte autour.",
-  ].join("\n");
+  // text lives in prompt/fr/chat-suggest-system.txt (editable without code)
+  return promptFilled("chat-suggest-system", {
+    persona,
+    castLine: cast ? `, les personnages présents sont : ${cast}` : "",
+  });
 }
 
 export function parseSuggestions(text: string): string[] {
@@ -381,12 +227,7 @@ export async function generateCardAssist(idea: string): Promise<CardAssistFields
     model = models[0] ?? "";
   }
   const fmt = JSON.stringify(Object.fromEntries(CARD_ASSIST_FIELDS.map((k) => [k, []])));
-  const sys = [
-    "Tu aides à créer des cartes de personnages de roleplay.",
-    "L'utilisateur décrit une idée brute — propose des alternatives (chips) pour chaque champ de la carte.",
-    `Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : ${fmt}.`,
-    "Contraintes : name → 3 noms courts ; description → 2 phrases autonomes ; personality → 2 blocs de traits ; scenario → 2 situations de départ ; first_mes → 2 premiers messages courts, à la première personne ; mes_example → 1 ou 2 exemples de dialogue au format « Nom : réplique » ; tags → 4 ou 5 tags sans # (une liste d'un seul élément = une chaîne). Tout en français, cohérent avec l'idée. JSON complet, non tronqué.",
-  ].join(" ");
+  const sys = promptText("card-assist-system");
   let text = "";
   try {
     text = await provider.complete({
@@ -454,16 +295,7 @@ export async function assistWorlds(
   description: string, feedback: string,
   existing: { id: number; name: string; description: string; tone: string }[],
 ): Promise<{ matches: { id: number; reason: string }[]; proposals: { name: string; description: string; tone: string; lore: string }[] }> {
-  const sys = [
-    "Tu aides un joueur à créer le monde d'un roleplay isekai à partir d'une description libre.",
-    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format :',
-    '{"matches":[{"id":42,"reason":"pourquoi ce monde existant convient"}],"proposals":[{"name":"Nom du monde","description":"2-3 phrases décrivant les lieux et la magie","tone":"genre et ambiance en quelques mots","lore":"1-2 phrases d\'histoire fondatrice"}]}.',
-    "matches : les mondes EXISTANTS fournis qui correspondent VRAIMENT à l'idée (0 à 2, id = leur numéro exact). Si aucun ne correspond, matches = [] et on créera un monde neuf.",
-    "proposals : EXACTEMENT 4 mondes NOUVEAUX, variés entre eux, cohérents avec l'idée.",
-    "Chaque proposition doit avoir un name unique ET inédit (jamais le nom d'un monde existant), une description de 2-3 phrases, un tone et un lore.",
-    "Ne propose jamais un monde existant dans proposals — il va dans matches.",
-    "Tout en français. JSON complet, non tronqué.",
-  ].join(" ");
+  const sys = promptText("assist-worlds-system");
   const existingBlock = existing.length
     ? existing.map((w) => `- #${w.id} « ${w.name} » : ${w.description.slice(0, 160)} (${w.tone})`).join("\n")
     : "(aucun monde existant)";
@@ -505,15 +337,7 @@ export async function assistPersonas(
   description: string, world: Record<string, unknown> | null, feedback: string,
   existing: { id: number; name: string; description: string }[],
 ): Promise<{ matches: { id: number; reason: string }[]; proposals: { name: string; description: string }[] }> {
-  const sys = [
-    "Tu proposes des personas de roleplay (le rôle que le joueur incarne) adaptés au monde choisi et à la description du joueur.",
-    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format :',
-    '{"matches":[{"id":42,"reason":"pourquoi ce persona existant colle au joueur"}],"proposals":[{"name":"Nom du persona","description":"2-3 phrases : qui il est, apparence, passé, motivation (à la deuxième personne, le joueur s\'incarne dedans)"}]}.',
-    "matches : les personas EXISTANTS fournis qui correspondent VRAIMENT au « moi » que le joueur décrit (0 à 2, id = leur numéro exact). Sinon matches = [].",
-    "proposals : EXACTEMENT 4 personas NOUVEAUX (jamais un persona existant), variés, cohérents avec le monde ET avec le joueur décrit.",
-    "Chaque proposition doit avoir un name unique ET un nom différent des personas existants, et une description de 2-3 phrases.",
-    "Tout en français. JSON complet, non tronqué.",
-  ].join(" ");
+  const sys = promptText("assist-personas-system");
   const worldBlock = world ? `Monde validé : « ${ASSIST_STR(world.name, 80)} » — ${ASSIST_STR(world.description, 600)}` : "(pas de monde choisi)";
   const existingBlock = existing.length
     ? existing.map((p) => `- #${p.id} « ${p.name} » : ${p.description.slice(0, 160)}`).join("\n")
@@ -552,16 +376,7 @@ export async function assistCharacters(
   description: string, world: Record<string, unknown> | null, persona: Record<string, unknown> | null,
   cards: { id: number; name: string; description: string }[], feedback: string,
 ): Promise<{ characters: { name: string; role: string; detail: string; reuse: string | null }[] }> {
-  const sys = [
-    "À partir de l'idée du joueur, extrais les personnages non-joueurs (PNJ) qu'il a décrits ou évoqués.",
-    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format :',
-    '{"characters":[{"name":"Nom du PNJ","role":"sa fonction dans l\'histoire","detail":"CE QUE le joueur a dit de lui : apparence, attitude, indices visuels (1-2 phrases)","reuse":null}]}.',
-    "characters : de 0 à 4 PNJ réellement évoqués par le joueur (0 si aucun).",
-    "name : si le joueur n'a pas donné de nom propre (ex. « la tavernière mystérieuse »), garde sa description courte comme nom provisoire — on le nommera plus tard.",
-    "detail : reproduis les indices de la description (apparence, objet, mystère) ; vide si le joueur n'a rien dit de précis.",
-    "reuse : si un PNJ correspond à une carte EXISTANTE fournie ci-dessous, met son nom exact dans \"reuse\" (sinon null). On proposera la carte existante en premier, plus des variantes neuves.",
-    "Tout en français. JSON complet, non tronqué.",
-  ].join(" ");
+  const sys = promptText("assist-characters-system");
   const worldBlock = world ? `Monde : « ${ASSIST_STR(world.name, 80)} » — ${ASSIST_STR(world.description, 400)}` : "";
   const personaBlock = persona ? `Persona du joueur : « ${ASSIST_STR(persona.name, 80)} »` : "";
   const cardsBlock = cards.length
@@ -602,17 +417,12 @@ export async function assistCards(
   const charDetail = ASSIST_STR(character?.detail, 400);
   const personaName = ASSIST_STR(persona?.name, 80);
   const forbidden = new Set([personaName, ...siblingNames].map(assistKey).filter(Boolean));
-  const sys = [
-    `Tu crées des cartes de personnage alternatives pour « ${charName} » (${charRole || "rôle à définir"}) dans le monde du joueur.`,
-    ...(charDetail ? [`Le joueur a dit de lui : « ${charDetail} » — RESPECTE ces indices visuels et ce mystère dans chaque carte.`] : []),
-    ...(personaName ? [`Le joueur incarne « ${personaName} » : n'utilise JAMAIS ce nom pour une carte, et rends chaque carte distincte de ce persona (pas un clone, pas un parent caché sauf si l'idée le suggère).`] : []),
-    "Si le nom provisoire n'est pas un vrai nom propre (ex. « la tavernière mystérieuse », « le garde »), invente un nom propre pour chaque carte.",
-    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format :',
-    '{"proposals":[{"name":"Nom","description":"2 phrases : apparence et signes distinctifs","personality":"traits de caractère en une phrase","scenario":"sa situation initiale dans l\'histoire","tags":["tag1","tag2"],"first_mes":"sa première réplique quand le joueur le rencontre (1-2 phrases, à la première personne)"}]}.',
-    "proposals : EXACTEMENT 4 cartes complètes, variées entre elles (ton, rôle, attitude), avec des noms différents.",
-    "first_mes : OBLIGATOIRE pour chaque carte — une réplique d'ouverture marquante, dans la voix du personnage.",
-    "Tout en français. JSON complet, non tronqué.",
-  ].join(" ");
+  const sys = promptFilled("assist-cards-system", {
+    charName,
+    charRole: charRole || "rôle à définir",
+    detailLine: charDetail ? `Le joueur a dit de lui : « ${charDetail} » — RESPECTE ces indices visuels et ce mystère dans chaque carte.` : "",
+    personaLine: personaName ? `Le joueur incarne « ${personaName} » : n'utilise JAMAIS ce nom pour une carte, et rends chaque carte distincte de ce persona (pas un clone, pas un parent caché sauf si l'idée le suggère).` : "",
+  });
   const worldBlock = world ? `Monde : « ${ASSIST_STR(world.name, 80)} » — ${ASSIST_STR(world.description, 400)}` : "";
   const personaBlock = personaName ? `Persona du joueur (à ne pas dupliquer) : « ${personaName} » — ${ASSIST_STR(persona?.description, 300)}` : "";
   const fb = feedback ? `\nRetour du joueur sur la fournée précédente (à intégrer) : ${feedback}` : "";
@@ -645,14 +455,7 @@ export async function assistOpening(
   description: string, world: Record<string, unknown> | null,
   persona: Record<string, unknown> | null, castNames: string[], feedback: string,
 ): Promise<{ title: string; intro: string }> {
-  const sys = [
-    "Tu écris la situation de départ d'un roleplay isekai, à partir de l'idée du joueur.",
-    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format :',
-    '{"title":"titre court de la scène d\'ouverture (3-6 mots)","intro":"3 à 5 phrases qui plantent le décor ET lancent l\'action en medias res, à la deuxième personne du singulier (tu…)"}.',
-    "L'intro doit situer le lieu, ce que le joueur y fait, et finir sur un crochet immédiat (un bruit, une rencontre, un danger) — jamais de fin fermée, jamais de résumé du monde.",
-    "Cohérent avec le monde, le persona et les personnages validés ci-dessous.",
-    "Tout en français. JSON complet, non tronqué.",
-  ].join(" ");
+  const sys = promptText("assist-opening-system");
   const worldBlock = world ? `Monde : « ${ASSIST_STR(world.name, 80)} » — ${ASSIST_STR(world.description, 400)}` : "";
   const personaBlock = persona ? `Tu incarnes : « ${ASSIST_STR(persona.name, 80)} » — ${ASSIST_STR(persona.description, 300)}` : "";
   const castBlock = castNames.length ? `Personnages présents : ${castNames.map((n) => `« ${n} »`).join(", ")}` : "";
@@ -804,11 +607,7 @@ export async function forkTail(src: ConversationRow, doomed: MessageRow[], fromI
 /** Condense a doomed stretch into a narrator loop-summary (~3000 tokens budget). */
 export async function summarizeLoop(title: string, doomed: MessageRow[]): Promise<{ title: string; summary: string }> {
   const fallback = { title: "Boucle", summary: "Une tentative aboutit à une impasse. Les détails de ce trajet ont été écrasés par le retour." };
-  const sys = [
-    `Tu es le narrateur d'un roleplay RE:ZERO. « ${title.slice(0, 60)} ». On te confie une tranche de partie qui a été brutalisée par un retour dans le temps, pour la condenser en souvenir.`,
-    "Ce souvenir doit tenir DANS ~3000 tokens, donc RESUME : garde l'essentiel des actions, des choix du joueur et de leurs conséquences, mais écrase les détails.",
-    "Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : {\"title\": \"intitulé court du souvenir (2-5 mots)\", \"summary\": \"résumé concis de 4 à 8 phrases, au présent, focalisé sur les choix et leurs issues\"}. JSON complet, non tronqué.",
-  ].join(" ");
+  const sys = promptFilled("loop-summary-system", { title: title.slice(0, 60) });
   const transcript = transcriptFor(doomed, 200);
   if (!transcript.trim()) return fallback;
   try {
@@ -822,13 +621,7 @@ export async function summarizeLoop(title: string, doomed: MessageRow[]): Promis
 
 export async function suggestLore(conv: ConversationRow, msgs: MessageRow[]): Promise<{ name: string; triggers: string; content: string }[]> {
   const LORE_FMT = '{"entries":[{"name":"faction ou lieu ou personne","triggers":"mots-clés (séparés par des virgules) qui signalent ce fait","content":"2 à 4 phrases fixes du canon, sans pronoms personnels de la scène"}]}';
-  const sys = [
-    `Tu es le conservateur du canon d'un roleplay « ${(conv.title || "").slice(0, 60)} ».`,
-    "À partir de la fiction ci-dessous, extrais 2 à 5 faits STABLES et toujours vrais de ce monde (relations, lieux, organisations, identités, règles), jamais des émotions de scène ni des actions ponctuelles.",
-    "Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : " + LORE_FMT,
-    "Les triggers doivent être de courts mots-clés de scène (prénoms, lieux, concepts) qui déclencheront l'injection du fait dans le prompt du modèle.",
-    "JSON complet, non tronqué.",
-  ].join(" ");
+  const sys = promptFilled("lore-suggest-system", { title: (conv.title || "").slice(0, 60), fmt: LORE_FMT });
   const transcript = transcriptFor(msgs.slice(-14), 280);
   if (!transcript.trim()) return [];
   try {
@@ -858,14 +651,7 @@ export async function proposeCanonFacts(convId: number, msgs: MessageRow[], sign
   if (story.length < 2) return [];
   const existing = listCanon(convId).filter((e) => e.status === "confirmed" || e.status === "proposed");
   const known = new Set(existing.map((e) => assistKey(e.subject)));
-  const sys = [
-    "Tu es le conservateur du canon d'une partie de roleplay.",
-    "À partir de la fiction ci-dessous, extrais les FAITS STABLES que le joueur doit garder en mémoire : identités, relations durables, lieux visités, objets possédés, promesses, règles du monde révélées.",
-    "Exclus les émotions de scène, les actions ponctuelles, les détails ambigus et ce qui n'est pas encore certain.",
-    "Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : " + CANON_FMT,
-    "Chaque fait est une phrase simple au présent, autonome (pas de pronoms ambigus). 2 à 5 faits maximum.",
-    "JSON complet, non tronqué.",
-  ].join(" ");
+  const sys = promptFilled("canon-propose-system", { fmt: CANON_FMT });
   const p = await llmJson(transcriptFor(story, 40), sys, 800, 0.4, 120_000, undefined, signal);
   const raw = Array.isArray(p?.facts) ? p.facts : [];
   const created: CanonRow[] = [];
@@ -891,11 +677,7 @@ export async function proposeCanonFacts(convId: number, msgs: MessageRow[], sign
 }
 
 export async function suggestChapter(title: string, msgs: MessageRow[]): Promise<{ title: string; summary: string } | null> {
-  const sys = [
-    `Tu es le maître de jeu d'un roleplay « ${title.slice(0, 60)} ». On te confie une tranche de partie pour en faire un chapitre.`,
-    "Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : {\"title\": \"titre évocateur de 2-6 mots\", \"summary\": \"résumé de 3 à 5 phrases des événements et des enjeux restés ouverts\"}.",
-    "Le titre ne contient pas le mot chapitre. Résumé au présent, en français, prêt à relire en reprenant la partie. JSON complet, non tronqué.",
-  ].join(" ");
+  const sys = promptFilled("chapter-suggest-system", { title: title.slice(0, 60) });
   const p = await llmJson(transcriptFor(msgs), sys);
   const t = String(p?.title ?? "").trim().slice(0, 80);
   const s = String(p?.summary ?? "").trim().slice(0, 1200);
@@ -918,8 +700,7 @@ export type RecapShot = { caption: string; prompt: string; image?: string; seed?
 export type RecapData = { title: string; text: string; at: number; last_msg_id: number; shots: RecapShot[] };
 
 export function recapOf(conv: ConversationRow): { cs: any; recap: RecapData | null } {
-  let cs: any = {};
-  try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  const cs = conversationSettingsOf(conv);
   const r = cs.recap;
   return { cs, recap: r && typeof r === "object" && !Array.isArray(r) ? r : null };
 }
@@ -932,13 +713,7 @@ export function storyMessages(msgs: MessageRow[]): MessageRow[] {
 }
 
 export async function suggestRecap(title: string, msgs: MessageRow[]): Promise<{ title: string; text: string; shots: { caption: string; prompt: string }[] } | null> {
-  const sys = [
-    `Tu es le narrateur d'un roleplay « ${title.slice(0, 60)} ». La session précédente vient de s'arrêter ; le joueur va reprendre la partie.`,
-    "Rédige le « Previously on… » : un résumé court et vivant qui replace le joueur dans l'histoire.",
-    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : {"title":"titre court de la session (2-5 mots)","recap":"résumé narratif de 4 à 8 phrases, au présent, à la voix du narrateur : ce qui s\'est passé, où l\'on en est, les enjeux restés ouverts","shots":[{"caption":"légende française du moment clé, une phrase","prompt":"prompt d\'illustration en anglais, tags danbooru pour un modèle anime : sujet, décor, lumière, composition — jamais de texte ni de mot français"}]}.',
-    `1 à ${RECAP_MAX_SHOTS} shots au maximum, pour des scènes PAYSAGE larges et visuelles ; chaque prompt décrit un moment précis et auto-suffisant, pas un plan abstrait.`,
-    "Ne mentionne jamais l'IA, l'assistant ni le mot récap. JSON complet, non tronqué.",
-  ].join(" ");
+  const sys = promptFilled("recap-suggest-system", { title: title.slice(0, 60), maxShots: RECAP_MAX_SHOTS });
   const p = await llmJson(transcriptFor(msgs, 120), sys, 1400, 0.8);
   const t = String(p?.title ?? "").trim().slice(0, 100);
   const text = String(p?.recap ?? p?.text ?? "").trim().slice(0, 2000);
@@ -1070,8 +845,7 @@ export function relPairKey(a: string, b: string): string {
 }
 
 export function relsOf(conv: ConversationRow): { cs: any; rels: RelState | null } {
-  let cs: any = {};
-  try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  const cs = conversationSettingsOf(conv);
   const r = cs.rels;
   const ok = r && typeof r === "object" && !Array.isArray(r) && Array.isArray(r.pairs);
   return { cs, rels: ok ? r : null };
@@ -1097,15 +871,7 @@ export function mergeRels(prev: RelState | null, fresh: RelPair[]): { pairs: Rel
 
 export async function suggestRelations(known: string[], msgs: MessageRow[], signal?: AbortSignal): Promise<RelPair[] | null> {
   const knownTxt = known.length ? known.join(", ") : "aucun — utilise les noms tels qu'écrits dans la fiction";
-  const sys = [
-    "Tu suis une partie de roleplay et tu mets à jour les affinités entre personnages.",
-    `Personnages connus (réutilise EXACTEMENT ces noms, orthographe comprise) : ${knownTxt}.`,
-    "Pour CHAQUE paire qui interagit réellement dans les scènes, donne ce que le premier ressent pour le second (a = celui qui ressent, b = celui qui est ressenti).",
-    "value : -100 = haine … 0 = neutre … +100 = amour, loyauté absolue. Les deux sens peuvent différer (amour non partagé).",
-    "note : une courte phrase française qui justifie le lien (actions récentes), sans citer les répliques.",
-    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour : {"relations":[{"a":"Personnage A","b":"Personnage B","value":42,"note":"une phrase"}]}.',
-    "Quelques liens forts valent mieux qu'un catalogue exhaustif. N'invente jamais un lien absent des scènes ; si personne n'interagit, renvoie {\"relations\":[]}. JSON complet, non tronqué.",
-  ].join(" ");
+  const sys = promptFilled("relations-system", { known: knownTxt });
   const p = await llmJson(transcriptFor(msgs, REL_SCAN_WINDOW), sys, 1200, 0.6, 120_000, undefined, signal);
   const list = Array.isArray(p?.relations) ? p.relations : null;
   if (!list) return null;
@@ -1171,17 +937,11 @@ export async function suggestNpcs(conv: ConversationRow, msgs: MessageRow[]): Pr
   // explicit exclusion list: the model famously re-proposes existing cast
   // members (then the filter drops them and the user sees "Aucun PNJ") — make
   // the rule loud and give the model a sanctioned empty answer instead
-  const sys = (extra: string) => `
-Tu suis une partie de roleplay et repères les personnages secondaires qui émergent de la fiction.
-
-PERSONNAGES DÉJÀ EN CARTE (STRICTEMENT INTERDITS, à ignorer) : ${castNames.join(", ") || "aucun"}.
-RÈGLES :
-- Ne propose JAMAIS un nom de cette liste, ni une variante, un surnom, un dérivé ou une translittération de l'un d'eux (même personnage, même rôle ⇒ interdit).
-- Ne propose QUE des personnages réellement évoqués par les derniers échanges, nouveaux par rapport à la liste ci-dessus, jamais le narrateur ni le joueur. Chaque proposition reçoit un nom propre INÉDIT.
-- Si TOUS les personnages secondaires de la scène sont déjà dans la liste (ou qu'aucun personnage secondaire distinct n'apparaît), réponds exactement {"npcs":[]} plutôt que de re-proposer un membre de la liste.
-${extra}
-RÉPONSE : ${NPC_FMT} — 0 à 3 entrées, JSON valide complet, aucun texte autour.
-`;
+  const sys = (extra: string) => promptFilled("npc-suggest-system", {
+    castNames: castNames.join(", ") || "aucun",
+    extra,
+    npcfmt: NPC_FMT,
+  });
   const castsJoined = castNames.join(", ") || "aucun";
   const first = await llmJson(transcript, sys(""), 900, 0.8);
   let out = clean(Array.isArray(first?.npcs) ? first.npcs as any[] : []);
@@ -1211,13 +971,7 @@ export async function generateQuests(title: string, messages: MessageRow[]): Pro
     .slice(-60)
     .map((m) => `${m.role === "user" ? "Joueur" : m.name || "Narrateur"} : ${(m.content || "").replace(/\s+/g, " ").slice(0, 320)}`)
     .join("\n");
-  const sys = [
-    `Tu suis la partie de roleplay « ${title.slice(0, 60)} » comme maître de jeu.`,
-    "À partir du fil de la partie, identifie les objectifs concrets du joueur, en cours ou récemment terminés/abandonnés (0 à 5 éléments).",
-    "Une quête = un objectif concret : retrouver quelqu'un, récupérer un objet, résoudre un mystère, échapper à une menace, gagner une bataille…",
-    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : {"quests":[{"title":"titre court","status":"active|done|dropped","notes":"une phrase de contexte"}]}.',
-    "Ne recopie pas les répliques ; titre court et nominal ; notes en une phrase. Tout en français. JSON complet, non tronqué.",
-  ].join(" ");
+  const sys = promptFilled("quests-system", { title: title.slice(0, 60) });
   let text = "";
   try {
     text = await provider.complete({
@@ -1284,13 +1038,7 @@ export async function generateQuestions(conv: ConversationRow, messages: Message
     model = models[0] ?? "";
   }
   const n = Math.max(1, Math.min(8, Math.round(count)));
-  const sys = [
-    `Tu es le meneur de jeu d'une partie de roleplay. Tu prépares ${n} questions à poser au joueur (${personaName}) pour GUIDER la partie.`,
-    "Chaque question doit aider la suite de l'histoire : intentions du personnage, choix à venir, relations, ton de jeu, envies du joueur.",
-    "Questions courtes et variées, dans la langue du joueur (français par défaut). 2 à 4 réponses suggérées par question, sous forme de propositions que le joueur pourra choisir ou modifier.",
-    'Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : [{"q":"question","answers":["proposition 1","proposition 2","proposition 3"]}].',
-    "JSON complet, non tronqué. Ne pose pas de questions hors de la partie.",
-  ].join(" ");
+  const sys = promptFilled("questions-system", { count: n, persona: personaName });
   const prompt = [
     worldLine,
     castLine,
@@ -1429,8 +1177,7 @@ export function parseCardAssistJson(text: string): Record<string, unknown> | nul
 export const SUMMARY_PREFIX = "(Session antérieure résumée)\n";
 
 export function contextConfig(conv: ConversationRow): { maxMsgs: number; maxTokens: number; capSource: string } {
-  let cs: Record<string, unknown> = {};
-  try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  const cs = conversationSettingsOf(conv);
   // per-world caps act as a hard ceiling over the conversation's own values,
   // so a world with a small model can protect every party in it
   let maxMsgs = Number(cs.context_max_messages ?? getSetting("context_max_messages", 20));
@@ -1564,12 +1311,7 @@ export async function validateNarrative(convId: number): Promise<{ findings: any
   let model = defaultModelFor(provider.id);
   if (!model) { const models = await provider.models().catch(() => []); model = models[0] ?? ""; }
   if (!model) return null;
-  const sys = [
-    "Tu es un correcteur de cohérence pour une partie de roleplay.",
-    "Relis le fil et détecte les incohérences : personnage mort qui réapparaît, objet utilisé avant d'être obtenu, lieu contradictoire, changement de nom, violation du point de vue, joueur contrôlé par l'IA.",
-    'Réponds avec un JSON strict : {"findings":[{"severity":"info|warning|critical","message":"l\'incohérence en une phrase","suggestion":"correction proposée"}]} — tableau vide si tout est cohérent.',
-    "Ne signale pas deux fois la même chose et ne sois pas tatillon : uniquement les vrais problèmes.",
-  ].join(" ");
+  const sys = promptText("coherence-system");
   const text = await provider
     .complete({
       messages: [{ role: "system", content: system + "\n\n" + sys }, { role: "user", content: transcript }],
@@ -1606,12 +1348,7 @@ export async function generateSceneState(convId: number): Promise<Record<string,
   let model = defaultModelFor(provider.id);
   if (!model) { const models = await provider.models().catch(() => []); model = models[0] ?? ""; }
   if (!model) return null;
-  const sys = [
-    "Tu es un outil d'analyse de partie de roleplay.",
-    "À partir du fil récent, produis un état de scène concis au format JSON strict, sans aucun texte autour :",
-    '{"location":"lieu actuel si identifiable, sinon vide","characters":["personnages présents"],"goals":["objectifs du joueur en cours"],"dangers":["menaces en cours"],"secrets":["secrets que le joueur a déjà découverts"],"notes":"une phrase de contexte"}',
-    "N'invente rien : ne mentionne que ce qui est visible dans le fil.",
-  ].join(" ");
+  const sys = promptText("scene-state-system");
   const text = await provider
     .complete({
       messages: [{ role: "system", content: system + "\n\n" + sys }, { role: "user", content: recent }],
@@ -1651,13 +1388,7 @@ export async function proposeTimelineEvents(worldId: number): Promise<{ proposal
   const transcript = threads
     .map(({ conv, msgs }) => `--- Partie : ${conv.title} ---\n` + msgs.map((m) => `${m.role === "user" ? "Joueur" : (m.name || "Narrateur")} : ${m.content.slice(0, 500)}`).join("\n"))
     .join("\n\n");
-  const sys = [
-    "Tu es un outil d'analyse de partie de roleplay. À partir des échanges récents d'une campagne, repère les ÉVÉNEMENTS MAJEURS à retenir pour la chronologie du monde : arrivées, rencontres marquantes, pactes, batailles, objets obtenus, révélations, choix importants.",
-    "Ignore les échanges anodins. Maximum 6 événements, un seul par événement marquant.",
-    "Réponds UNIQUEMENT par un tableau JSON, sans aucun texte autour :",
-    `[{"label": "Jour 1 — Arrivée à Eldoria", "message": "extrait très court (moins de 120 caractères) tiré du fil justifiant l'événement"}]`,
-    "Le label commence par « Jour N — » en respectant l'ordre chronologique apparent.",
-  ].join(" ");
+  const sys = promptText("timeline-system");
   const text = await provider
     .complete({
       messages: [{ role: "system", content: sys }, { role: "user", content: transcript.slice(0, 16000) }],
@@ -1700,377 +1431,6 @@ export async function proposeTimelineEvents(worldId: number): Promise<{ proposal
     };
   });
   return { proposals };
-}
-
-export async function generateSuggestions(ctx: CastContext, history: MessageRow[]): Promise<string[]> {
-  // same context policy as the main stream
-  const { kept, summary, memory } = applyContextWindow(ctx.conversation.id, ctx.conversation, history);
-  ctx = { ...ctx, summary, memory };
-  let cs: Record<string, unknown> = {};
-  try { cs = JSON.parse(ctx.conversation.settings || "{}"); } catch { /* ignore */ }
-  const provider = getProvider((cs.provider as string) || undefined);
-  const model = (cs.model as string) || defaultModelFor(provider.id);
-  const messages: ChatMessage[] = [
-    chatMsg("system", suggestSystem(ctx)),
-    ...kept.slice(-10).map((m) => chatMsg(m.role === "user" ? "user" : "assistant", m.content)),
-    chatMsg("user", "Propose tes suggestions de réponses pour le joueur."),
-  ];
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const text = await provider
-      .complete({ messages, model, temperature: 1.1, maxTokens: 512, noThinking: true, signal: AbortSignal.timeout(90_000) })
-      .catch((e) => {
-        console.error("[sugg] complete failed:", String(e?.message ?? e).slice(0, 200));
-        return "";
-      });
-    const sugg = parseSuggestions(text);
-    if (sugg.length >= 3) return sugg;
-  }
-  return [];
-}
-
-// one in-flight generation per conversation: a second tab (or a double-click)
-// must never start a parallel turn on the same party
-const activeStreams = new Set<number>();
-
-export async function handleStream(req: Request, convId: number): Promise<Response> {
-  const body = await readJson(req);
-  const conv = getConversation(convId);
-  if (!conv) return json({ error: "conversation not found" }, 404);
-  if (activeStreams.has(convId)) {
-    return json({ error: "Une génération est déjà en cours pour cette partie.", code: "CONFLICT" }, 409);
-  }
-  activeStreams.add(convId);
-  // idempotent retries: the client tags every attempt with a uid and re-posts
-  // the SAME uid when the connection dropped before any token arrived. If a
-  // previous attempt with this uid partially committed (user turn + possibly a
-  // partial reply), drop that tail so the retry starts clean — never touching
-  // anything past the newest user message (real newer turns are safe).
-  const attemptUid = typeof body.uid === "string" && body.uid ? body.uid.slice(0, 64) : "";
-  if (attemptUid) {
-    const msgs = listMessages(convId);
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i];
-      let meta: any = {};
-      try { meta = JSON.parse(m.meta || "{}"); } catch { /* ignore */ }
-      if (m.role === "user") {
-        if (meta.uid === attemptUid && i < msgs.length) {
-          for (const d of msgs.slice(i)) deleteMessage(d.id);
-          console.log(`[chat] ↻ nouvelle tentative #${convId} — tour précédent (uid ${attemptUid.slice(0, 8)}) retiré`);
-        }
-        break;
-      }
-    }
-  }
-  const view = conversationView(convId)!;
-  const world = view.world;
-  const persona = view.persona;
-  const cards = view.cards;
-  const scenario = view.scenario;
-
-  const userText = (body.content ?? "").trim();
-  const modelText = (body.prompt ?? body.content ?? "").trim(); // slash commands rewrite the model input
-  const directive = (body.directive ?? "").trim();
-  const steering = (body.steering ?? "").trim(); // per-turn steering channel (§8.3)
-  const isOoc = body.mode === "ooc" || /^(\/ooc\b|<ooc:?\s)/i.test(userText) || /^\[hors-jeu/i.test(modelText);
-  if (!userText && !directive) { activeStreams.delete(convId); return json({ error: "message vide" }, 400); }
-  // keep the model-facing input on the user message so "Régénérer" can replay
-  // it exactly (slash commands and directives rewrite the raw content)
-  const userMeta: Record<string, string> = {};
-  if (modelText && modelText !== userText) userMeta.prompt = modelText;
-  if (directive) userMeta.directive = directive;
-  if (steering) userMeta.steering = steering;
-  if (isOoc) userMeta.ooc = "1";
-  if (attemptUid) userMeta.uid = attemptUid;
-  const userMsg = createMessage({
-    conversation_id: convId, role: "user",
-    name: persona?.name ?? "Moi", content: userText || directive.slice(0, 120),
-    meta: JSON.stringify(userMeta),
-  });
-
-  // messages present before this exchange (used for the auto-title heuristic)
-  const historyBefore = listMessages(convId).filter((m) => m.id !== userMsg.id);
-  // history + new user message
-  const history = listMessages(convId);
-
-  // per-party settings must be valid before we touch the model
-  let settings: any = {};
-  try {
-    settings = JSON.parse(conv.settings || "{}");
-    if (!settings || typeof settings !== "object") settings = {};
-  } catch {
-    activeStreams.delete(convId);
-    return json({ error: "Réglages de la partie corrompus — réinitialise-les depuis les réglages.", code: "INVALID_JSON" }, 422);
-  }
-
-  // RP profile + intention classification (§8.2): the detected intent feeds
-  // the scene focus by default, and a direction change puts the persistent
-  // scene plan on hold for THIS turn only (manual focus always overrides).
-  const profile = profileFromSettings(settings);
-  const intent = classifyIntent(modelText || directive || userText);
-  const intentHistory: string[] = Array.isArray(settings.intent_history)
-    ? settings.intent_history.filter((x: unknown) => typeof x === "string")
-    : [];
-  const changed = directionChanged(intentHistory as any, intent);
-  const sceneControlHeld = changed && settings.scene_control && settings.scene_control.enabled !== false;
-  const effectiveFocus: SceneFocus | undefined = isOoc ? undefined : (profile.sceneFocus ?? intentToFocus(intent));
-
-  const preset = presetFromKey(settings.preset);
-  const provider = getProvider((settings.provider as string) || undefined);
-  const model = (settings.model as string) || defaultModelFor(provider.id);
-  const mclass = modelClass(model);
-  const budgetTokens = modelContextBudget(mclass);
-  // calmer defaults for the reactive profiles (report Phase 5)
-  const behaviorDefaultTemp = profile.behavior === "cinematique" ? 0.9 : 0.75;
-  const rawTemp = Number(settings.temperature ?? preset?.temperature ?? getSetting("temperature", behaviorDefaultTemp));
-  const temperature = Number.isFinite(rawTemp) ? Math.min(2, Math.max(0, rawTemp)) : 0.75;
-  const rawMax = Number(settings.max_tokens ?? preset?.maxTokens ?? getSetting("max_tokens", 2048));
-  const maxTokens = Number.isFinite(rawMax) ? Math.min(8192, Math.max(64, Math.round(rawMax))) : 2048;
-
-  // context window: keep recent messages, compress the rest into a rolling summary
-  const { kept, summary, memory } = applyContextWindow(convId, conv, history.filter((m) => m.id !== userMsg.id));
-  const buildOpts: BuildPromptOptions = {
-    profile,
-    ooc: isOoc,
-    sceneControlHeld,
-    steering: isOoc ? "" : steering,
-    budgetTokens,
-    currentTurn: modelText || directive,
-  };
-  const { system, messages } = buildMessages({ world, persona, cards, scenario, conversation: conv, summary, memory }, kept, buildOpts);
-  messages.push({ role: "user", content: modelText || directive });
-  // interpellation directive (e.g. "ask the narrator / a character to speak")
-  // — only when the turn also carries text, else the directive IS the message
-  if (directive && modelText) messages[messages.length - 1].content += `\n\n[Directive : ${directive}]`;
-  // recency block (§8.3): agency + active focus repeated right before generation
-  if (isOoc) messages[messages.length - 1].content += "\n\n[OOC — question hors-jeu : réponds hors de la fiction]";
-  else messages[messages.length - 1].content += `\n\n${recencyBlock(persona?.name ?? "le joueur", effectiveFocus)}`;
-
-  // server-side trace of every generation (structured — see log.ts)
-  const genLabel = (userText || directive || "").replace(/\s+/g, " ").trim().slice(0, 90);
-  const genStart = Date.now();
-  log("chat", "generation started", {
-    convId, title: (conv.title || "sans titre").slice(0, 60), message: genLabel || "(directive)",
-    provider: provider.id, model: model || "défaut", temperature, maxTokens,
-    behavior: profile.behavior, contextMode: profile.contextMode, length: profile.responseLength,
-    focus: effectiveFocus ?? "", focusSource: profile.manualFocus ? "manual" : isOoc ? "ooc" : "detected",
-    intent, modelClass: mclass, budgetTokens, sceneControlHeld, ooc: isOoc ? 1 : 0,
-  });
-
-  // hard timeout: a stuck model must not leave the UI on "…" forever
-  const rawTimeout = Number(getSetting("llm_timeout", 150));
-  const timeoutSec = Number.isFinite(rawTimeout) ? Math.min(900, Math.max(20, rawTimeout)) : 150;
-  const llmAbort = new AbortController();
-  let llmTimer = setTimeout(() => llmAbort.abort(), timeoutSec * 1000);
-  let clientStopped = false;
-  let assistantCreated = false;
-  let streamAttempts = 0;
-
-  return sseStream(
-    async (send, close) => {
-    let full = "";
-    let assistantId = 0;
-    let doneSent = false; // the client was told the turn committed
-    const MAX_ATTEMPTS = 3;
-    // stream one attempt set with transient-failure backoff; sends deltas live
-    const streamOnce = async (msgs: ChatMessage[], temp: number): Promise<string> => {
-      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-        streamAttempts++;
-        let acc = "";
-        try {
-          for await (const delta of provider.stream({
-            messages: msgs,
-            model,
-            temperature: temp,
-            maxTokens,
-            noThinking: true,
-            signal: llmAbort.signal,
-          })) {
-            acc += delta;
-            send("delta", { text: delta });
-          }
-          return acc;
-        } catch (e: any) {
-          const aborted = e?.name === "AbortError" || e?.name === "TimeoutError" || /abort/i.test(String(e));
-          // Once any output has reached the client, retrying would append a
-          // second response to the partial one and commit duplicated fiction.
-          if (aborted || acc || attempt >= MAX_ATTEMPTS) throw e;
-          send("retry", { attempt, message: `Connexion au modèle instable — nouvelle tentative (${attempt}/${MAX_ATTEMPTS})…` });
-          await new Promise((r) => setTimeout(r, 500 * attempt * attempt));
-          if (clientStopped) throw e;
-        }
-      }
-      return "";
-    };
-    try {
-      full = await streamOnce([{ role: "system", content: system }, ...messages], temperature);
-      clearTimeout(llmTimer);
-      // the guardrail correction below is a SECOND model call: re-arm a fresh,
-      // shorter timeout so a hung model can't leave the SSE open and the
-      // conversation locked after the main stream already succeeded
-      llmTimer = setTimeout(() => llmAbort.abort(), 60_000);
-      const genSecs = ((Date.now() - genStart) / 1000).toFixed(1);
-      log("chat", "generation completed", { convId, secs: genSecs, chars: full.trim().length, attempts: streamAttempts });
-      if (!full.trim()) {
-        // try to get the model list for a nicer error
-        const models = await provider.models().catch(() => []);
-        const hint = models.length ? ` Modèles détectés : ${models.slice(0, 5).join(", ")}` : "";
-        // like any other failure: drop the pending user turn so the retry
-        // (the client keeps its own copy) doesn't duplicate the message
-        deleteMessage(userMsg.id);
-        send("error", { message: `Le modèle "${model}" n'a rien renvoyé.${hint}` });
-        close();
-        return;
-      }
-      // post-generation guardrail (§8.9): rule-based drift checks, then ONE
-      // transparent corrective regeneration when a check trips (extra latency
-      // only on real triggers; never for OOC turns or after Stop).
-      let driftRetry = false;
-      let driftIssues: string[] = [];
-      if (!isOoc && !clientStopped) {
-        const issues = checkResponseDrift(full, { personaName: persona?.name, focus: effectiveFocus, behavior: profile.behavior });
-        if (issues.length) {
-          driftIssues = issues.map((i) => i.detail);
-          log("chat", "drift detected", { convId, issues: driftIssues.join(" | ") });
-          const correction = `[CORRECTION : la réponse précédente ${driftIssues.join(" ; ")}. Réponds uniquement à la dernière action du joueur, sans contrôler le joueur ni introduire d'événement majeur non demandé, et termine à un point naturel où le joueur peut répondre.]`;
-          try {
-            const corrected = await streamOnce([...messages, chatMsg("user", correction)], 0.6);
-            if (corrected.trim()) { full = corrected; driftRetry = true; }
-          } catch (e2) {
-            console.warn(`[chat] correction du garde-fou échouée (partie #${convId}):`, String((e2 as any)?.message ?? e2).slice(0, 160));
-          }
-        }
-      }
-      clearTimeout(llmTimer);
-      // strip any visible chain-of-thought from the SAVED content
-      full = stripThinking(full);
-      if (!full.trim()) { deleteMessage(userMsg.id); send("error", { message: `Le modèle "${model}" n'a rien renvoyé.` }); close(); return; }
-      const assistant = createMessage({
-        conversation_id: convId, role: "assistant",
-        name: cards[0]?.name ?? "Narrateur", content: full.trim(),
-        meta: JSON.stringify({ ooc: isOoc ? 1 : 0 }),
-      });
-      assistantCreated = true;
-      assistantId = assistant.id;
-      // The turn is now COMMITTED: bookkeeping failures below must never turn
-      // into an "error" event (the client would think the turn failed and
-      // retry, duplicating it). Log them and move on.
-      try {
-        // OOC replies stay plain text — never split into narration/dialogue
-        if (!isOoc) {
-          const segments = parseSegmentsFor(conv, full);
-          updateMessage(assistant.id, { segments: JSON.stringify(segments) });
-        }
-        // diagnostic trace on the message (Phase 5 — context inspector + metrics)
-        const diag = {
-          behavior: profile.behavior, contextMode: profile.contextMode, length: profile.responseLength,
-          focus: effectiveFocus ?? "", focusSource: profile.manualFocus ? "manual" : isOoc ? "ooc" : "detected",
-          intent, modelClass: mclass, budgetTokens, promptTokens: estimateTokens(system),
-          temperature, maxTokens, driftRetry, driftIssues, sceneControlHeld, attempts: streamAttempts,
-        };
-        const m2 = getMessage(assistant.id)!;
-        updateMessage(assistant.id, { meta: JSON.stringify({ ...JSON.parse(m2.meta || "{}"), diagnostics: diag }) });
-        touchConversation(convId);
-        const firstLine = full.trim().split("\n")[0]?.slice(0, 60) ?? "";
-        // fresh conversation (only the opening message so far) → name it from the
-        // first reply; keep manual titles
-        if (historyBefore.length <= 1 && conv.title === "Nouvelle partie") {
-          updateConversation(convId, { title: firstLine || "Partie" });
-        }
-        // dashboard preview = the latest exchange
-        updateConversation(convId, { last_message: full.trim().slice(0, 200) });
-        // end-of-turn state: clear the one-shot DM flag, record the intent
-        // history (scene_control.hold is per-turn only, never persisted)
-        updateConversation(convId, { settings: JSON.stringify({ ...settings, dm_pending: false, intent_history: [...intentHistory, intent].slice(-5) }) });
-      } catch (e) {
-        console.error(`[chat] post-commit bookkeeping failed (partie #${convId}):`, String((e as any)?.message ?? e).slice(0, 160));
-      }
-      // Phase 8: raw per-turn metric (regeneration rate, guardrail, profiles)
-      recordMetric("turn", {
-        convId, behavior: profile.behavior, contextMode: profile.contextMode, length: profile.responseLength,
-        focus: effectiveFocus ?? "", focusSource: profile.manualFocus ? "manual" : isOoc ? "ooc" : "detected",
-        intent, modelClass: mclass, budgetTokens, promptTokens: estimateTokens(system),
-        temperature, maxTokens, driftRetry, ooc: isOoc ? 1 : 0, attempts: streamAttempts, secs: Number(genSecs),
-      });
-      doneSent = true;
-      send("done", { message: messageView(getMessage(assistant.id) ?? assistant) });
-      console.log(`[chat] 📨  Réponse #${assistant.id} envoyée au client${driftRetry ? " (corrigée par le garde-fou)" : ""}`);
-      // player-owned canon: optional AI proposals after each turn (opt-in via
-      // settings.canon_auto, avancé mode only) — non-blocking tracked job
-      try {
-        let cs2: Record<string, unknown> = {};
-        try { cs2 = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
-        if (cs2.canon_auto && profile.contextMode === "avance") {
-          void trackJob(
-            {
-              type: "canon",
-              title: "Propositions de canon",
-              conversationId: convId,
-              payload: { conversationId: convId },
-              retryable: true,
-            },
-            async (job, api) => {
-              await proposeCanonFacts(convId, listMessages(convId), api.signal);
-            },
-          ).catch((e) => console.warn(`[canon] auto-propose failed (#${convId}):`, String((e as any)?.message ?? e).slice(0, 160)));
-        }
-      } catch { /* ignore */ }
-      close();
-    } catch (e: any) {
-      const aborted = e?.name === "AbortError" || e?.name === "TimeoutError" || /abort/i.test(String(e));
-      if (assistantCreated) {
-        if (doneSent) {
-          // committed AND announced — the client already has the turn, nothing
-          // to report (this path is defensive; post-done work swallows its own
-          // errors above)
-          console.error(`[chat] erreur après envoi (partie #${convId}):`, String(e?.message ?? e).slice(0, 160));
-        } else {
-          // committed but never announced (e.g. the meta write above blew up) —
-          // deliver "done" now so the client doesn't wait on a finished turn
-          try {
-            const m = getMessage(assistantId);
-            if (m) send("done", { message: messageView(m) });
-          } catch { /* stream closed */ }
-        }
-      } else if (aborted && clientStopped) {
-        // user pressed Stop: commit whatever the model already wrote, then
-        // drop the orphan user turn only if nothing was produced
-        const stoppedText = stripThinking(full);
-        if (stoppedText.trim()) {
-          const partial = createMessage({
-            conversation_id: convId, role: "assistant",
-            name: cards[0]?.name ?? "Narrateur", content: stoppedText.trim(),
-          });
-          const segs = parseSegmentsFor(conv, stoppedText);
-          updateMessage(partial.id, { segments: JSON.stringify(segs) });
-          touchConversation(convId);
-          updateConversation(convId, { last_message: stoppedText.trim().slice(0, 200) });
-        } else {
-          deleteMessage(userMsg.id);
-        }
-      } else {
-        log("chat", "generation failed", { convId, secs: ((Date.now() - genStart) / 1000).toFixed(1), error: String(e?.message ?? e).slice(0, 160), aborted });
-        send("error", {
-          message: aborted
-            ? `Le modèle n'a pas répondu dans le délai de ${timeoutSec} s (il est peut-être en train de charger). Réessaie, ou augmente le timeout dans les réglages.`
-            : String(e?.message ?? e),
-        });
-        // remove the user message on failure so the user can retry cleanly
-        deleteMessage(userMsg.id);
-      }
-      close();
-    } finally {
-      clearTimeout(llmTimer);
-      activeStreams.delete(convId);
-    }
-  },
-    () => {
-      // client disconnected (Stop / tab closed): stop the model generation and
-      // clean up the pending exchange
-      activeStreams.delete(convId);
-      clientStopped = true;
-      llmAbort.abort();
-    },
-  );
 }
 
 // ─── job work functions (wrapped in tracked jobs by the routers) ─────────────
@@ -2163,11 +1523,7 @@ export async function generateCaptions(conversationId: number, signal?: AbortSig
   let model = defaultModelFor(provider.id);
   if (!model) { const models = await provider.models(); model = models[0] ?? ""; }
   const list = items.map((m: any, i: number) => `[${i + 1}] ${(m.content || "").slice(0, 300)}`).join("\n\n");
-  const sys = [
-    "Tu écris des légendes courtes pour la galerie d'illustrations d'une partie de roleplay.",
-    "Pour chaque extrait numéroté, écris une légende d'1-2 phrases qui résume ce qui se passe, comme la voix d'un documentaire.",
-    "Réponds strictement au format : 1: légende, 2: légende… Une ligne par numéro, rien d'autre.",
-  ].join(" ");
+  const sys = promptText("captions-system");
   let text = "";
   try {
     for await (const delta of provider.stream({
@@ -2243,8 +1599,7 @@ export async function scanRelations(conversationId: number, force: boolean, sign
 
 /** Rolling-summary work, shared by the tracked job and its retry. */
 async function summarizeMessages(convId: number, conv: ConversationRow, newMsgs: MessageRow[], signal?: AbortSignal): Promise<void> {
-  let cs: Record<string, unknown> = {};
-  try { cs = JSON.parse(conv.settings || "{}"); } catch { /* ignore */ }
+  const cs = conversationSettingsOf(conv);
   const provider = getProvider((cs.provider as string) || undefined);
   const model = (cs.model as string) || defaultModelFor(provider.id);
   const oldMem = parseMemory(conv.memory_json);

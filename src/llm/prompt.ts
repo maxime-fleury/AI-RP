@@ -10,8 +10,9 @@
  * before the turn in the stream path.
  */
 import type { CanonRow, CardRow, ConversationRow, LorebookRow, MessageRow, PersonaRow, ScenarioRow, WorldRow } from "../server/db";
-import { getSetting, activeLorebook, activeCanon } from "../server/db";
+import { getSetting, activeLorebook, activeCanon, conversationSettingsOf } from "../server/db";
 import { selectRelevantMemory } from "./memory";
+import { promptText } from "./promptText";
 
 export interface NarratorPreset {
   label: string;
@@ -392,8 +393,7 @@ export function buildPromptLayers(ctx: CastContext, profile: RpProfile, opts: Bu
 
   // active generation preset → optional style flavor (never overrides focus)
   {
-    let cs: Record<string, unknown> = {};
-    try { cs = JSON.parse(ctx.conversation.settings || "{}"); } catch { /* ignore */ }
+    const cs = conversationSettingsOf(ctx.conversation);
     const preset = presetFromKey(cs.preset);
     if (preset) style.push(`## Directives de style (« ${preset.label} »)\n${preset.directive}\n`);
   }
@@ -402,8 +402,7 @@ export function buildPromptLayers(ctx: CastContext, profile: RpProfile, opts: Bu
   // / forbidden events, NPC agendas, reveal gates. Skipped while the plan is on
   // hold (the player just changed direction — see the intent classifier).
   if (!opts.sceneControlHeld) {
-    let cs: Record<string, any> = {};
-    try { cs = JSON.parse(ctx.conversation.settings || "{}"); } catch { /* ignore */ }
+    const cs = conversationSettingsOf(ctx.conversation);
     const sc = cs.scene_control as Record<string, any> | undefined;
     if (sc && sc.enabled !== false) {
       const lines: string[] = [];
@@ -431,8 +430,7 @@ export function buildPromptLayers(ctx: CastContext, profile: RpProfile, opts: Bu
 
   // game-master mode: one-shot directives applied to the NEXT turn only
   {
-    let cs: Record<string, unknown> = {};
-    try { cs = JSON.parse(ctx.conversation.settings || "{}"); } catch { /* ignore */ }
+    const cs = conversationSettingsOf(ctx.conversation);
     const dm = cs.dm as Record<string, unknown> | undefined;
     if (dm && cs.dm_pending) {
       const lines: string[] = [];
@@ -456,8 +454,7 @@ export function buildPromptLayers(ctx: CastContext, profile: RpProfile, opts: Bu
   // time-loop rules: explicit per-party setting (default 0 = off) — kept as a
   // style directive; the loop SUMMARY itself goes through the memory layer
   {
-    let cs: Record<string, unknown> = {};
-    try { cs = JSON.parse(ctx.conversation.settings || "{}"); } catch { /* ignore */ }
+    const cs = conversationSettingsOf(ctx.conversation);
     const narratorMem = Number(cs.loop_mem_narrator ?? 0);
     const playerMem = Number(cs.loop_mem_player ?? 0);
     if (narratorMem > 0 || playerMem > 0) {
@@ -477,8 +474,7 @@ export function buildPromptLayers(ctx: CastContext, profile: RpProfile, opts: Bu
   // chapters / recap / loops), capped for the model class by compilePrompt
   let memoryBlock: string | undefined;
   {
-    let cs: Record<string, any> = {};
-    try { cs = JSON.parse(ctx.conversation.settings || "{}"); } catch { /* ignore */ }
+    const cs = conversationSettingsOf(ctx.conversation);
     const chapters = Array.isArray(cs.chapters) ? cs.chapters.slice(-3) : [];
     const recap = cs.recap && typeof cs.recap === "object" && !Array.isArray(cs.recap) ? cs.recap : undefined;
     const narratorMem = Number(cs.loop_mem_narrator ?? 0);
@@ -669,13 +665,7 @@ export function modelContextBudget(cls: ModelClass, explicit?: number): number {
 // items, relationships) so the memory stays robust — a free-text paragraph is
 // accepted as a fallback when the model can't produce JSON.
 export function summarizeSystem(): string {
-  return [
-    "Tu compresses un fil de roleplay en une mémoire structurée pour l'IA qui poursuit l'histoire.",
-    "Réponds UNIQUEMENT par un objet JSON valide, sans commentaire, avec ces champs :",
-    '{"location": "lieu actuel", "characters": ["noms"], "goals": ["objectifs en cours"], "facts": ["événements importants, indices actifs"], "items": ["objets possédés/importants"], "relationships": {"X": "nature du lien avec Y"}}',
-    "Garde les noms propres. Complète les informations manquantes, ne répète pas l'ancienne mémoire à l'identique.",
-    "Si tu ne peux pas produire de JSON, écris 3 à 6 phrases en français à la place.",
-  ].join("\n");
+  return promptText("summarize-system");
 }
 
 export function estimateTokens(text: string): number {

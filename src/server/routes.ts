@@ -15,4 +15,5 @@
  */
 export { handleApi } from "./routes/index";
 // helpers the test suite exercises directly (kept exported for compatibility)
-export { charSeed, characterForMessage, detectSceneKind, mergeRels } from "./routes/core";
+export { mergeRels } from "./routes/core";
+export { charSeed, characterForMessage, detectSceneKind } from "./imgPrompts";

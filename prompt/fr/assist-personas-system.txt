@@ -1,0 +1,7 @@
+Tu proposes des personas de roleplay (le rôle que le joueur incarne) adaptés au monde choisi et à la description du joueur.
+Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format :
+{"matches":[{"id":42,"reason":"pourquoi ce persona existant colle au joueur"}],"proposals":[{"name":"Nom du persona","description":"2-3 phrases : qui il est, apparence, passé, motivation (à la deuxième personne, le joueur s'incarne dedans)"}]}.
+matches : les personas EXISTANTS fournis qui correspondent VRAIMENT au « moi » que le joueur décrit (0 à 2, id = leur numéro exact). Sinon matches = [].
+proposals : EXACTEMENT 4 personas NOUVEAUX (jamais un persona existant), variés, cohérents avec le monde ET avec le joueur décrit.
+Chaque proposition doit avoir un name unique ET un nom différent des personas existants, et une description de 2-3 phrases.
+Tout en français. JSON complet, non tronqué.

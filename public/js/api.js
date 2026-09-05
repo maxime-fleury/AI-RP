@@ -1,4 +1,30 @@
+// @ts-check
 // Tiny API helper
+
+/**
+ * Wire types imported straight from the server-side contract module — the
+ * same source both sides compile against (no copied .d.ts to drift).
+ * @typedef {import("../../src/shared/contracts.ts").MessageView} MessageView
+ * @typedef {import("../../src/shared/contracts.ts").ConversationView} ConversationView
+ * @typedef {import("../../src/shared/contracts.ts").SuggestionsResponse} SuggestionsResponse
+ */
+
+/**
+ * Error carrying an HTTP status (thrown by api/apiForm on !ok responses).
+ * @param {string} msg
+ * @param {number} status
+ * @returns {Error & { status?: number }}
+ */
+function httpError(msg, status) {
+  const e = /** @type {Error & { status?: number }} */ (new Error(msg));
+  e.status = status;
+  return e;
+}
+//
+// Type-checked against the shared wire contract (src/shared/contracts.ts) via
+// JSDoc imports — the SAME declarations the server's view builders use, so a
+// field rename/removal fails `bun run typecheck` on the client boundary too.
+// Other JS files can join by adding @ts-check + fixing their (few) locals.
 export function getToken() {
   try { return localStorage.getItem("innsekai-token") || ""; } catch { return ""; }
 }
@@ -26,16 +52,12 @@ export async function api(path, opts = {}) {
   });
   if (res.status === 401) {
     window.dispatchEvent(new CustomEvent("innsekai-unauthorized"));
-    const err = new Error("Authentification requise — entre le token LAN (Réglages → Sécurité).");
-    err.status = 401;
-    throw err;
+    throw httpError("Authentification requise — entre le token LAN (Réglages → Sécurité).", 401);
   }
   if (!res.ok) {
     let msg = res.statusText;
     try { msg = (await res.json()).error || msg; } catch { /* ignore */ }
-    const err = new Error(msg);
-    err.status = res.status;
-    throw err;
+    throw httpError(msg, res.status);
   }
   const ct = res.headers.get("content-type") || "";
   if (ct.includes("application/json")) {
@@ -54,7 +76,7 @@ export async function apiForm(path, formData) {
   const res = await apiFetch(path, { method: "POST", body: formData });
   if (res.status === 401) {
     window.dispatchEvent(new CustomEvent("innsekai-unauthorized"));
-    throw new Error("Authentification requise — entre le token LAN.");
+    throw httpError("Authentification requise — entre le token LAN.", 401);
   }
   if (!res.ok) {
     let msg = res.statusText;

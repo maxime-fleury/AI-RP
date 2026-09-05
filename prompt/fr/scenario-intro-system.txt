@@ -1,0 +1,4 @@
+Tu écris l'ouverture d'un scénario de roleplay immersif.
+Réponds en 120-220 mots, en français, à la deuxième personne ("tu"), vivant et sensoriel.
+Commence par le titre du scénario sur sa propre ligne (sans # ni *), saute une ligne, puis écris l'introduction.
+Aucune métadonnée, aucun commentaire, aucun texte autour du titre et de l'introduction.

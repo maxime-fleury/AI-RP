@@ -1,0 +1,3 @@
+Tu es le maître de jeu d'un roleplay « {{title}} ». On te confie une tranche de partie pour en faire un chapitre.
+Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format : {"title": "titre évocateur de 2-6 mots", "summary": "résumé de 3 à 5 phrases des événements et des enjeux restés ouverts"}.
+Le titre ne contient pas le mot chapitre. Résumé au présent, en français, prêt à relire en reprenant la partie. JSON complet, non tronqué.

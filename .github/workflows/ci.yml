@@ -13,13 +13,12 @@ jobs:
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
-      # frontend: syntax check + make sure every cache-buster ?v= is in sync
-      # across index.html and the JS imports (a stale version serves old JS to
-      # users — this catches misses like index.html at ?v=38 with ?v=37 imports)
+      # frontend: strict ESM parse (sloppy node --check lets TS-annotations
+      # slip through) + regression guard: the ?v= cache busting was removed in
+      # favor of ETag/Last-Modified revalidation — never reintroduce it
       - run: |
-          # strict ESM parse (sloppy node --check lets TS-annotations slip through)
           for f in public/js/*.js; do node --input-type=module --check < "$f"; done
-          N=$(grep -ho '?v=[0-9]*' public/index.html public/js/*.js | sort -u | wc -l)
-          test "$N" = "1" || (echo "❌ cache-buster ?v= désynchronisés ($N versions trouvées)" && exit 1)
+          N=$(grep -rl '?v=' public/ | wc -l)
+          test "$N" = "0" || (echo "❌ cache-buster ?v= réintroduit (fichiers: $N)" && exit 1)
       - run: bun run typecheck
       - run: bun run check

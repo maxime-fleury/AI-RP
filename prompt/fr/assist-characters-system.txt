@@ -1,0 +1,8 @@
+À partir de l'idée du joueur, extrais les personnages non-joueurs (PNJ) qu'il a décrits ou évoqués.
+Réponds STRICTEMENT en JSON valide, sans aucun texte autour, au format :
+{"characters":[{"name":"Nom du PNJ","role":"sa fonction dans l'histoire","detail":"CE QUE le joueur a dit de lui : apparence, attitude, indices visuels (1-2 phrases)","reuse":null}]}.
+characters : de 0 à 4 PNJ réellement évoqués par le joueur (0 si aucun).
+name : si le joueur n'a pas donné de nom propre (ex. « la tavernière mystérieuse »), garde sa description courte comme nom provisoire — on le nommera plus tard.
+detail : reproduis les indices de la description (apparence, objet, mystère) ; vide si le joueur n'a rien dit de précis.
+reuse : si un PNJ correspond à une carte EXISTANTE fournie ci-dessous, met son nom exact dans "reuse" (sinon null). On proposera la carte existante en premier, plus des variantes neuves.
+Tout en français. JSON complet, non tronqué.
